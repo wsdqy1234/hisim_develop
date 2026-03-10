@@ -41,6 +41,20 @@ from hisim.simulation.utils import (
 logger = get_logger("hisim")
 
 
+class C_EngineHook(BaseHook):
+    HOOK_CLASS_NAME = "Engine"
+    HOOK_MODULE_NAME = "sglang.srt.entrypoints.engine"
+
+    @classmethod
+    def hook(cls, target):
+        def hook_clear_hicache_storage(self):
+            return self.loop.run_until_complete(
+                self.tokenizer_manager.clear_hicache_storage()
+            )
+
+        target.clear_hicache_storage = hook_clear_hicache_storage
+
+
 class C_TokenizerManagerHook(BaseHook):
     HOOK_CLASS_NAME = "TokenizerManager"
     HOOK_MODULE_NAME = "sglang.srt.managers.tokenizer_manager"
@@ -222,8 +236,6 @@ class C_HiCacheController(BaseHook):
 
     @classmethod
     def hook(cls, target):
-        original_reset = target.reset
-
         def override_backup_thread_func(self, *args, **kwargs):
             # Async thread: perform no action
             # The action will be performed by `handle_backup_operation`
@@ -233,11 +245,6 @@ class C_HiCacheController(BaseHook):
             # Async thread: perform no action
             # The action will be performed by `handle_prefetch_operation`
             pass
-
-        def override_reset(self):
-            if hasattr(self, "storage_backend"):
-                self.storage_backend.clear()
-            original_reset(self)
 
         def handle_backup_operation(self):
             if not self.enable_storage:
@@ -296,6 +303,9 @@ class C_HiCacheController(BaseHook):
                     self.append_host_mem_release(
                         operation.host_indices[storage_hit_count:]
                     )
+                # update request states
+                req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
+                req_stats.prefetch_complete_tokens = operation.completed_tokens
 
             while remain_dur > 0:
                 try:
@@ -347,6 +357,9 @@ class C_HiCacheController(BaseHook):
                         # TODO: Track the prefetch operation according to the global clock
                         operation.mark_terminate()
                         remain_dur -= prefetch_dur
+                    # update request states
+                    req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
+                    req_stats.prefetch_complete_tokens = operation.completed_tokens
                     # Release host memory after current operation is finished
                     self.append_host_mem_release(
                         operation.host_indices[storage_hit_count:]
@@ -355,11 +368,21 @@ class C_HiCacheController(BaseHook):
                 except Empty:
                     return
 
+        def override_generic_page_set(
+            self, hash_values, host_indices, extra_info=None
+        ) -> bool:
+            # Always pass extra_info to storage_backend.
+            data = [
+                self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
+                for i in range(len(hash_values))
+            ]
+            return self.storage_backend.batch_set(hash_values, data, extra_info)
+
         target.prefetch_thread_func = override_prefetch_thread_func
         target.backup_thread_func = override_backup_thread_func
         target.handle_backup_operation = handle_backup_operation
         target.handle_prefetch_operation = handle_prefetch_operation
-        target.reset = override_reset
+        target._generic_page_set = override_generic_page_set
 
 
 class C_HiRadixCacheHook(BaseHook):
@@ -369,6 +392,12 @@ class C_HiRadixCacheHook(BaseHook):
     @classmethod
     def hook(cls, target):
         original_check_hicache_events = target.check_hicache_events
+        original_reset = target.reset
+
+        def wrapped_reset(self):
+            if hasattr(self, "cache_controller"):
+                self.cache_controller.handle_backup_operation()
+            original_reset(self)
 
         def override_init(self, params, server_args):
             if server_args.hicache_io_backend == "direct":
@@ -471,6 +500,7 @@ class C_HiRadixCacheHook(BaseHook):
 
         target.__init__ = override_init
         target.check_hicache_events = wrapped_check_hicache_events
+        target.reset = wrapped_reset
 
 
 class C_StorageBackendFactory(BaseHook):
