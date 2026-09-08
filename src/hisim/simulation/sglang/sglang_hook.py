@@ -914,22 +914,35 @@ class C_HiRadixCacheHook(BaseHook):
             # 3. Write timing: submit_write advances avail_time for next round
             self.cache_controller.submit_l3_write_timing()
             result = original_check_hicache_events(self, *args, **kwargs)
-            # 4. Fix: In CPU simulation, CUDA events in ack_write_queue never
-            # complete, so writing_check() never calls write_backup_storage(),
-            # which means backup_queue is never populated and batch_set is never
-            # called through the async path. We process ack_write_queue here,
-            # skip the CUDA event check, and call write_backup_storage directly.
+            # 4. Fix: In CPU simulation, CUDA events in ack_write_queue and
+            # ack_load_queue never complete, so writing_check() and
+            # loading_check() never process their queues. We process them
+            # here as a fallback, skipping the CUDA event check.
             if hasattr(self, 'cache_controller') and self.enable_storage:
                 cc = self.cache_controller
-                # In CPU simulation, CUDA events in ack_write_queue may not
-                # complete, so writing_check() may not call write_backup_storage().
-                # Process any remaining ack_write_queue items here as a fallback.
+                # ack_write_queue fallback: mirrors sglang's writing_check()
+                # normal path (hiradix_cache.py:698-706). Must call
+                # dec_lock_ref to unlock the node so it can be evicted later.
+                # Without dec_lock_ref, backed-up nodes stay locked in L1
+                # forever, host_hit_length is always 0, and L2 load_back is
+                # never triggered.
                 for ack in cc.ack_write_queue:
                     for ack_id in ack.node_ids:
                         node = self.ongoing_write_through.pop(ack_id, None)
                         if node is not None:
+                            self.dec_lock_ref(node)
                             self.write_backup_storage(node)
                 cc.ack_write_queue.clear()
+                # ack_load_queue fallback: mirrors sglang's loading_check()
+                # (hiradix_cache.py:708-721). Without this, nodes in
+                # ongoing_load_back stay locked forever, eventually
+                # exhausting evictable L1 space and breaking L2 load_back.
+                for ack in cc.ack_load_queue:
+                    for ack_id in ack.node_ids:
+                        end_node = self.ongoing_load_back.pop(ack_id, None)
+                        if end_node is not None:
+                            self.dec_lock_ref(end_node)
+                cc.ack_load_queue.clear()
             return result
 
         target.__init__ = override_init
