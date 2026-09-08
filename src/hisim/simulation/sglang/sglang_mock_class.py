@@ -1023,6 +1023,10 @@ def _pass_str_to_block_ids(hash_key):
 
 
 class MockHiCacheStorage:
+    _DEBUG_BATCH_SET_COUNT = 0
+    _DEBUG_BATCH_EXISTS_COUNT = 0
+    _DEBUG_BATCH_EXISTS_HITS = 0
+
     def __init__(self, *args, **kwargs):
         self._last_per_tier_hits = None
         self._last_per_tier_write = None
@@ -1146,6 +1150,7 @@ class MockHiCacheStorage:
                 write_timestamp,
                 int_hash_keys,
             )
+            MockHiCacheStorage._DEBUG_BATCH_SET_COUNT += 1
             # Cache per-tier write block counts for get_last_write_per_tier()
             if (hasattr(res, "tier_names") and hasattr(res, "per_tier_write_block_num")
                     and res.tier_names):
@@ -1185,6 +1190,8 @@ class MockHiCacheStorage:
                 block_mask,
                 input_len,
             )
+            MockHiCacheStorage._DEBUG_BATCH_EXISTS_COUNT += 1
+            MockHiCacheStorage._DEBUG_BATCH_EXISTS_HITS += res.kvcm_hit_length
             logger.debug(f"{res.kvcm_hit_length=}")
             # Cache per-tier hits for batch_exists_per_tier()
             if hasattr(res, "tier_names") and hasattr(res, "per_tier_hit_block_num") and res.tier_names:

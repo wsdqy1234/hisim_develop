@@ -723,6 +723,10 @@ class C_HiCacheController(BaseHook):
                     if C_HiCacheController._tier_sims:
                         try:
                             per_tier_hits = self.storage_backend.batch_exists_per_tier()
+                            C_SchedulerHook._L3_QUERY_COUNT += 1
+                            for tn, cnt in per_tier_hits.items():
+                                C_SchedulerHook._L3_HIT_STATS[tn] = C_SchedulerHook._L3_HIT_STATS.get(tn, 0) + cnt
+                                C_SchedulerHook._L3_TOTAL_HITS += cnt
                         except Exception:
                             pass
                     calc_arg = per_tier_hits if per_tier_hits else storage_hit_count
@@ -738,6 +742,7 @@ class C_HiCacheController(BaseHook):
                     if completed_tokens < storage_hit_count:
                         # Continue to prefetch data next time.
                         operation.completed_tokens = int(completed_tokens)
+                        C_SchedulerHook._L3_PREFETCHED_TOKENS += int(completed_tokens)
                         setattr(
                             self,
                             "chunked_prefetch_operation",
@@ -752,9 +757,11 @@ class C_HiCacheController(BaseHook):
                         operation.completed_tokens = int(
                             storage_hit_count // self.page_size * self.page_size
                         )
-                        # TODO: Track the prefetch operation according to the global clock
                         operation.mark_terminate()
                         remain_dur -= prefetch_dur
+                        C_SchedulerHook._L3_PREFETCHED_TOKENS += int(
+                            storage_hit_count // self.page_size * self.page_size
+                        )
                     # update request states
                     req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
                     req_stats.prefetch_complete_tokens = operation.completed_tokens
@@ -906,7 +913,24 @@ class C_HiRadixCacheHook(BaseHook):
             self.cache_controller.handle_prefetch_operation()
             # 3. Write timing: submit_write advances avail_time for next round
             self.cache_controller.submit_l3_write_timing()
-            return original_check_hicache_events(self, *args, **kwargs)
+            result = original_check_hicache_events(self, *args, **kwargs)
+            # 4. Fix: In CPU simulation, CUDA events in ack_write_queue never
+            # complete, so writing_check() never calls write_backup_storage(),
+            # which means backup_queue is never populated and batch_set is never
+            # called through the async path. We process ack_write_queue here,
+            # skip the CUDA event check, and call write_backup_storage directly.
+            if hasattr(self, 'cache_controller') and self.enable_storage:
+                cc = self.cache_controller
+                # In CPU simulation, CUDA events in ack_write_queue may not
+                # complete, so writing_check() may not call write_backup_storage().
+                # Process any remaining ack_write_queue items here as a fallback.
+                for ack in cc.ack_write_queue:
+                    for ack_id in ack.node_ids:
+                        node = self.ongoing_write_through.pop(ack_id, None)
+                        if node is not None:
+                            self.write_backup_storage(node)
+                cc.ack_write_queue.clear()
+            return result
 
         target.__init__ = override_init
         target.check_hicache_events = wrapped_check_hicache_events
@@ -945,6 +969,12 @@ class C_SchedulerHook(BaseHook):
     FUTURE_QUEUE: list[
         tuple[float, int, RequestStats]
     ] = []  # tuple(created time, salt, request)
+
+    # L2/L3 cache hit statistics
+    _L3_HIT_STATS: dict = {}  # tier_name -> total hit blocks
+    _L3_QUERY_COUNT: int = 0  # total batch_exists calls
+    _L3_TOTAL_HITS: int = 0  # total hit blocks across all tiers
+    _L3_PREFETCHED_TOKENS: int = 0  # total tokens actually prefetched from L3
 
     SCHEDULE_REQ_STATS = []
 
@@ -1324,6 +1354,21 @@ class C_SchedulerHook(BaseHook):
 
                     logger.info(f"Simulation results saved to {output_dir}.")
 
+                    # Log L2/L3 cache hit statistics
+                    from hisim.simulation.sglang.sglang_mock_class import MockHiCacheStorage
+                    logger.info(
+                        f"Storage stats: batch_set={MockHiCacheStorage._DEBUG_BATCH_SET_COUNT}, "
+                        f"batch_exists={MockHiCacheStorage._DEBUG_BATCH_EXISTS_COUNT}, "
+                        f"hits={MockHiCacheStorage._DEBUG_BATCH_EXISTS_HITS}"
+                    )
+                    if C_SchedulerHook._L3_QUERY_COUNT > 0:
+                        logger.info(
+                            f"L3 cache stats: queries={C_SchedulerHook._L3_QUERY_COUNT}, "
+                            f"total_hits={C_SchedulerHook._L3_TOTAL_HITS} blocks, "
+                            f"prefetched={C_SchedulerHook._L3_PREFETCHED_TOKENS} tokens, "
+                            f"per_tier={C_SchedulerHook._L3_HIT_STATS}"
+                        )
+
                 except Exception as e:
                     logger.error(f"Failed to dump results. Error: {e}")
             else:
@@ -1335,6 +1380,10 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.LAST_CPU_TS = 0
             C_SchedulerHook.LAST_FLUSH_TS = time.time()
             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False
+            C_SchedulerHook._L3_HIT_STATS = {}
+            C_SchedulerHook._L3_QUERY_COUNT = 0
+            C_SchedulerHook._L3_TOTAL_HITS = 0
+            C_SchedulerHook._L3_PREFETCHED_TOKENS = 0
 
             ProfileReqOutput = getattr(
                 importlib.import_module("sglang.srt.managers.io_struct"),
