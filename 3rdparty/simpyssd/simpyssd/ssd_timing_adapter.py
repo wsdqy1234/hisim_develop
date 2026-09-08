@@ -95,45 +95,57 @@ class SSDTimingSimulator:
     # ===== Timing-aware API =====
 
     def submit_write(self, arrival_us, data_bytes, io_block_size,
-                     ch_id=0, chip_id=0):
+                     is_sequential=True):
         """
-        Submit a write request with arrival time. Returns (completion_us, latency_us, wait_us, exec_us).
-        Advances chip avail_time (write effect persists for subsequent requests).
+        Submit a write request with arrival time.
+        I/Os are striped across channels/chips (like _predict).
+        Returns (completion_us, latency_us, wait_us, exec_us).
+        Advances all affected chips' avail_time (write effect persists).
         """
         return self._submit_timed('write', arrival_us, data_bytes,
-                                   io_block_size, ch_id, chip_id)
+                                   io_block_size, is_sequential)
 
     def submit_read(self, arrival_us, data_bytes, io_block_size,
-                    ch_id=0, chip_id=0):
+                    is_sequential=True):
         """
-        Submit a read request with arrival time. Returns (completion_us, latency_us, wait_us, exec_us).
-        Also advances chip avail_time. Call set_avail_time() after to undo read's effect if needed.
+        Submit a read request with arrival time.
+        I/Os are striped across channels/chips.
+        Returns (completion_us, latency_us, wait_us, exec_us).
+        Also advances all affected chips' avail_time.
+        Call set_all_avail_time() after to undo read's effect if needed.
         """
         return self._submit_timed('read', arrival_us, data_bytes,
-                                  io_block_size, ch_id, chip_id)
+                                  io_block_size, is_sequential)
 
     def _submit_timed(self, cmd_typ, arrival_us, data_bytes, io_block_size,
-                      ch_id, chip_id):
+                      is_sequential):
         # Set engine time to arrival
         engine.now = arrival_us
-        # Soft reset: clear exec state but keep avail_time
+        # Soft reset: clear exec state but keep avail_time on ALL chips
         self._soft_reset()
 
-        # Record avail_time before submission
-        chip = self._ssd.channels[ch_id].chips[chip_id]
-        avail_before = chip.avail_time
+        # Snapshot avail_time of ALL chips before submission
+        # (to compute max wait across all chips)
+        avail_before = {}
+        for ci, ch in enumerate(self._ssd.channels):
+            for pi, chip in enumerate(ch.chips):
+                avail_before[(ci, pi)] = chip.avail_time
 
-        # Create and submit all commands
+        # Create and submit all commands, striped across channels/chips
         num_io = max(1, math.ceil(data_bytes / io_block_size))
         n_ch = ssd_config.num_channel
         n_chip = ssd_config.num_chip
         for i in range(num_io):
-            c = ch_id if ch_id is not None else (i % n_ch)
-            p = chip_id if chip_id is not None else ((i // n_ch) % n_chip)
-            cmd = Cmd(cmd_typ, c, p, data_sz=io_block_size)
+            if is_sequential:
+                ch_id = i % n_ch
+                chip_id = (i // n_ch) % n_chip
+            else:
+                ch_id = random.randrange(n_ch)
+                chip_id = random.randrange(n_chip)
+            cmd = Cmd(cmd_typ, ch_id, chip_id, data_sz=io_block_size)
             self._ssd.issue(cmd)
 
-        # Run ALL events to completion (don't break early on first I/O)
+        # Run ALL events to completion
         safety = 0
         while engine.events:
             engine.exec()
@@ -144,20 +156,57 @@ class SSDTimingSimulator:
         # Completion = engine.now after ALL I/Os finish
         comp = engine.now
         total_lat = comp - arrival_us
-        wait = max(0, avail_before - arrival_us)
+
+        # wait = max wait across all chips that were used
+        # (the chip that took the longest to become available)
+        max_wait = 0.0
+        for i in range(num_io):
+            if is_sequential:
+                ch_id = i % n_ch
+                chip_id = (i // n_ch) % n_chip
+            else:
+                # For random, we can't reconstruct, so use overall max
+                pass
+            key = (ch_id, chip_id) if is_sequential else None
+            if key and key in avail_before:
+                w = max(0, avail_before[key] - arrival_us)
+                if w > max_wait:
+                    max_wait = w
+
+        # For non-sequential, compute max across all chips
+        if not is_sequential:
+            for key, avail in avail_before.items():
+                w = max(0, avail - arrival_us)
+                if w > max_wait:
+                    max_wait = w
+
+        wait = max_wait
         exec_t = total_lat - wait
         return comp, total_lat, wait, exec_t
 
+    def get_all_avail_time(self):
+        """Get avail_time of ALL chips as dict {(ch, chip): time}"""
+        result = {}
+        for ci, ch in enumerate(self._ssd.channels):
+            for pi, chip in enumerate(ch.chips):
+                result[(ci, pi)] = chip.avail_time
+        return result
+
+    def set_all_avail_time(self, snapshot):
+        """Restore all chips' avail_time from a snapshot (undo read's effect)"""
+        for (ci, pi), avail in snapshot.items():
+            self._ssd.channels[ci].chips[pi].avail_time = avail
+
     def get_avail_time(self, ch_id=0, chip_id=0):
-        """Get chip avail_time (for snapshot before read)"""
+        """Get single chip's avail_time"""
         return self._ssd.channels[ch_id].chips[chip_id].avail_time
 
     def set_avail_time(self, ch_id, chip_id, value):
-        """Restore chip avail_time (undo read's effect after interruption)"""
+        """Set single chip's avail_time"""
         self._ssd.channels[ch_id].chips[chip_id].avail_time = value
 
     def reset_avail_time(self):
-        """Reset all chips' avail_time to 0 (full reset for init/switch)"""
+        """Reset all chips' avail_time to 0"""
         for ch in self._ssd.channels:
             for chip in ch.chips:
                 chip.avail_time = 0

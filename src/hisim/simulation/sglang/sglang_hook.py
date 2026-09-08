@@ -355,12 +355,12 @@ class C_HiCacheController(BaseHook):
         if hasattr(sim, 'submit_read'):
             total_bytes = required_pages * page_size_byte
             read_arrival = StateManager.get_global_clock() + StateManager.get_last_l2_load_dur()
-            avail_before = sim.get_avail_time()
+            avail_snapshot = sim.get_all_avail_time()
             comp, lat, wait, exec_t = sim.submit_read(
-                read_arrival, total_bytes, page_size_byte
+                read_arrival, total_bytes, page_size_byte, is_sequential=True
             )
-            # Restore avail_time to undo read's effect (sglang aborts prefetch)
-            sim.set_avail_time(0, 0, avail_before)
+            # Restore all chips' avail_time to undo read's effect (sglang aborts prefetch)
+            sim.set_all_avail_time(avail_snapshot)
             # Separate wait and exec for accurate partial completion
             remaining_budget = max_dur - wait
             if remaining_budget <= 0:
@@ -485,7 +485,8 @@ class C_HiCacheController(BaseHook):
                     )
                     comp, lat, wait, exec_t = sim.submit_write(
                         write_arrival, total_write_bytes,
-                        C_HiCacheController.KV_CACHE_BYTES
+                        C_HiCacheController.KV_CACHE_BYTES,
+                        is_sequential=True
                     )
                     write_time = lat
                 elif sim is not None:
