@@ -949,3 +949,93 @@ pop_l3_direct_load_count()  # 复位
 - `src/hisim/src/hisim/simulation/manager/state.py` — `_l3_direct_load_count` + `_hicache_l3_direct_load_dur` 及 inc/get/pop/reset
 - `src/hisim/src/hisim/simulation/sglang/sglang_hook.py` — `handle_prefetch_operation` 直通分支 + `wrapped_process_batch_result` max 逻辑
 - `src/hisim/src/hisim/simulation/sglang/sglang_mock_class.py` — `load_to_device_per_layer` 直通分支（拆分 L2/L3 + 分别累计）
+
+---
+
+## 2026-09-08 — 将 memory_system 中的 HiSim 修改迁移到 hisim 独立仓库
+
+**背景**：memory_system 仓库中 `src/hisim/` 下的所有修改（22 个 commit）是在 hisim 原始代码基础上做的。现在要将这些修改按 commit 迁移回 hisim 独立仓库（`/home/lfz/push/hisim`，develop 分支），使 hisim 仓库成为唯一维护源。
+
+**前提验证**：
+- hisim 仓库 develop 分支 HEAD（`96b2716`，4月8日）与 memory_system 的 init commit（`38a1e28`，7月6日）的 base 完全一致（sglang_hook.py、sglang_mock_class.py 等 6 个关键文件 MD5 全部相同）。
+- 迁移方式：对 memory_system 的每个 commit 生成 diff patch，去掉 `src/hisim/` 前缀后 `git apply` 到 hisim 仓库。零冲突。
+
+**完成的事项**：
+
+1. **22 个 HiSim 代码修改 commit**（按时间序逐个 apply，零冲突）：
+   - `支持kvcm_optimizer L3多层级仿真功能` → `对接SimpySSD` → `修复sglang dev兼容性` → `多tier L3存储仿真` → SSD时序仿真系列（读写重叠/条带分配/multi-tier timing/split modes/decouple layers/Multi-TP） → `Fix trace timestamp` → L2/L3 hit stats + ack fallback 系列 → `Fix mock size_per_token` → `Add L2 host_hit_length tracking` → `Track L2 hit tokens` → `Add per-request L1/L2/L3 hit tracking + cache state logging` → `Add L3 direct-to-L1 read path`
+
+2. **迁移 history.md**（commit `ec671f7`）：从 memory_system 根目录拷到 hisim 仓库根目录。
+
+3. **迁移 HiSim_Simulation_Test_Report.md**（commit `846bd72`）：从 memory_system 根目录拷到 `docs/` 目录。
+
+4. **迁移 cache analyzer v1/v2/v3 到 test/**（commit `6c4d973`）：
+   - `test/hisim_cache_analyzer_v1.py` — block-level prefix cache 模型（vllm 风格 LRU），修复了 docstring（原误写"Radix Cache"→改为"block-level prefix cache, vllm-style"）
+   - `test/hisim_cache_analyzer_v2.py` — radix tree 模型（匹配 sglang HiRadixCache），原样迁移
+   - `test/hisim_cache_analyzer_v3.py` — v2 + HiSim 逻辑，清理了实验性代码后迁移
+   - `test/README_hisim_cache_analyzer_v1.md` + `test/README_hisim_cache_analyzer_v2.md`
+
+**V3 清理详情**：
+- 删除：`ack_delay_n`/`ack_delay_queues`/`_process_delayed_acks`（ACK 延迟实验，证明无效）
+- 删除：`prefetch_to_free`（死代码，声明后从未使用）
+- 删除：`prefetch_enabled` flag（调试工具，非 HiSim 逻辑）
+- 删除：`evictable_size` 属性 + `_evictable_size()` 方法（未使用）
+- 删除：注释掉的"permanent allocation"实验代码
+- 保留：`pending_l3` 延迟 L3 hash 写入（匹配 HiSim 的 ACK 时 `write_backup_storage` 语义）
+- 简化：ACK 处理改为简单 `_process_acks()`（请求开头直接处理 pending_acks，不走 delay queue）
+- 保留的核心 HiSim 逻辑：write_through backup + lock、load_back、contiguous prefix invariant、16384 chunking、Phase 3 统一 backup（chunked=True 跳过）、Phase 3 重物化（churn 循环）、shallow-first walk、output 叶子流、L3 条件写入（backup 成功才写）、L3 仅通过 prefetch 查询、prefetch buffer（按整个 remaining 分配 L2）
+
+**总新增 commit 数**：25（22 代码 + history.md + 测试报告 + cache analyzer）
+
+**注意事项**：
+- hisim 仓库 develop 分支现在是唯一维护源，memory_system 中的 `src/hisim/` 不再继续维护
+- 未 push 远端，用户自行 push
+- hisim 仓库的 `3rdparty/` 目录在 git 中未跟踪（.so 文件等），需要单独安装
+
+---
+
+## 2026-09-01 ~ 09-08 — HiSim 三层缓存命中率分析（memory_system 阶段）
+
+**背景**：在 memory_system 的 `src/hisim/` 上，用 trace 数据对标 HiSim 仿真结果，分析 L1/L2/L3 三层缓存的命中率差异和根因。
+
+**开发的工具**：
+- `hisim_cache_analyzer.py`（V1）：block-level 前缀缓存模型，模拟 vllm 风格的 LRU 逐出。用 `OrderedDict` + 累积 hash 做前缀匹配，block_size 可配。简单快速但不建模 radix tree 的节点分裂和级联驱逐。
+- `hisim_cache_analyzer_v2.py`（V2）：radix tree 模型，匹配 sglang HiRadixCache 的行为（变长节点、节点分裂、级联驱逐、host leaf 驱逐、L3 hash 查询）。验证了全量数据集 L1=40M 与 L1=400K+L2=1600GB 的 Total 一致性（97.78% = 97.78%）。
+- `hisim_cache_analyzer_v3.py`（V3）：V2 + HiSim 特有逻辑。建模 write_through backup+lock、load_back 重物化、连续前缀不变量、16384 chunking、Phase 3 统一 backup、churn 循环、output 叶子流、prefetch buffer、延迟 L3 hash 写入。
+
+**HiSim 实测结果（对标基准）**：
+
+| 配置 | L1 | L2 | L3 | Total |
+|------|----|----|----|----|
+| L1=200K L2=80GB | 87.34% | 0.09% | 2.39% | 89.82% |
+| L1=200K L2=160GB | 87.49% | 1.97% | 0.00% | 89.46% |
+| L1=200K L2=400GB | 85.80% | 8.60% | 0.00% | 94.40% |
+| L1=200K L2=1600GB | 85.80% | 8.60% | 0.00% | 94.40% |
+| L1=160K L2=70GB | 81.25% | 0.03% | 0.15% | 81.43% |
+| L1=160K L2=70GB（禁 prefetch） | 79.85% | 12.37% | 0.15% | 92.37% |
+
+**V3 校准结果（无 prefetch，对标 HiSim 无 prefetch）**：
+
+| | L1 | L2 | L3 | Total |
+|--|----|----|----|----|
+| V3 | 82.70% | 9.63% | 0.00% | 92.33% |
+| HiSim | 79.85% | 12.37% | 0.15% | 92.37% |
+| 差距 | +2.85% | -2.74% | -0.15% | +0.04% |
+
+**关键发现**：
+
+1. **Total 在无 prefetch 下几乎完美对齐**（0.04% 差距），验证了 V3 的核心缓存逻辑正确性。
+
+2. **L2=0.03%（L1=160K L2=70GB）的根因是 prefetch buffer**：HiSim 的 `prefetch_from_storage` 按整个 remaining input 长度预分配 L2（非树节点，`evict_host` 无法回收），导致 L2 结构性超卖。禁掉 prefetch 后 L2 恢复到 12.37%。这是 SGLang 真实代码的行为，非仿真 artifact。
+
+3. **L1=160K 比 L1=200K 的 L2/L3 更低**是反直觉的非单调现象：更小 L1/L2 → death spiral 更严重（backup 失败 → 连续前缀级联 skip → non-backuped 节点被 `_evict_regular` 删除 → 树缩小 → host leaf 断档 → 更多 backup 失败）。这是螺旋类机制独有的阈值/相变指纹。
+
+4. **HiSim 的 L2/L3 偏低不是 ACK 延迟问题**（L3>0 直接反证 ACK 链路畅通），也不是 CUDA event artifact（CPU 模拟下 mock D2H 是同步瞬时完成）。根因是 SGLang 原生的 write_through 钉死 + prefetch buffer 超卖 + evict_host 只能收树上的 host leaf 三重结构性压力。
+
+5. **V3 与 HiSim 的剩余差距**（有 prefetch 时 11pp）来自 host leaf 粒度差异：V3 的 host leaf ~16K/个（input chunk 叶子），HiSim 的 ~1.6K/个（output 叶子 ~1K + 分裂尾）。粒度差异导致 V3 的 `_evict_l2` 总能找到足够的 host leaf（2-3 个即可），backup 永不失败；HiSim 一次 burst 需要 15+ 个小 host leaf，容易耗尽触发 death spiral。
+
+**关键文件**：
+- `test/hisim_cache_analyzer_v1.py` — block-level 模型（vllm 风格）
+- `test/hisim_cache_analyzer_v2.py` — radix tree 模型（sglang 风格）
+- `test/hisim_cache_analyzer_v3.py` — V2 + HiSim 逻辑（write_through/load_back/prefetch/contiguous prefix）
+- `docs/HiSim_Simulation_Test_Report.md` — 完整测试报告（含配置说明、运行方法、结果对比）
