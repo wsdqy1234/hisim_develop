@@ -88,7 +88,8 @@ class PlatformConfig:
     memory_write_bandwidth_gb: Optional[float] = None
     num_device_per_node: int = 8
     storage_tiers: list[StorageTierConfig] = field(default_factory=list)
-    tier_read_mode: str = "parallel"
+    tier_read_mode: str = "serial"
+    tier_write_mode: str = "parallel"
 
     @property
     def disk_read_bandwidth(self):

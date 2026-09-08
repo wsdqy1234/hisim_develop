@@ -89,7 +89,8 @@ class ConfigManager:
                 ),
                 num_device_per_node=platform_config.get("num_device_per_node"),
                 storage_tiers=storage_tiers,
-                tier_read_mode=platform_config.get("tier_read_mode", "parallel"),
+                tier_read_mode=platform_config.get("tier_read_mode", "serial"),
+                tier_write_mode=platform_config.get("tier_write_mode", "parallel"),
             )
 
             logger.info(

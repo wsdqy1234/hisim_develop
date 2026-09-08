@@ -281,7 +281,8 @@ class C_HiCacheController(BaseHook):
     _tier_sims = None
     _tier_bandwidths = None
     _tier_write_bandwidths = None
-    _tier_read_mode = "parallel"
+    _tier_read_mode = "serial"
+    _tier_write_mode = "parallel"
 
     @classmethod
     def _get_ssd_simulator(cls):
@@ -301,6 +302,7 @@ class C_HiCacheController(BaseHook):
             platform_cfg = ConfigManager.get_platform_config()
             tiers = platform_cfg.storage_tiers
             cls._tier_read_mode = platform_cfg.tier_read_mode
+            cls._tier_write_mode = platform_cfg.tier_write_mode
         except Exception:
             tiers = []
 
@@ -393,10 +395,8 @@ class C_HiCacheController(BaseHook):
             StateManager.get_global_clock() + StateManager.get_last_l2_load_dur()
         )
 
-        tier_info = {}  # tier_name -> (hit_count, wait, exec_t, lat)
-        for tier_name, hit_count in per_tier_hits.items():
-            if hit_count == 0:
-                continue
+        def _read_tier(tier_name, hit_count, arrival):
+            """Submit a read to one tier, return (wait, exec_t, lat)."""
             total_bytes = hit_count * page_size_byte
             sim = (
                 C_HiCacheController._tier_sims.get(tier_name)
@@ -406,16 +406,15 @@ class C_HiCacheController(BaseHook):
             if sim and hasattr(sim, 'submit_read'):
                 avail_snapshot = sim.get_all_avail_time()
                 _, lat, wait, exec_t = sim.submit_read(
-                    read_arrival, total_bytes, page_size_byte, is_sequential=True
+                    arrival, total_bytes, page_size_byte, is_sequential=True
                 )
-                # Restore avail_time to undo read's effect (sglang aborts prefetch)
                 sim.set_all_avail_time(avail_snapshot)
-                tier_info[tier_name] = (hit_count, wait, exec_t, lat)
+                return wait, exec_t, lat
             elif sim:
                 t = sim.predict_read_time(
                     total_bytes, page_size_byte, is_sequential=True
                 )
-                tier_info[tier_name] = (hit_count, 0.0, t, t)
+                return 0.0, t, t
             else:
                 bw = (
                     C_HiCacheController._tier_bandwidths.get(tier_name, 8e9)
@@ -423,30 +422,49 @@ class C_HiCacheController(BaseHook):
                     else 8e9
                 )
                 t = total_bytes / bw
-                tier_info[tier_name] = (hit_count, 0.0, t, t)
+                return 0.0, t, t
 
-        if not tier_info:
+        active = {n: c for n, c in per_tier_hits.items() if c > 0}
+        if not active:
             return 0.0, 0.0
 
-        total_completed = sum(c for c, _, _, _ in tier_info.values())
-
         if C_HiCacheController._tier_read_mode == "serial":
-            total_dur = sum(lat for _, _, _, lat in tier_info.values())
-            if total_dur <= max_dur:
-                return float(total_completed), total_dur
-            ratio = max_dur / total_dur
-            completed = sum(
-                max(1, int(c * ratio)) for c, _, _, _ in tier_info.values()
-            )
-            return float(completed), max_dur
+            # Serial: tiers read in priority order, each arrival chains
+            # off the previous tier's completion.
+            accumulated = 0.0
+            completed = 0.0
+            for tier_name, hit_count in active.items():
+                arrival = read_arrival + accumulated
+                wait, exec_t, lat = _read_tier(tier_name, hit_count, arrival)
+                budget = max_dur - accumulated
+                if budget <= wait:
+                    # Can't even finish waiting — this and all later tiers get 0
+                    break
+                if budget >= lat:
+                    # Full completion
+                    completed += hit_count
+                    accumulated += lat
+                else:
+                    # Partial: only (budget - wait) time for exec
+                    if exec_t > 0:
+                        partial = hit_count * (budget - wait) / exec_t
+                        completed += max(1.0, partial) if hit_count > 0 else 0
+                    return completed, max_dur
+            return completed, accumulated
         else:
-            # Parallel: total_dur = max(lat) across tiers
-            total_dur = max(lat for _, _, _, lat in tier_info.values())
+            # Parallel: all tiers start at the same read_arrival
+            tier_results = {}
+            for tier_name, hit_count in active.items():
+                wait, exec_t, lat = _read_tier(tier_name, hit_count, read_arrival)
+                tier_results[tier_name] = (hit_count, wait, exec_t, lat)
+
+            total_completed = sum(c for c, _, _, _ in tier_results.values())
+            total_dur = max(lat for _, _, _, lat in tier_results.values())
             if total_dur <= max_dur:
                 return float(total_completed), total_dur
             # Partial: each tier independently checks budget after its own wait
             completed = 0.0
-            for _, (hit_count, wait, exec_t, lat) in tier_info.items():
+            for _, (hit_count, wait, exec_t, lat) in tier_results.items():
                 remaining = max_dur - wait
                 if remaining <= 0:
                     continue
@@ -534,33 +552,43 @@ class C_HiCacheController(BaseHook):
                         + StateManager.get_last_l2_backup_dur()
                     )
                     tier_lats = {}
+                    accumulated = 0.0
                     for tier_name, write_blocks in per_tier_write_accum.items():
                         if write_blocks <= 0:
                             continue
                         write_bytes = write_blocks * C_HiCacheController.KV_CACHE_BYTES
                         sim = C_HiCacheController._tier_sims.get(tier_name)
+                        # Serial: chain arrival = base + sum of previous lats
+                        # Parallel: all tiers use the same arrival
+                        if C_HiCacheController._tier_write_mode == "serial":
+                            arrival = write_arrival + accumulated
+                        else:
+                            arrival = write_arrival
                         if sim is not None and hasattr(sim, 'submit_write'):
                             _, lat, _, _ = sim.submit_write(
-                                write_arrival, write_bytes,
+                                arrival, write_bytes,
                                 C_HiCacheController.KV_CACHE_BYTES,
                                 is_sequential=True
                             )
                             tier_lats[tier_name] = lat
                         elif sim is not None:
-                            tier_lats[tier_name] = sim.predict_write_time(
+                            lat = sim.predict_write_time(
                                 write_bytes,
                                 C_HiCacheController.KV_CACHE_BYTES,
                                 is_sequential=True,
                             )
+                            tier_lats[tier_name] = lat
                         else:
                             bw = (
                                 C_HiCacheController._tier_write_bandwidths.get(tier_name, 8e9)
                                 if C_HiCacheController._tier_write_bandwidths
                                 else 8e9
                             )
-                            tier_lats[tier_name] = write_bytes / bw
+                            lat = write_bytes / bw
+                            tier_lats[tier_name] = lat
+                        accumulated += tier_lats[tier_name]
 
-                    if C_HiCacheController._tier_read_mode == "serial":
+                    if C_HiCacheController._tier_write_mode == "serial":
                         write_time = sum(tier_lats.values())
                     else:
                         write_time = max(tier_lats.values()) if tier_lats else 0.0
