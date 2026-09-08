@@ -131,9 +131,11 @@ class Chip(Sim):
 
     def read_begin(self, cmd, buf):
         assert_equal(cmd, self.queued_cmd[0])
+        start = max(engine.now, self.avail_time)
         self.exec(cmd, buf)
         logger.debug(f"[{engine.now}]: {self} read_begin {cmd}")
-        engine.add(Event(self, 'read_finish', engine.now + self.read_latency, {'buf':buf}))
+        engine.add(Event(self, 'read_finish', start + self.read_latency, {'buf':buf}))
+        self.avail_time = start + self.read_latency
 
     def read_finish(self, buf):
         cmd = buf.cmd
@@ -152,10 +154,11 @@ class Chip(Sim):
 
     def write_begin(self, cmd, buf):
         logger.debug(f"[{engine.now}]: {self} write for {cmd}")
-
+        start = max(engine.now, self.avail_time)
         self.exec(cmd, buf)
         self.check_transfer()
-        engine.add(Event(self, 'write_finish', engine.now + self.write_latency, {'buf': buf}))
+        engine.add(Event(self, 'write_finish', start + self.write_latency, {'buf': buf}))
+        self.avail_time = start + self.write_latency
 
     def write_finish(self, buf):
         cmd = buf.cmd

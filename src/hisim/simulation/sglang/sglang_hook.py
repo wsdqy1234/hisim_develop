@@ -351,6 +351,26 @@ class C_HiCacheController(BaseHook):
     def _calc_prefetch_pages_ssd(
         sim, required_pages: int, page_size_byte: int, max_dur: float
     ) -> tuple[float, float]:
+        # Try timing-aware API first
+        if hasattr(sim, 'submit_read'):
+            total_bytes = required_pages * page_size_byte
+            read_arrival = StateManager.get_global_clock() + StateManager.get_last_l2_load_dur()
+            avail_before = sim.get_avail_time()
+            comp, lat, wait, exec_t = sim.submit_read(
+                read_arrival, total_bytes, page_size_byte
+            )
+            # Restore avail_time to undo read's effect (sglang aborts prefetch)
+            sim.set_avail_time(0, 0, avail_before)
+            # Separate wait and exec for accurate partial completion
+            remaining_budget = max_dur - wait
+            if remaining_budget <= 0:
+                return 0.0, max_dur
+            if exec_t <= remaining_budget:
+                return float(required_pages), lat
+            ratio = remaining_budget / exec_t
+            completed = max(1.0, required_pages * ratio)
+            return completed, max_dur
+        # Fallback: original non-timing API
         total_bytes = required_pages * page_size_byte
         read_time = sim.predict_read_time(
             total_bytes, page_size_byte, is_sequential=True
@@ -449,13 +469,26 @@ class C_HiCacheController(BaseHook):
                 except Empty:
                     break
 
-            # Compute L2→L3 write time using SimpySSD (or fallback bandwidth)
+            # Compute L2→L3 write time using SimpySSD timing-aware API (or fallback)
             if total_write_tokens > 0:
                 if C_HiCacheController.KV_CACHE_BYTES is None:
                     C_HiCacheController.KV_CACHE_BYTES = ConfigManager.get_kv_cache_bytes()
                 total_write_bytes = total_write_tokens * C_HiCacheController.KV_CACHE_BYTES
                 sim = C_HiCacheController._get_ssd_simulator()
-                if sim is not None:
+                if sim is not None and hasattr(sim, 'submit_write'):
+                    # Timing-aware: submit with arrival time, get wait/exec breakdown
+                    write_arrival = (
+                        StateManager.get_global_clock()
+                        + StateManager.get_last_l2_load_dur()
+                        + StateManager.get_current_inference_dur()
+                        + StateManager.get_last_l2_backup_dur()
+                    )
+                    comp, lat, wait, exec_t = sim.submit_write(
+                        write_arrival, total_write_bytes,
+                        C_HiCacheController.KV_CACHE_BYTES
+                    )
+                    write_time = lat
+                elif sim is not None:
                     write_time = sim.predict_write_time(
                         total_write_bytes,
                         C_HiCacheController.KV_CACHE_BYTES,
@@ -1041,6 +1074,10 @@ class C_SchedulerHook(BaseHook):
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
                 hicache_l3_backup_dur = StateManager.pop_hicache_l3_backup_dur()
                 current_inference_dur = StateManager.get_current_inference_dur()
+
+                # Save last values for next iteration's timing-aware SSD simulation
+                StateManager.set_last_l2_load_dur(hicache_l2_load_dur)
+                StateManager.set_last_l2_backup_dur(hicache_l2_backup_dur)
 
                 # L3 write overlaps with next inference; only overflow delays
                 l3_write_overflow = max(0, hicache_l3_backup_dur - current_inference_dur)
