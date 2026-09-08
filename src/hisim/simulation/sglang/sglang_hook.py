@@ -266,10 +266,66 @@ class C_HiCacheController(BaseHook):
     DISK_READ_BANDWIDTH_BYTES: float = None
     DISK_WRITE_BANDWIDTH_BYTES: float = None
 
+    _ssd_simulator = None
+    _ssd_simulator_initialized = False
+
+    @classmethod
+    def _get_ssd_simulator(cls):
+        if not cls._ssd_simulator_initialized:
+            cls._init_ssd_simulator()
+        return cls._ssd_simulator
+
+    @classmethod
+    def _init_ssd_simulator(cls):
+        cls._ssd_simulator_initialized = True
+        env = os.environ.get("HISIM_SSD_SIM", "")
+        if not env:
+            return
+        try:
+            if env in ("1", "default", "true", "True", "simpyssd"):
+                from simpyssd import SSDTimingSimulator
+                import simpyssd as _pkg
+
+                cfg_path = os.path.join(
+                    os.path.dirname(_pkg.__file__), "configs", "es3500p_pcie5.cfg"
+                )
+                cls._ssd_simulator = SSDTimingSimulator(cfg_path)
+                get_logger().info(
+                    f"SSD simulator enabled (SimpySSD) with config: {cfg_path}"
+                )
+            else:
+                from simpyssd import SSDTimingSimulator
+
+                cls._ssd_simulator = SSDTimingSimulator(env)
+                get_logger().info(
+                    f"SSD simulator enabled (SimpySSD) with config: {env}"
+                )
+        except Exception as e:
+            get_logger().warning(f"Failed to init SSD simulator: {e}")
+
+    @staticmethod
+    def _calc_prefetch_pages_ssd(
+        sim, required_pages: int, page_size_byte: int, max_dur: float
+    ) -> tuple[float, float]:
+        total_bytes = required_pages * page_size_byte
+        read_time = sim.predict_read_time(
+            total_bytes, page_size_byte, is_sequential=True
+        )
+        if read_time <= max_dur:
+            return float(required_pages), read_time
+        ratio = max_dur / read_time
+        completed = max(1, int(required_pages * ratio))
+        return float(completed), max_dur
+
     @staticmethod
     def calc_prefetch_pages(
         required_pages: int, page_size_byte: int, max_dur: float, bandwidth: float
     ) -> tuple[float, float]:
+        sim = C_HiCacheController._get_ssd_simulator()
+        if sim is not None:
+            return C_HiCacheController._calc_prefetch_pages_ssd(
+                sim, required_pages, page_size_byte, max_dur
+            )
         _prefetch_dur = required_pages * page_size_byte / bandwidth
         if _prefetch_dur > max_dur:
             _completed_pages = max(max_dur * bandwidth / page_size_byte, 1)
