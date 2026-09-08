@@ -95,31 +95,34 @@ class SSDTimingSimulator:
 
     # ===== Timing-aware API =====
 
-    def submit_write(self, arrival_us, data_bytes, io_block_size,
+    def submit_write(self, arrival_sec, data_bytes, io_block_size,
                      is_sequential=True):
         """
-        Submit a write request with arrival time.
+        Submit a write request with arrival time in seconds.
         I/Os are striped across channels/chips (like _predict).
-        Returns (completion_us, latency_us, wait_us, exec_us).
+        Returns (completion_sec, latency_sec, wait_sec, exec_sec) in seconds.
         Advances all affected chips' avail_time (write effect persists).
         """
-        return self._submit_timed('write', arrival_us, data_bytes,
+        return self._submit_timed('write', arrival_sec, data_bytes,
                                    io_block_size, is_sequential)
 
-    def submit_read(self, arrival_us, data_bytes, io_block_size,
+    def submit_read(self, arrival_sec, data_bytes, io_block_size,
                     is_sequential=True):
         """
-        Submit a read request with arrival time.
+        Submit a read request with arrival time in seconds.
         I/Os are striped across channels/chips.
-        Returns (completion_us, latency_us, wait_us, exec_us).
+        Returns (completion_sec, latency_sec, wait_sec, exec_sec) in seconds.
         Also advances all affected chips' avail_time.
         Call set_all_avail_time() after to undo read's effect if needed.
         """
-        return self._submit_timed('read', arrival_us, data_bytes,
+        return self._submit_timed('read', arrival_sec, data_bytes,
                                   io_block_size, is_sequential)
 
-    def _submit_timed(self, cmd_typ, arrival_us, data_bytes, io_block_size,
+    def _submit_timed(self, cmd_typ, arrival_sec, data_bytes, io_block_size,
                       is_sequential):
+        # arrival_sec is in seconds; SSD sim internals (config latencies,
+        # avail_time, engine.now) are in microseconds.
+        arrival_us = arrival_sec * 1e6
         # Set engine time to arrival
         self._engine.now = arrival_us
         # Soft reset: clear exec state but keep avail_time on ALL chips
@@ -181,7 +184,8 @@ class SSDTimingSimulator:
 
         wait = max_wait
         exec_t = total_lat - wait
-        return comp, total_lat, wait, exec_t
+        # Convert all return values from us to seconds, matching predict_* APIs
+        return comp * 1e-6, total_lat * 1e-6, wait * 1e-6, exec_t * 1e-6
 
     def get_all_avail_time(self):
         """Get avail_time of ALL chips as dict {(ch, chip): time}"""
