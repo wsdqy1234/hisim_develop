@@ -8,6 +8,7 @@ class StateManager:
     _hicache_l3_backup_dur: float = 0
     _last_l2_load_dur: float = 0
     _last_l2_backup_dur: float = 0
+    _last_l3_write_overflow: float = 0
 
     @classmethod
     def reset(cls):
@@ -20,6 +21,7 @@ class StateManager:
         cls._hicache_l3_backup_dur = 0
         cls._last_l2_load_dur = 0
         cls._last_l2_backup_dur = 0
+        cls._last_l3_write_overflow = 0
 
     @classmethod
     def inc_iteration(cls) -> None:
@@ -99,3 +101,11 @@ class StateManager:
     @classmethod
     def get_last_l2_backup_dur(cls) -> float:
         return cls._last_l2_backup_dur
+
+    @classmethod
+    def set_last_l3_write_overflow(cls, dur: float) -> None:
+        cls._last_l3_write_overflow = dur
+
+    @classmethod
+    def get_last_l3_write_overflow(cls) -> float:
+        return cls._last_l3_write_overflow
