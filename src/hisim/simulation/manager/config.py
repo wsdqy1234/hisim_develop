@@ -5,6 +5,7 @@ from hisim.simulation.types import PlatformConfig, SchedulerConfig, StorageTierC
 from hisim.simulation.manager import Envs
 from hisim.simulation.utils import (
     calc_kv_cache_cell_elems,
+    calc_kv_cache_cell_elems_full,
     calc_kv_cache_per_layer_elems,
 )
 from hisim.time_predictor import (
@@ -110,6 +111,17 @@ class ConfigManager:
         return (
             calc_kv_cache_cell_elems(
                 model, scheduler_config.tp_size, scheduler_config.pp_size
+            )
+            * scheduler_config.data_type.bytes
+        )
+
+    @classmethod
+    def get_kv_cache_bytes_full(cls) -> int:
+        model = cls._model_info
+        scheduler_config = cls._scheduler_config
+        return (
+            calc_kv_cache_cell_elems_full(
+                model, scheduler_config.pp_size
             )
             * scheduler_config.data_type.bytes
         )

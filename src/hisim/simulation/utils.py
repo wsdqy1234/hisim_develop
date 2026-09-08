@@ -15,6 +15,17 @@ def calc_kv_cache_cell_elems(model_info: ModelInfo, tp_size: int, pp_size: int) 
         return num_kv_heads * model_info.head_dim * num_layers * 2
 
 
+def calc_kv_cache_cell_elems_full(model_info: ModelInfo, pp_size: int) -> int:
+    """Full KV cache size across all TP workers (not divided by tp_size).
+    MLA: same as per-worker (MLA doesn't shard, only rank 0 writes L3).
+    MHA: uses full num_kv_heads (not divided by tp_size), = per-worker × tp_size."""
+    num_layers = model_info.num_hidden_layers // pp_size
+    if model_info.kv_lora_rank != 0:
+        return (model_info.kv_lora_rank + model_info.qk_rope_head_dim) * num_layers
+    else:
+        return model_info.num_key_value_heads * model_info.head_dim * num_layers * 2
+
+
 def calc_kv_cache_per_layer_elems(
     model_info: ModelInfo, tp_size: int, pp_size: int
 ) -> int:

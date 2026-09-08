@@ -273,6 +273,7 @@ class C_HiCacheController(BaseHook):
     HOOK_MODULE_NAME = "sglang.srt.managers.cache_controller"
 
     KV_CACHE_BYTES: int = None
+    KV_CACHE_BYTES_FULL: int = None
     DISK_READ_BANDWIDTH_BYTES: float = None
     DISK_WRITE_BANDWIDTH_BYTES: float = None
 
@@ -357,9 +358,11 @@ class C_HiCacheController(BaseHook):
     def _calc_prefetch_pages_ssd(
         sim, required_pages: int, page_size_byte: int, max_dur: float
     ) -> tuple[float, float]:
+        # KV_CACHE_BYTES_FULL = total across all TP workers
+        full_bytes = C_HiCacheController.KV_CACHE_BYTES_FULL or page_size_byte
         # Try timing-aware API first
         if hasattr(sim, 'submit_read'):
-            total_bytes = required_pages * page_size_byte
+            total_bytes = required_pages * full_bytes
             # read_arrival = T_{N-1} + l2_load_{N-1}
             #              = T_N - inference_{N-1} - l2_backup_{N-1} - l3_overflow_{N-1}
             read_arrival = (
@@ -384,7 +387,7 @@ class C_HiCacheController(BaseHook):
             completed = max(1.0, required_pages * ratio)
             return completed, max_dur
         # Fallback: original non-timing API
-        total_bytes = required_pages * page_size_byte
+        total_bytes = required_pages * full_bytes
         read_time = sim.predict_read_time(
             total_bytes, page_size_byte, is_sequential=True
         )
@@ -409,7 +412,8 @@ class C_HiCacheController(BaseHook):
 
         def _read_tier(tier_name, hit_count, arrival):
             """Submit a read to one tier, return (wait, exec_t, lat)."""
-            total_bytes = hit_count * page_size_byte
+            full_bytes = C_HiCacheController.KV_CACHE_BYTES_FULL or page_size_byte
+            total_bytes = hit_count * full_bytes
             sim = (
                 C_HiCacheController._tier_sims.get(tier_name)
                 if C_HiCacheController._tier_sims
@@ -502,9 +506,10 @@ class C_HiCacheController(BaseHook):
                 sim, required_pages, page_size_byte, max_dur
             )
         # Original bandwidth model
-        _prefetch_dur = required_pages * page_size_byte / bandwidth
+        full_bytes = C_HiCacheController.KV_CACHE_BYTES_FULL or page_size_byte
+        _prefetch_dur = required_pages * full_bytes / bandwidth
         if _prefetch_dur > max_dur:
-            _completed_pages = max(max_dur * bandwidth / page_size_byte, 1)
+            _completed_pages = max(max_dur * bandwidth / full_bytes, 1)
             return _completed_pages, max_dur
         else:
             return required_pages, _prefetch_dur
@@ -564,6 +569,8 @@ class C_HiCacheController(BaseHook):
 
             if C_HiCacheController.KV_CACHE_BYTES is None:
                 C_HiCacheController.KV_CACHE_BYTES = ConfigManager.get_kv_cache_bytes()
+            if C_HiCacheController.KV_CACHE_BYTES_FULL is None:
+                C_HiCacheController.KV_CACHE_BYTES_FULL = ConfigManager.get_kv_cache_bytes_full()
 
             # L3 write starts at T_N (data's L2 backup was 2 rounds ago, already done)
             write_arrival = StateManager.get_global_clock()
@@ -575,7 +582,7 @@ class C_HiCacheController(BaseHook):
                 for tier_name, write_blocks in per_tier_write_accum.items():
                     if write_blocks <= 0:
                         continue
-                    write_bytes = write_blocks * C_HiCacheController.KV_CACHE_BYTES
+                    write_bytes = write_blocks * C_HiCacheController.KV_CACHE_BYTES_FULL
                     sim = C_HiCacheController._tier_sims.get(tier_name)
                     if C_HiCacheController._tier_write_mode == "serial":
                         arrival = write_arrival + accumulated
@@ -611,7 +618,7 @@ class C_HiCacheController(BaseHook):
                     write_time = max(tier_lats.values()) if tier_lats else 0.0
             else:
                 # Single-tier fallback
-                total_write_bytes = total_write_tokens * C_HiCacheController.KV_CACHE_BYTES
+                total_write_bytes = total_write_tokens * C_HiCacheController.KV_CACHE_BYTES_FULL
                 sim = C_HiCacheController._get_ssd_simulator()
                 if sim is not None and hasattr(sim, 'submit_write'):
                     _, lat, _, _ = sim.submit_write(
@@ -641,6 +648,8 @@ class C_HiCacheController(BaseHook):
 
             if C_HiCacheController.KV_CACHE_BYTES is None:
                 C_HiCacheController.KV_CACHE_BYTES = ConfigManager.get_kv_cache_bytes()
+            if C_HiCacheController.KV_CACHE_BYTES_FULL is None:
+                C_HiCacheController.KV_CACHE_BYTES_FULL = ConfigManager.get_kv_cache_bytes_full()
             if C_HiCacheController.DISK_READ_BANDWIDTH_BYTES is None:
                 C_HiCacheController.DISK_READ_BANDWIDTH_BYTES = (
                     ConfigManager.get_platform_config().disk_read_bandwidth
