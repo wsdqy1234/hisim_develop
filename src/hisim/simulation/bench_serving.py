@@ -2171,8 +2171,26 @@ async def benchmark(
         )
         pbar_total *= args.mooncake_num_rounds
     elif backend == "sglang" and args.dataset_name == "hisim-collection":
+        # Auto-detect timestamp unit: check raw timestamp values.
+        # If raw timestamps > 1e9 (Unix epoch ms), scale by 1000 (ms→s).
+        # Otherwise they're relative seconds → scale by 1.
+        ts_scale = 1
+        if input_requests:
+            # sample_hisim_collection_requests normalizes timestamps (raw - min).
+            # We need the RAW min to check if it's a Unix epoch ms.
+            # Read first line of the trace file to get raw timestamp.
+            try:
+                import json as _json
+                with open(args.dataset_path) as _f:
+                    _first = _json.loads(_f.readline())
+                _ts_field = "created_time" if "created_time" in _first else "timestamp"
+                _raw_ts = _first.get(_ts_field, 0)
+                if _raw_ts > 1e9:
+                    ts_scale = 1000  # ms → s
+            except Exception:
+                pass
         request_generator = get_request(
-            input_requests, -1, use_trace_timestamps=True, timestamp_scale_s=1
+            input_requests, -1, use_trace_timestamps=True, timestamp_scale_s=ts_scale
         )
     else:
         request_generator = get_request(input_requests, request_rate)
