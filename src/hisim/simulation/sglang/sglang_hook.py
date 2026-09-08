@@ -65,16 +65,21 @@ class C_TokenizerManagerHook(BaseHook):
         original_send_one_request = target._send_one_request
 
         # When running with blocking mode, send the created time to schedule.
-        def wrapped_send_one_request(self, obj, tokenized_obj, created_time):
-            if obj.__class__.__name__ == "GenerateReqInput":
-                if (
-                    tokenized_obj.sampling_params.custom_params is not None
-                    and "simulation" in tokenized_obj.sampling_params.custom_params
-                ):
-                    tokenized_obj.sampling_params.custom_params["simulation"][
-                        "server_created_time"
-                    ] = created_time
-            return original_send_one_request(self, obj, tokenized_obj, created_time)
+        def wrapped_send_one_request(self, *args):
+            import time as _time
+
+            if len(args) >= 1 and args[0].__class__.__name__ == "GenerateReqInput":
+                obj = args[0]
+                tokenized_obj = args[1] if len(args) >= 2 else None
+                if tokenized_obj is not None:
+                    custom_params = getattr(
+                        tokenized_obj.sampling_params, "custom_params", None
+                    )
+                    if custom_params and "simulation" in custom_params:
+                        custom_params["simulation"]["server_created_time"] = (
+                            _time.time()
+                        )
+            return original_send_one_request(self, *args)
 
         target._send_one_request = wrapped_send_one_request
 
@@ -93,6 +98,11 @@ class C_ModelRunnerHook(BaseHook):
                     pass
 
             self.model = MockModel()
+
+            # Attributes that may not be set by the hook but are expected by sglang
+            self.use_ngram_embedding = False
+            self.is_hybrid_swa = False
+            self.is_draft_worker = False
 
             self.dtype = self.model_config.dtype
             self.kv_cache_dtype = (
@@ -548,10 +558,13 @@ class C_HiRadixCacheHook(BaseHook):
                 importlib.import_module("sglang.srt.managers.cache_controller"),
                 "HiCacheController",
             )
-            StorageMetricsCollector = getattr(
-                importlib.import_module("sglang.srt.metrics.collector"),
-                "StorageMetricsCollector",
-            )
+            try:
+                StorageMetricsCollector = getattr(
+                    importlib.import_module("sglang.srt.metrics.collector"),
+                    "StorageMetricsCollector",
+                )
+            except (ImportError, ModuleNotFoundError):
+                StorageMetricsCollector = None
 
             self.load_cache_event = threading.Event()
             self.cache_controller = HiCacheController(
@@ -567,7 +580,7 @@ class C_HiRadixCacheHook(BaseHook):
                 model_name=server_args.served_model_name,
                 storage_backend_extra_config=extra_config,
             )
-            if self.enable_storage_metrics:
+            if self.enable_storage_metrics and StorageMetricsCollector is not None:
                 # TODO: support pp
                 labels = {
                     "storage_backend": server_args.hicache_storage_backend,
