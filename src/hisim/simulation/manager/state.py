@@ -5,6 +5,7 @@ class StateManager:
     _current_inference_dur: float = 0
     _hicache_l2_load_dur: float = 0
     _hicache_l2_backup_dur: float = 0
+    _hicache_l3_backup_dur: float = 0
 
     @classmethod
     def reset(cls):
@@ -14,6 +15,7 @@ class StateManager:
         cls._current_inference_dur = 0
         cls._hicache_l2_backup_dur = 0
         cls._hicache_l2_load_dur = 0
+        cls._hicache_l3_backup_dur = 0
 
     @classmethod
     def inc_iteration(cls) -> None:
@@ -32,6 +34,10 @@ class StateManager:
         cls._hicache_l2_backup_dur += dur
 
     @classmethod
+    def inc_hicache_l3_backup_dur(cls, dur: float) -> None:
+        cls._hicache_l3_backup_dur += dur
+
+    @classmethod
     def pop_hicache_l2_load_dur(cls) -> float:
         dur = cls._hicache_l2_load_dur
         cls._hicache_l2_load_dur = 0
@@ -41,6 +47,12 @@ class StateManager:
     def pop_hicache_l2_backup_dur(cls) -> float:
         dur = cls._hicache_l2_backup_dur
         cls._hicache_l2_backup_dur = 0
+        return dur
+
+    @classmethod
+    def pop_hicache_l3_backup_dur(cls) -> float:
+        dur = cls._hicache_l3_backup_dur
+        cls._hicache_l3_backup_dur = 0
         return dur
 
     @classmethod

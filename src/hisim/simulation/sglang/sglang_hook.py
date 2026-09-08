@@ -432,19 +432,43 @@ class C_HiCacheController(BaseHook):
         def handle_backup_operation(self):
             if not self.enable_storage:
                 return
+            total_write_tokens = 0
             while True:
                 try:
                     operation = self.backup_queue.get(block=False)
                     if operation is None:
-                        return
+                        break
 
                     if not self.backup_skip:
                         self._page_backup(operation)
-                    # TODO: Track the backup operation according to the global clock
+                    # Collect write data size (token-level, same convention as prefetch)
+                    if hasattr(operation, "host_indices"):
+                        total_write_tokens += len(operation.host_indices)
                     self.ack_backup_queue.put(operation)
 
                 except Empty:
-                    return
+                    break
+
+            # Compute L2→L3 write time using SimpySSD (or fallback bandwidth)
+            if total_write_tokens > 0:
+                if C_HiCacheController.KV_CACHE_BYTES is None:
+                    C_HiCacheController.KV_CACHE_BYTES = ConfigManager.get_kv_cache_bytes()
+                total_write_bytes = total_write_tokens * C_HiCacheController.KV_CACHE_BYTES
+                sim = C_HiCacheController._get_ssd_simulator()
+                if sim is not None:
+                    write_time = sim.predict_write_time(
+                        total_write_bytes,
+                        C_HiCacheController.KV_CACHE_BYTES,
+                        is_sequential=True,
+                    )
+                else:
+                    if C_HiCacheController.DISK_WRITE_BANDWIDTH_BYTES is None:
+                        C_HiCacheController.DISK_WRITE_BANDWIDTH_BYTES = (
+                            ConfigManager.get_platform_config().disk_write_bandwidth
+                        )
+                    bw = C_HiCacheController.DISK_WRITE_BANDWIDTH_BYTES or 8e9
+                    write_time = total_write_bytes / bw
+                StateManager.inc_hicache_l3_backup_dur(write_time)
 
         def handle_prefetch_operation(self):
             if not self.enable_storage:
@@ -1015,7 +1039,11 @@ class C_SchedulerHook(BaseHook):
 
                 hicache_l2_load_dur = StateManager.pop_hicache_l2_load_dur()
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
+                hicache_l3_backup_dur = StateManager.pop_hicache_l3_backup_dur()
                 current_inference_dur = StateManager.get_current_inference_dur()
+
+                # L3 write overlaps with next inference; only overflow delays
+                l3_write_overflow = max(0, hicache_l3_backup_dur - current_inference_dur)
 
                 if C_SchedulerHook.OVERLAP_SCHEDULE:
                     StateManager.step_global_clock(
@@ -1026,13 +1054,16 @@ class C_SchedulerHook(BaseHook):
                     )
                     StateManager.step_global_clock(current_inference_dur)
                     request_response_time = (
-                        StateManager.get_global_clock() + hicache_l2_backup_dur
+                        StateManager.get_global_clock()
+                        + hicache_l2_backup_dur
+                        + l3_write_overflow
                     )
                 else:
                     StateManager.step_global_clock(
                         hicache_l2_load_dur
                         + current_inference_dur
                         + hicache_l2_backup_dur
+                        + l3_write_overflow
                     )
                     request_response_time = StateManager.get_global_clock()
                 # Request statistics
@@ -1054,6 +1085,7 @@ class C_SchedulerHook(BaseHook):
                         "forward_latency": current_inference_dur,
                         "l2_load_latency": hicache_l2_load_dur,
                         "l2_backup_latency": hicache_l2_backup_dur,
+                        "l3_backup_latency": hicache_l3_backup_dur,
                     }
                 )
             C_SchedulerHook.LAST_CPU_TS = time.time()
