@@ -69,6 +69,7 @@ class ConfigManager:
                     name=t.get("name", "default"),
                     ssd_config=t.get("ssd_config"),
                     read_bandwidth_gb=t.get("read_bandwidth_gb", 4.0),
+                    write_bandwidth_gb=t.get("write_bandwidth_gb"),
                     kvcm_storage_type=t.get("kvcm_storage_type", "pace"),
                     kvcm_bandwidth_mbps=t.get("kvcm_bandwidth_mbps", 4000),
                     kvcm_capacity_gb=t.get("kvcm_capacity_gb", 10.0),

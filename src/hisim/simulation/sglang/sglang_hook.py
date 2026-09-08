@@ -280,6 +280,7 @@ class C_HiCacheController(BaseHook):
     _ssd_simulator_initialized = False
     _tier_sims = None
     _tier_bandwidths = None
+    _tier_write_bandwidths = None
     _tier_read_mode = "parallel"
 
     @classmethod
@@ -306,8 +307,11 @@ class C_HiCacheController(BaseHook):
         if tiers:
             cls._tier_sims = {}
             cls._tier_bandwidths = {}
+            cls._tier_write_bandwidths = {}
             for tier in tiers:
                 cls._tier_bandwidths[tier.name] = tier.read_bandwidth_gb * 1e9
+                wbg = tier.write_bandwidth_gb or tier.read_bandwidth_gb
+                cls._tier_write_bandwidths[tier.name] = wbg * 1e9
                 if env in ("1", "default", "true", "True", "simpyssd", "simpyssd_multi"):
                     try:
                         from simpyssd import SSDTimingSimulator
@@ -385,34 +389,72 @@ class C_HiCacheController(BaseHook):
     def _calc_prefetch_multi_tier(
         per_tier_hits: dict, page_size_byte: int, max_dur: float
     ) -> tuple[float, float]:
-        tier_times = {}
+        read_arrival = (
+            StateManager.get_global_clock() + StateManager.get_last_l2_load_dur()
+        )
+
+        tier_info = {}  # tier_name -> (hit_count, wait, exec_t, lat)
         for tier_name, hit_count in per_tier_hits.items():
             if hit_count == 0:
                 continue
             total_bytes = hit_count * page_size_byte
-            sim = C_HiCacheController._tier_sims.get(tier_name) if C_HiCacheController._tier_sims else None
-            if sim:
-                t = sim.predict_read_time(total_bytes, page_size_byte, is_sequential=True)
+            sim = (
+                C_HiCacheController._tier_sims.get(tier_name)
+                if C_HiCacheController._tier_sims
+                else None
+            )
+            if sim and hasattr(sim, 'submit_read'):
+                avail_snapshot = sim.get_all_avail_time()
+                _, lat, wait, exec_t = sim.submit_read(
+                    read_arrival, total_bytes, page_size_byte, is_sequential=True
+                )
+                # Restore avail_time to undo read's effect (sglang aborts prefetch)
+                sim.set_all_avail_time(avail_snapshot)
+                tier_info[tier_name] = (hit_count, wait, exec_t, lat)
+            elif sim:
+                t = sim.predict_read_time(
+                    total_bytes, page_size_byte, is_sequential=True
+                )
+                tier_info[tier_name] = (hit_count, 0.0, t, t)
             else:
-                bw = C_HiCacheController._tier_bandwidths.get(tier_name, 8e9) if C_HiCacheController._tier_bandwidths else 8e9
+                bw = (
+                    C_HiCacheController._tier_bandwidths.get(tier_name, 8e9)
+                    if C_HiCacheController._tier_bandwidths
+                    else 8e9
+                )
                 t = total_bytes / bw
-            tier_times[tier_name] = (hit_count, t)
+                tier_info[tier_name] = (hit_count, 0.0, t, t)
 
-        if not tier_times:
+        if not tier_info:
             return 0.0, 0.0
 
+        total_completed = sum(c for c, _, _, _ in tier_info.values())
+
         if C_HiCacheController._tier_read_mode == "serial":
-            total_dur = sum(t for _, t in tier_times.values())
+            total_dur = sum(lat for _, _, _, lat in tier_info.values())
+            if total_dur <= max_dur:
+                return float(total_completed), total_dur
+            ratio = max_dur / total_dur
+            completed = sum(
+                max(1, int(c * ratio)) for c, _, _, _ in tier_info.values()
+            )
+            return float(completed), max_dur
         else:
-            total_dur = max(t for _, t in tier_times.values())
-
-        total_completed = sum(c for c, _ in tier_times.values())
-
-        if total_dur <= max_dur:
-            return float(total_completed), total_dur
-        ratio = max_dur / total_dur
-        completed = sum(max(1, int(c * ratio)) for c, _ in tier_times.values())
-        return float(completed), max_dur
+            # Parallel: total_dur = max(lat) across tiers
+            total_dur = max(lat for _, _, _, lat in tier_info.values())
+            if total_dur <= max_dur:
+                return float(total_completed), total_dur
+            # Partial: each tier independently checks budget after its own wait
+            completed = 0.0
+            for _, (hit_count, wait, exec_t, lat) in tier_info.items():
+                remaining = max_dur - wait
+                if remaining <= 0:
+                    continue
+                if exec_t <= remaining:
+                    completed += hit_count
+                elif exec_t > 0:
+                    completed += max(1.0, hit_count * (remaining / exec_t))
+            return completed, max_dur
 
     @staticmethod
     def calc_prefetch_pages(
@@ -453,6 +495,7 @@ class C_HiCacheController(BaseHook):
             if not self.enable_storage:
                 return
             total_write_tokens = 0
+            per_tier_write_accum = {}
             while True:
                 try:
                     operation = self.backup_queue.get(block=False)
@@ -464,44 +507,93 @@ class C_HiCacheController(BaseHook):
                     # Collect write data size (token-level, same convention as prefetch)
                     if hasattr(operation, "host_indices"):
                         total_write_tokens += len(operation.host_indices)
+                    # Accumulate per-tier write block counts from kvcm
+                    if C_HiCacheController._tier_sims:
+                        try:
+                            per_tier = self.storage_backend.get_last_write_per_tier()
+                            for tn, cnt in per_tier.items():
+                                per_tier_write_accum[tn] = per_tier_write_accum.get(tn, 0) + cnt
+                        except Exception:
+                            pass
                     self.ack_backup_queue.put(operation)
 
                 except Empty:
                     break
 
-            # Compute L2→L3 write time using SimpySSD timing-aware API (or fallback)
+            # Compute L2→L3 write time
             if total_write_tokens > 0:
                 if C_HiCacheController.KV_CACHE_BYTES is None:
                     C_HiCacheController.KV_CACHE_BYTES = ConfigManager.get_kv_cache_bytes()
-                total_write_bytes = total_write_tokens * C_HiCacheController.KV_CACHE_BYTES
-                sim = C_HiCacheController._get_ssd_simulator()
-                if sim is not None and hasattr(sim, 'submit_write'):
-                    # Timing-aware: submit with arrival time, get wait/exec breakdown
+
+                # Multi-tier: per-tier SSD timing with independent engines
+                if C_HiCacheController._tier_sims and per_tier_write_accum:
                     write_arrival = (
                         StateManager.get_global_clock()
                         + StateManager.get_last_l2_load_dur()
                         + StateManager.get_current_inference_dur()
                         + StateManager.get_last_l2_backup_dur()
                     )
-                    comp, lat, wait, exec_t = sim.submit_write(
-                        write_arrival, total_write_bytes,
-                        C_HiCacheController.KV_CACHE_BYTES,
-                        is_sequential=True
-                    )
-                    write_time = lat
-                elif sim is not None:
-                    write_time = sim.predict_write_time(
-                        total_write_bytes,
-                        C_HiCacheController.KV_CACHE_BYTES,
-                        is_sequential=True,
-                    )
+                    tier_lats = {}
+                    for tier_name, write_blocks in per_tier_write_accum.items():
+                        if write_blocks <= 0:
+                            continue
+                        write_bytes = write_blocks * C_HiCacheController.KV_CACHE_BYTES
+                        sim = C_HiCacheController._tier_sims.get(tier_name)
+                        if sim is not None and hasattr(sim, 'submit_write'):
+                            _, lat, _, _ = sim.submit_write(
+                                write_arrival, write_bytes,
+                                C_HiCacheController.KV_CACHE_BYTES,
+                                is_sequential=True
+                            )
+                            tier_lats[tier_name] = lat
+                        elif sim is not None:
+                            tier_lats[tier_name] = sim.predict_write_time(
+                                write_bytes,
+                                C_HiCacheController.KV_CACHE_BYTES,
+                                is_sequential=True,
+                            )
+                        else:
+                            bw = (
+                                C_HiCacheController._tier_write_bandwidths.get(tier_name, 8e9)
+                                if C_HiCacheController._tier_write_bandwidths
+                                else 8e9
+                            )
+                            tier_lats[tier_name] = write_bytes / bw
+
+                    if C_HiCacheController._tier_read_mode == "serial":
+                        write_time = sum(tier_lats.values())
+                    else:
+                        write_time = max(tier_lats.values()) if tier_lats else 0.0
                 else:
-                    if C_HiCacheController.DISK_WRITE_BANDWIDTH_BYTES is None:
-                        C_HiCacheController.DISK_WRITE_BANDWIDTH_BYTES = (
-                            ConfigManager.get_platform_config().disk_write_bandwidth
+                    # Single-tier fallback (existing behavior)
+                    total_write_bytes = total_write_tokens * C_HiCacheController.KV_CACHE_BYTES
+                    sim = C_HiCacheController._get_ssd_simulator()
+                    if sim is not None and hasattr(sim, 'submit_write'):
+                        write_arrival = (
+                            StateManager.get_global_clock()
+                            + StateManager.get_last_l2_load_dur()
+                            + StateManager.get_current_inference_dur()
+                            + StateManager.get_last_l2_backup_dur()
                         )
-                    bw = C_HiCacheController.DISK_WRITE_BANDWIDTH_BYTES or 8e9
-                    write_time = total_write_bytes / bw
+                        comp, lat, wait, exec_t = sim.submit_write(
+                            write_arrival, total_write_bytes,
+                            C_HiCacheController.KV_CACHE_BYTES,
+                            is_sequential=True
+                        )
+                        write_time = lat
+                    elif sim is not None:
+                        write_time = sim.predict_write_time(
+                            total_write_bytes,
+                            C_HiCacheController.KV_CACHE_BYTES,
+                            is_sequential=True,
+                        )
+                    else:
+                        if C_HiCacheController.DISK_WRITE_BANDWIDTH_BYTES is None:
+                            C_HiCacheController.DISK_WRITE_BANDWIDTH_BYTES = (
+                                ConfigManager.get_platform_config().disk_write_bandwidth
+                            )
+                        bw = C_HiCacheController.DISK_WRITE_BANDWIDTH_BYTES or 8e9
+                        write_time = total_write_bytes / bw
                 StateManager.inc_hicache_l3_backup_dur(write_time)
 
         def handle_prefetch_operation(self):

@@ -1,8 +1,5 @@
 class Engine:
-    engine = None
     def __init__(self):
-        assert(Engine.engine is None)
-        Engine.engine = self
         self.events = []
         self.now = 0
 
@@ -15,8 +12,6 @@ class Engine:
         self.now = event.time
         obj = event.obj
         obj.do(event)
-
-engine = Engine()
 
 class Event:
     def __init__(self, obj, func, time, args):

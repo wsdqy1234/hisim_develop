@@ -242,6 +242,10 @@ WriteCacheRes OptimizerManager::WriteCache(const std::string &instance_id,
         res.kvcm_write_length = last_write->newly_inserted_blocks;
         // write_hit = 请求写入数 - 实际新插入数（即已存在、未被驱逐的 block 数）
         res.kvcm_write_hit_length = last_write->write_blocks - last_write->newly_inserted_blocks;
+        res.per_tier_write_block_num.assign(
+            last_write->per_tier_write_blocks.begin(),
+            last_write->per_tier_write_blocks.end());
+        res.tier_names = last_write->tier_names;
     }
     return res;
 }

@@ -64,7 +64,9 @@ PYBIND11_MODULE(_native, module) {
     py::class_<kvcm::WriteCacheRes>(module, "WriteCacheRes")
         .def_readonly("trace_id", &kvcm::WriteCacheRes::trace_id)
         .def_readonly("kvcm_write_length", &kvcm::WriteCacheRes::kvcm_write_length)
-        .def_readonly("kvcm_write_hit_length", &kvcm::WriteCacheRes::kvcm_write_hit_length);
+        .def_readonly("kvcm_write_hit_length", &kvcm::WriteCacheRes::kvcm_write_hit_length)
+        .def_readonly("per_tier_write_block_num", &kvcm::WriteCacheRes::per_tier_write_block_num)
+        .def_readonly("tier_names", &kvcm::WriteCacheRes::tier_names);
 
     // 绑定 RadixTreeExport 结构体
     py::class_<kvcm::RadixTreeIndex::RadixTreeExportNode>(module, "RadixTreeExportNode")

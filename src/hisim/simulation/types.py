@@ -69,6 +69,7 @@ class StorageTierConfig:
     name: str
     ssd_config: Optional[str] = None
     read_bandwidth_gb: float = 4.0
+    write_bandwidth_gb: Optional[float] = None
     kvcm_storage_type: str = "pace"
     kvcm_bandwidth_mbps: int = 4000
     kvcm_capacity_gb: float = 10.0

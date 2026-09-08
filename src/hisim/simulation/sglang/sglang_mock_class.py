@@ -1025,6 +1025,7 @@ def _pass_str_to_block_ids(hash_key):
 class MockHiCacheStorage:
     def __init__(self, *args, **kwargs):
         self._last_per_tier_hits = None
+        self._last_per_tier_write = None
         if kvcm_py_optimizer is not None:
             logger.info("Using KVCM HiCache storage")
             self.init_kvcm()
@@ -1139,12 +1140,20 @@ class MockHiCacheStorage:
             # insert to kvcm
             trace_id = "1"
             write_timestamp = int(time.time() * 1000)
-            self.storage_manager.WriteCache(
+            res = self.storage_manager.WriteCache(
                 self.instance_id,
                 trace_id,
                 write_timestamp,
                 int_hash_keys,
             )
+            # Cache per-tier write block counts for get_last_write_per_tier()
+            if (hasattr(res, "tier_names") and hasattr(res, "per_tier_write_block_num")
+                    and res.tier_names):
+                self._last_per_tier_write = dict(
+                    zip(res.tier_names, res.per_tier_write_block_num)
+                )
+            else:
+                self._last_per_tier_write = {"default": res.kvcm_write_length}
             return True
         else:
             for key, value in zip(keys, values):
@@ -1193,6 +1202,13 @@ class MockHiCacheStorage:
         """Return per-tier hit counts from the last batch_exists() call. No extra kvcm call."""
         if self._last_per_tier_hits is not None:
             return self._last_per_tier_hits
+        return {"default": 0}
+
+    def get_last_write_per_tier(self) -> dict:
+        """Return per-tier newly-inserted write block counts from the last batch_set() call.
+        No extra kvcm call. Mirrors batch_exists_per_tier() pattern."""
+        if self._last_per_tier_write is not None:
+            return self._last_per_tier_write
         return {"default": 0}
 
     def clear(self) -> bool:

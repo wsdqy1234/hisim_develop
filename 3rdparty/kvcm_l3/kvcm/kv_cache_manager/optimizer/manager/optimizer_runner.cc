@@ -274,6 +274,8 @@ void OptimizerRunner::HandleWriteCache(const WriteCacheSchemaTrace &trace) {
     record.timestamp_ns = trace.timestamp_ns();
     record.write_blocks = trace.keys().size();
     record.newly_inserted_blocks = result.inserted_keys.size();
+    record.tier_names = indexer->GetTierNames();
+    record.per_tier_write_blocks = eviction_manager_->GetCurrentInstanceUsagePerTier(instance_id);
     record.trace_id = trace.trace_id();
     stats_collector_->OnWriteComplete(instance_id, record);
 }

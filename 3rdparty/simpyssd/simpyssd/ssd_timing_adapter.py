@@ -1,7 +1,7 @@
 import math
 import random
 
-from .sim import engine, Event, Sim
+from .sim import Engine, Event, Sim
 from .ssd_estimate import SSD, Cmd
 from .ssd_config import ssd_config
 
@@ -16,12 +16,13 @@ class StubSystem:
 class SSDTimingSimulator:
     def __init__(self, cfg_path):
         ssd_config.read_conf_file(cfg_path)
-        self._ssd = SSD(StubSystem())
+        self._engine = Engine()
+        self._ssd = SSD(StubSystem(), self._engine)
 
     def _reset(self):
         """Full reset: engine + all chip state (including avail_time)"""
-        engine.now = 0
-        engine.events = []
+        self._engine.now = 0
+        self._engine.events = []
         ssd = self._ssd
         ssd.issued_cmd = set()
         ssd.finished_cmd = set()
@@ -43,7 +44,7 @@ class SSDTimingSimulator:
 
     def _soft_reset(self):
         """Soft reset: engine + exec state, but keep avail_time (for timing simulation)"""
-        engine.events = []
+        self._engine.events = []
         ssd = self._ssd
         ssd.issued_cmd = set()
         ssd.finished_cmd = set()
@@ -88,9 +89,9 @@ class SSDTimingSimulator:
                 chip_id = random.randrange(n_chip)
             cmd = Cmd(cmd_typ, ch_id, chip_id, data_sz=io_block_size)
             self._ssd.issue(cmd)
-        while engine.events:
-            engine.exec()
-        return engine.now * 1e-6
+        while self._engine.events:
+            self._engine.exec()
+        return self._engine.now * 1e-6
 
     # ===== Timing-aware API =====
 
@@ -120,12 +121,11 @@ class SSDTimingSimulator:
     def _submit_timed(self, cmd_typ, arrival_us, data_bytes, io_block_size,
                       is_sequential):
         # Set engine time to arrival
-        engine.now = arrival_us
+        self._engine.now = arrival_us
         # Soft reset: clear exec state but keep avail_time on ALL chips
         self._soft_reset()
 
         # Snapshot avail_time of ALL chips before submission
-        # (to compute max wait across all chips)
         avail_before = {}
         for ci, ch in enumerate(self._ssd.channels):
             for pi, chip in enumerate(ch.chips):
@@ -147,18 +147,17 @@ class SSDTimingSimulator:
 
         # Run ALL events to completion
         safety = 0
-        while engine.events:
-            engine.exec()
+        while self._engine.events:
+            self._engine.exec()
             safety += 1
             if safety > 10000000:
                 break
 
         # Completion = engine.now after ALL I/Os finish
-        comp = engine.now
+        comp = self._engine.now
         total_lat = comp - arrival_us
 
         # wait = max wait across all chips that were used
-        # (the chip that took the longest to become available)
         max_wait = 0.0
         for i in range(num_io):
             if is_sequential:

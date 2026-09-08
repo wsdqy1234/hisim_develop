@@ -16,6 +16,8 @@ struct WriteCacheRes {
     std::string trace_id;
     int64_t kvcm_write_length;
     int64_t kvcm_write_hit_length;
+    std::vector<int64_t> per_tier_write_block_num;
+    std::vector<std::string> tier_names;
 };
 
 } // namespace kv_cache_manager
