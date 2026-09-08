@@ -332,7 +332,10 @@ class MockTokenToKVPool:
 
         # self.head_num = head_num
         # self.head_dim = head_dim
-        # Overwrite
+        # Save real values for capacity calculations (MockTokenToKVPoolHost)
+        self._real_head_num = head_num
+        self._real_head_dim = head_dim
+        # Overwrite to 1x1 to save memory (actual buffers stay tiny)
         self.head_num = 1
         self.head_dim = 1
 
@@ -814,13 +817,24 @@ class MockTokenToKVPoolHost:
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
 
-        assert self.size > device_pool.size, (
-            "The host memory should be larger than the device memory with the current protocol"
-        )
+        if self.size <= device_pool.size:
+            logger.warning(
+                f"Host memory pool ({self.size} tokens) is not larger than device pool "
+                f"({device_pool.size} tokens). L2 may evict before L1 does."
+            )
 
         # Verify there is enough available host memory.
+        # Use actual mock buffer size (1x1 per token) for the check, not the
+        # virtual size_per_token (which uses real head_num/dim for capacity).
+        mock_per_token = (
+            self.device_pool.head_num
+            * self.device_pool.head_dim
+            * self.layer_num
+            * self.dtype.itemsize
+            * 2
+        )
         host_mem = psutil.virtual_memory()
-        requested_bytes = self.size * self.size_per_token
+        requested_bytes = self.size * mock_per_token
         # preserve at least 10GB for other usage
         ten_gb = 10 * (1024**3)
         available_bytes = host_mem.available - ten_gb
@@ -833,7 +847,9 @@ class MockTokenToKVPoolHost:
             )
         else:
             logger.info(
-                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache."
+                f"Allocating {requested_bytes / 1e9:.2f} GB host memory for hierarchical KV cache "
+                f"(virtual capacity: {self.size} tokens × {self.size_per_token / 1024:.0f} KB/token "
+                f"= {self.size * self.size_per_token / 1e9:.1f} GB virtual)."
             )
 
         self.kv_buffer = self.init_kv_buffer()
@@ -843,12 +859,14 @@ class MockTokenToKVPoolHost:
         self.clear()
 
     def get_size_per_token(self):
-        # MHA implementation
+        self.layer_num = self.device_pool.layer_num
+        # Use real model params for capacity calculation (not mock 1x1)
+        real_head_num = getattr(self.device_pool, '_real_head_num', 1)
+        real_head_dim = getattr(self.device_pool, '_real_head_dim', 1)
+        # Keep mock 1x1 for actual buffer allocation (saves memory)
         self.head_num = self.device_pool.head_num
         self.head_dim = self.device_pool.head_dim
-        self.layer_num = self.device_pool.layer_num
-
-        return self.head_dim * self.head_num * self.layer_num * self.dtype.itemsize * 2
+        return real_head_dim * real_head_num * self.layer_num * self.dtype.itemsize * 2
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":
