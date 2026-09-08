@@ -1,0 +1,438 @@
+#include "kv_cache_manager/data_storage/storage_config.h"
+
+#include <sstream>
+
+namespace kv_cache_manager {
+
+std::string ThreeFSStorageSpec::ToString() const {
+    std::ostringstream oss;
+    oss << "cluster_name: " << cluster_name_ << ", mountpoint: " << mountpoint_ << ", root_dir: " << root_dir_;
+    return oss.str();
+}
+
+bool ThreeFSStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    // cluster_name未使用
+    // if (cluster_name_.empty()) {
+    //     valid = false;
+    //     invalid_fields += "{cluster_name}";
+    // }
+    if (mountpoint_.empty()) {
+        valid = false;
+        local_invalid_fields += "{mountpoint}";
+    }
+    if (root_dir_.empty()) {
+        valid = false;
+        local_invalid_fields += "{root_dir}";
+    }
+    if (!valid) {
+        invalid_fields += "{ThreeFSStorageSpec: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+
+std::string VcnsThreeFSStorageSpec::ToString() const {
+    std::ostringstream oss;
+    oss << "cluster_name: " << cluster_name_ << ", mountpoint: " << mountpoint_ << ", root_dir: " << root_dir_
+        << ", remote_host:" << remote_host_ << ", remote_port:" << remote_port_
+        << ", meta_storage_uri:" << meta_storage_uri_;
+    return oss.str();
+}
+
+bool VcnsThreeFSStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (mountpoint_.empty()) {
+        valid = false;
+        local_invalid_fields += "{mountpoint}";
+    }
+    if (root_dir_.empty()) {
+        valid = false;
+        local_invalid_fields += "{root_dir}";
+    }
+    if (remote_host_.empty()) {
+        valid = false;
+        local_invalid_fields += "{remote_host}";
+    }
+    if (remote_port_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{remote_port}";
+    }
+    if (meta_storage_uri_.empty()) {
+        valid = false;
+        local_invalid_fields += "{meta_storage_uri}";
+    }
+    if (!valid) {
+        invalid_fields += "{VcnsThreeFSStorageSpec: " + local_invalid_fields + "}";
+    }
+
+    return valid;
+}
+
+std::string MooncakeStorageSpec::ToString() const {
+    std::ostringstream oss;
+    oss << "local_hostname: " << local_hostname_ << ", metadata_conn_string: " << metadata_connstring_
+        << ", protocol: " << protocol_ << ", rdma_device: " << rdma_device_
+        << ", master_server_entry: " << master_server_entry_;
+    return oss.str();
+}
+
+bool MooncakeStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (local_hostname_.empty()) {
+        valid = false;
+        local_invalid_fields += "{local_hostname}";
+    }
+    if (metadata_connstring_.empty()) {
+        valid = false;
+        local_invalid_fields += "{metadata_connstring}";
+    }
+    if (protocol_.empty()) {
+        valid = false;
+        local_invalid_fields += "{protocol}";
+    }
+    if (master_server_entry_.empty()) {
+        valid = false;
+        local_invalid_fields += "{master_server_entry}";
+    }
+    if (!valid) {
+        invalid_fields += "{MooncakeStorageSpec: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+std::string TairMemPoolStorageSpec::ToString() const {
+    std::ostringstream oss;
+    oss << "domain: " << domain_ << ", timeout: " << timeout_ << ", service_discovery_url: " << service_discovery_url_;
+    return oss.str();
+}
+bool TairMemPoolStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (domain_.empty()) {
+        valid = false;
+        local_invalid_fields += "{domain}";
+    }
+
+    if (!valid) {
+        invalid_fields += "{TairMemPoolStorageSpec: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+std::string NfsStorageSpec::ToString() const {
+    std::ostringstream oss;
+    oss << "root_path: " << root_path_;
+    oss << " , key_count_per_file: " << key_count_per_file_;
+    return oss.str();
+}
+bool NfsStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (root_path_.empty()) {
+        valid = false;
+        local_invalid_fields += "{root_path}";
+    }
+    if (!valid) {
+        invalid_fields += "{NfsStorageSpec: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+std::string StorageConfig::ToString() const {
+    std::ostringstream oss;
+    oss << "type: " << kv_cache_manager::ToString(type_) << ", global_unique_name: " << global_unique_name_
+        << ", storage_spec: " << (storage_spec_ ? storage_spec_->ToString() : "null");
+    return oss.str();
+}
+
+std::string ToString(const DataStorageType &type) {
+    switch (type) {
+    case DataStorageType::DATA_STORAGE_TYPE_UNKNOWN:
+        return "unknown";
+    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+        return "hf3fs";
+    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+        return "vcns_hf3fs";
+    case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
+        return "mooncake";
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+        return "pace";
+    case DataStorageType::DATA_STORAGE_TYPE_NFS:
+        return "file";
+    case DataStorageType::DATA_STORAGE_TYPE_DUMMY:
+        return "dummy";
+    case DataStorageType::DATA_STORAGE_TYPE_VINEYARD:
+        return "vineyard";
+    default:
+        return "unrecognized";
+    }
+}
+
+DataStorageType ToDataStorageType(const std::string &type) {
+    if (type == "hf3fs") {
+        return DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+    } else if (type == "vcns_hf3fs") {
+        return DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS;
+    } else if (type == "mooncake") {
+        return DataStorageType::DATA_STORAGE_TYPE_MOONCAKE;
+    } else if (type == "pace") {
+        return DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL;
+    } else if (type == "file") {
+        return DataStorageType::DATA_STORAGE_TYPE_NFS;
+    } else if (type == "dummy") {
+        return DataStorageType::DATA_STORAGE_TYPE_DUMMY;
+    } else if (type == "vineyard") {
+        return DataStorageType::DATA_STORAGE_TYPE_VINEYARD;
+    } else {
+        return DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+    }
+}
+
+DataStorageType ToBaseType(const DataStorageType &type) noexcept {
+    if (type == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
+        return DataStorageType::DATA_STORAGE_TYPE_HF3FS;
+    }
+    return type;
+}
+
+// ThreeFSStorageSpec
+bool ThreeFSStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "cluster_name", cluster_name_);
+    KVCM_JSON_GET_MACRO(rapid_value, "mountpoint", mountpoint_);
+    KVCM_JSON_GET_MACRO(rapid_value, "root_dir", root_dir_);
+    KVCM_JSON_GET_MACRO(rapid_value, "key_count_per_file", key_count_per_file_);
+    return true;
+}
+
+void ThreeFSStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "cluster_name", cluster_name_);
+    Put(writer, "mountpoint", mountpoint_);
+    Put(writer, "root_dir", root_dir_);
+    Put(writer, "key_count_per_file", key_count_per_file_);
+}
+
+// VcnsThreeFSStorageSpec
+bool VcnsThreeFSStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "cluster_name", cluster_name_);
+    KVCM_JSON_GET_MACRO(rapid_value, "mountpoint", mountpoint_);
+    KVCM_JSON_GET_MACRO(rapid_value, "root_dir", root_dir_);
+    KVCM_JSON_GET_MACRO(rapid_value, "key_count_per_file", key_count_per_file_);
+    KVCM_JSON_GET_MACRO(rapid_value, "remote_host", remote_host_);
+    KVCM_JSON_GET_MACRO(rapid_value, "remote_port", remote_port_);
+    KVCM_JSON_GET_MACRO(rapid_value, "meta_storage_uri", meta_storage_uri_);
+    return true;
+}
+
+void VcnsThreeFSStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "cluster_name", cluster_name_);
+    Put(writer, "mountpoint", mountpoint_);
+    Put(writer, "root_dir", root_dir_);
+    Put(writer, "key_count_per_file", key_count_per_file_);
+    Put(writer, "remote_host", remote_host_);
+    Put(writer, "remote_port", remote_port_);
+    Put(writer, "meta_storage_uri", meta_storage_uri_);
+}
+
+// MooncakeStorageSpec
+bool MooncakeStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "local_hostname", local_hostname_);
+    KVCM_JSON_GET_MACRO(rapid_value, "metadata_connstring", metadata_connstring_);
+    KVCM_JSON_GET_MACRO(rapid_value, "protocol", protocol_);
+    KVCM_JSON_GET_MACRO(rapid_value, "rdma_device", rdma_device_);
+    KVCM_JSON_GET_MACRO(rapid_value, "master_server_entry", master_server_entry_);
+    return true;
+}
+
+void MooncakeStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "local_hostname", local_hostname_);
+    Put(writer, "metadata_connstring", metadata_connstring_);
+    Put(writer, "protocol", protocol_);
+    Put(writer, "rdma_device", rdma_device_);
+    Put(writer, "master_server_entry", master_server_entry_);
+}
+
+// TairMemPoolStorageSpec
+bool TairMemPoolStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "domain", domain_);
+    KVCM_JSON_GET_MACRO(rapid_value, "timeout", timeout_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "service_discovery_url", service_discovery_url_, std::string(""));
+
+    // 向后兼容：把已废弃的 enable_vipserver / vipserver_domain 自动迁移成 service_discovery_url，
+    // 兼容旧 admin 工具 / 旧持久化数据。新字段 service_discovery_url 优先级更高，
+    // 已显式指定时不会被旧字段覆盖。
+    if (service_discovery_url_.empty()) {
+        bool legacy_enable_vipserver = false;
+        std::string legacy_vipserver_domain;
+        if (!Get(rapid_value, "enable_vipserver", legacy_enable_vipserver, false) ||
+            !Get(rapid_value, "vipserver_domain", legacy_vipserver_domain, std::string(""))) {
+            return false;
+        }
+        if (legacy_enable_vipserver && !legacy_vipserver_domain.empty()) {
+            service_discovery_url_ = "vipserver://" + legacy_vipserver_domain;
+        }
+    }
+    return true;
+}
+
+void TairMemPoolStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "domain", domain_);
+    Put(writer, "timeout", timeout_);
+    Put(writer, "service_discovery_url", service_discovery_url_);
+}
+
+bool NfsStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "root_path", root_path_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "key_count_per_file", key_count_per_file_, 1);
+    return true;
+}
+
+void NfsStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "root_path", root_path_);
+    Put(writer, "key_count_per_file", key_count_per_file_);
+}
+
+// DummyStorageSpec
+std::string DummyStorageSpec::ToString() const {
+    std::ostringstream oss;
+    oss << "root_path: " << root_path_;
+    oss << " , key_count_per_file: " << key_count_per_file_;
+    return oss.str();
+}
+
+bool DummyStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (root_path_.empty()) {
+        valid = false;
+        local_invalid_fields += "{root_path}";
+    }
+    if (!valid) {
+        invalid_fields += "{DummyStorageSpec: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+
+bool DummyStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_MACRO(rapid_value, "root_path", root_path_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "key_count_per_file", key_count_per_file_, 1);
+    return true;
+}
+
+void DummyStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "root_path", root_path_);
+    Put(writer, "key_count_per_file", key_count_per_file_);
+}
+
+bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
+    std::string type_str;
+    KVCM_JSON_GET_MACRO(rapid_value, "type", type_str);
+    type_ = ToDataStorageType(type_str);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "is_available", is_available_, true);
+    KVCM_JSON_GET_MACRO(rapid_value, "global_unique_name", global_unique_name_);
+    if (type_ == DataStorageType::DATA_STORAGE_TYPE_NFS) {
+        auto tmp = std::make_shared<NfsStorageSpec>();
+        KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
+        storage_spec_ = tmp;
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_HF3FS) {
+        auto tmp = std::make_shared<ThreeFSStorageSpec>();
+        KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
+        storage_spec_ = tmp;
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS) {
+        auto tmp = std::make_shared<VcnsThreeFSStorageSpec>();
+        KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
+        storage_spec_ = tmp;
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_MOONCAKE) {
+        auto tmp = std::make_shared<MooncakeStorageSpec>();
+        KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
+        storage_spec_ = tmp;
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL) {
+        auto tmp = std::make_shared<TairMemPoolStorageSpec>();
+        KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
+        storage_spec_ = tmp;
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
+        auto tmp = std::make_shared<DummyStorageSpec>();
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_VINEYARD) {
+        auto tmp = std::make_shared<VineyardStorageSpec>();
+        KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
+        storage_spec_ = tmp;
+    } else {
+        storage_spec_ = nullptr; // 对未知或未支持类型，设为空
+    }
+    return true;
+}
+
+void StorageConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "type", kv_cache_manager::ToString(type_));
+    Put(writer, "is_available", is_available_);
+    Put(writer, "global_unique_name", global_unique_name_);
+    Put(writer, "storage_spec", storage_spec_);
+}
+
+bool StorageConfig::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (global_unique_name_.empty()) {
+        valid = false;
+        local_invalid_fields += "{global_unique_name}";
+    }
+    if (type_ == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN || storage_spec_ == nullptr) {
+        valid = false;
+        local_invalid_fields += "{storage_spec}";
+    }
+    if (storage_spec_ && !storage_spec_->ValidateRequiredFields(local_invalid_fields)) {
+        valid = false;
+    }
+    if (!valid) {
+        invalid_fields += "{StorageConfig: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+
+// VineyardStorageSpec
+bool VineyardStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "heartbeat_timeout_ms", heartbeat_timeout_ms_, static_cast<int64_t>(kDefaultHeartbeatTimeoutMs));
+    KVCM_JSON_GET_DEFAULT_MACRO(
+        rapid_value, "cleanup_grace_ms", cleanup_grace_ms_, static_cast<int64_t>(kDefaultCleanupGraceMs));
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value,
+                                "liveness_check_interval_ms",
+                                liveness_check_interval_ms_,
+                                static_cast<int64_t>(kDefaultLivenessCheckIntervalMs));
+    return true;
+}
+
+void VineyardStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "heartbeat_timeout_ms", heartbeat_timeout_ms_);
+    Put(writer, "cleanup_grace_ms", cleanup_grace_ms_);
+    Put(writer, "liveness_check_interval_ms", liveness_check_interval_ms_);
+}
+
+bool VineyardStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    bool valid = true;
+    std::string local_invalid_fields;
+    if (heartbeat_timeout_ms_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{heartbeat_timeout_ms}";
+    }
+    if (cleanup_grace_ms_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{cleanup_grace_ms}";
+    }
+    if (liveness_check_interval_ms_ <= 0) {
+        valid = false;
+        local_invalid_fields += "{liveness_check_interval_ms}";
+    }
+    if (!valid) {
+        invalid_fields += "{VineyardStorageSpec: " + local_invalid_fields + "}";
+    }
+    return valid;
+}
+
+std::string VineyardStorageSpec::ToString() const {
+    std::ostringstream oss;
+    oss << "heartbeat_timeout_ms: " << heartbeat_timeout_ms_ << ", cleanup_grace_ms: " << cleanup_grace_ms_
+        << ", liveness_check_interval_ms: " << liveness_check_interval_ms_;
+    return oss.str();
+}
+
+} // namespace kv_cache_manager

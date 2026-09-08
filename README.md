@@ -26,6 +26,33 @@ cd hisim
 pip install .
 ```
 
+### L3 Multi-level Cache Simulation (Optional)
+
+The L3 (disk/remote) tier of the hierarchical cache simulation is backed by the
+optional `kvcm_py_optimizer` extension, whose source and standalone CMake build
+live under [`3rdparty/kvcm_l3/`](./3rdparty/kvcm_l3/README.md). Without it, `MockHiCacheStorage`
+falls back to a simple `set()` backend (no real L3 prefix matching) and hisim
+still runs L1/L2 scenarios without error.
+
+To enable L3:
+
+```bash
+cd 3rdparty/kvcm_l3
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release && cmake --build build
+python setup.py bdist_wheel --dist-dir dist
+pip install dist/kvcm_py_optimizer-*.whl
+cd .. && pip install .
+```
+
+The bundled optimizer startup config is shipped inside the wheel; override it
+with `HISIM_KVCM_CONFIG_PATH=/path/to/config.json` if needed.
+
+> Note: `sglang_mock_class.py` calls `kvcm_py_optimizer` with arguments adapted
+> to the vendored kvcm pybind API (`WriteCache` without `write_token_ids`;
+> `GetCacheLocation` with `block_mask=0` and `input_len=len(keys)*block_size`).
+> See [`3rdparty/kvcm_l3/README.md`](./3rdparty/kvcm_l3/README.md) for the rationale. This adapter
+> may need revisiting when aligning with a newer upstream kvcm API.
+
 ---
 
 ## Support Matrix

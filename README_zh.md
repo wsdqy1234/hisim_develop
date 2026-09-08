@@ -21,6 +21,32 @@ cd hisim
 pip install .
 ```
 
+### L3 多层级缓存仿真（可选）
+
+多层级缓存的 L3（磁盘/远端）层仿真由可选的 `kvcm_py_optimizer` 扩展提供，
+其源码与独立 CMake 构建位于 [`3rdparty/kvcm_l3/`](./3rdparty/kvcm_l3/README.md)。未安装时
+`MockHiCacheStorage` 退化为简易 `set()` 后端（无真实 L3 前缀匹配），hisim 的
+L1/L2 场景仍可正常运行。
+
+启用 L3：
+
+```bash
+cd 3rdparty/kvcm_l3
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release && cmake --build build
+python setup.py bdist_wheel --dist-dir dist
+pip install dist/kvcm_py_optimizer-*.whl
+cd .. && pip install .
+```
+
+默认配置随 wheel 内置；如需替换，设置环境变量
+`HISIM_KVCM_CONFIG_PATH=/path/to/config.json`。
+
+> 说明：`sglang_mock_class.py` 调用 `kvcm_py_optimizer` 时已按 vendored kvcm
+> pybind API 做了适配（`WriteCache` 去掉 `write_token_ids`；`GetCacheLocation`
+> 传 `block_mask=0`、`input_len=len(keys)*block_size`），详见
+> [`3rdparty/kvcm_l3/README.md`](./3rdparty/kvcm_l3/README.md)。与更新版本 upstream kvcm API
+> 对齐时可能需要 revisiting。
+
 ---
 ## Support Matrix
 

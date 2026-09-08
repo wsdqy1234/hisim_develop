@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from hisim.simulation.sglang.version import VersionDispatcher
 
 try:
-    from kv_cache_manager.optimizer.pybind import kvcm_py_optimizer
+    import kvcm_py_optimizer
 except ImportError:
     kvcm_py_optimizer = None
 
@@ -25,6 +25,7 @@ except ImportError:
 
 logger = get_logger("hisim")
 _CURRENT_DIR = Path(__file__).parent.resolve()
+_KVCM_BLOCK_SIZE = 16
 
 
 def alloc_extend_cpu(
@@ -1051,16 +1052,7 @@ class MockHiCacheStorage:
         self.temp_dir = tempfile.mkdtemp()
         logger.info(f"Using temporary directory: {self.temp_dir}")
 
-        project_root = _CURRENT_DIR.parents[4]
-        config_path = (
-            project_root
-            / "kv_cache_manager"
-            / "optimizer"
-            / "test"
-            / "testdata"
-            / "optimizer_startup_config_load.json"
-        )
-        config_path = config_path.resolve()
+        config_path = os.environ.get("HISIM_KVCM_CONFIG_PATH") or kvcm_py_optimizer.get_config_path()
         self.config_loader = kvcm_py_optimizer.OptimizerConfigLoader()
 
         if not self.config_loader.load(str(config_path)):
@@ -1115,13 +1107,11 @@ class MockHiCacheStorage:
             # insert to kvcm
             trace_id = "1"
             write_timestamp = int(time.time() * 1000)
-            write_token_ids = [1]
             self.storage_manager.WriteCache(
                 self.instance_id,
                 trace_id,
                 write_timestamp,
                 int_hash_keys,
-                write_token_ids,
             )
             return True
         else:
@@ -1144,15 +1134,15 @@ class MockHiCacheStorage:
             # Call the kvcm interface to match L3 prefix
             trace_id = "2"
             read_timestamp = int(time.time() * 1000)
-            read_token_ids = [1]
-            mask_offset = 0
+            block_mask = 0
+            input_len = len(int_hash_keys) * _KVCM_BLOCK_SIZE
             res = self.storage_manager.GetCacheLocation(
                 self.instance_id,
                 trace_id,
                 read_timestamp,
                 int_hash_keys,
-                read_token_ids,
-                mask_offset,
+                block_mask,
+                input_len,
             )
             logger.debug(f"{res.kvcm_hit_length=}")
             return res.kvcm_hit_length
