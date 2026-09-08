@@ -702,6 +702,13 @@ class C_HiCacheController(BaseHook):
                         return
 
                     hash_value, storage_hit_count = self._storage_hit_query(operation)
+                    # Track L3 hit tokens per request (page_size=1, so count=tokens)
+                    if storage_hit_count > 0:
+                        try:
+                            req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
+                            req_stats.l3_hit_tokens = storage_hit_count
+                        except Exception:
+                            pass
                     # not to prefetch if not enough benefits
                     if (
                         self.prefetch_threshold is not None
@@ -1195,8 +1202,22 @@ class C_SchedulerHook(BaseHook):
                     # Track L2 host_hit_length (set by _prefetch_kvcache -> init_next_round_input)
                     host_hit = getattr(req, 'host_hit_length', 0)
                     if host_hit > 0:
+                        req_stats.l2_hit_tokens = host_hit
                         C_SchedulerHook._L2_HIT_TOKENS += host_hit
                         C_SchedulerHook._L2_HIT_COUNT += 1
+                    # Log cache state per prefill batch (L1/L2 pool sizes)
+                    tc = getattr(self, 'tree_cache', None)
+                    if tc is not None and hasattr(tc, 'evictable_size_'):
+                        cc = getattr(tc, 'cache_controller', None)
+                        l2_avail = cc.mem_pool_host.available_size() if cc and hasattr(cc, 'mem_pool_host') else -1
+                        l1_evict = tc.evictable_size_
+                        l1_total = tc.token_to_kv_pool_allocator.available_size() + l1_evict if hasattr(tc, 'token_to_kv_pool_allocator') else -1
+                        owt = len(getattr(tc, 'ongoing_write_through', {}))
+                        olb = len(getattr(tc, 'ongoing_load_back', {}))
+                        logger.info(
+                            f"Cache state: L1_evict={l1_evict} L1_total={l1_total} "
+                            f"L2_avail={l2_avail} owt={owt} olb={olb}"
+                        )
             elif len(self.running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
                 # Prefetching
                 StateManager.step_global_clock(0.005)
@@ -1405,6 +1426,19 @@ class C_SchedulerHook(BaseHook):
                         f"L2 cache stats: hit_requests={C_SchedulerHook._L2_HIT_COUNT}, "
                         f"hit_tokens={C_SchedulerHook._L2_HIT_TOKENS}"
                     )
+                    # Log per-request L1/L2/L3 hit breakdown
+                    for item in metrics_stats:
+                        # final_reused_tokens (cached_tokens) includes both L1 prefix match
+                        # AND L2 load_back (init_load_back extends prefix_indices).
+                        # Subtract L2 to get L1-only.
+                        l2 = item.l2_hit_tokens
+                        l1 = item.final_reused_tokens - l2
+                        l3 = item.l3_hit_tokens
+                        new_tok = item.input_length - l1 - l2 - l3
+                        logger.info(
+                            f"Req #{item.rid}: input={item.input_length} "
+                            f"L1={l1} L2={l2} L3={l3} New={new_tok}"
+                        )
 
                 except Exception as e:
                     logger.error(f"Failed to dump results. Error: {e}")
