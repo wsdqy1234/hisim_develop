@@ -1050,8 +1050,11 @@ class MockHiCacheStorage:
             logger.info(
                 "Cleared KV cache saved in the storage backend because the system environment variable (`HISIM_RESET_HICACHE_STORAGE`) is set."
             )
-            with open(self.storage_file_path, "w") as f:
-                pass
+            if hasattr(self, "storage_manager"):
+                self.storage_manager.ClearAllCaches()
+            else:
+                with open(self.storage_file_path, "w") as f:
+                    pass
 
     def init_kvcm(self):
         # Initialize kvcm based on reference examples

@@ -926,10 +926,12 @@ class C_HiRadixCacheHook(BaseHook):
                 # Without dec_lock_ref, backed-up nodes stay locked in L1
                 # forever, host_hit_length is always 0, and L2 load_back is
                 # never triggered.
+                n_write_acks = 0
                 for ack in cc.ack_write_queue:
                     for ack_id in ack.node_ids:
                         node = self.ongoing_write_through.pop(ack_id, None)
                         if node is not None:
+                            n_write_acks += 1
                             self.dec_lock_ref(node)
                             self.write_backup_storage(node)
                 cc.ack_write_queue.clear()
@@ -937,12 +939,23 @@ class C_HiRadixCacheHook(BaseHook):
                 # (hiradix_cache.py:708-721). Without this, nodes in
                 # ongoing_load_back stay locked forever, eventually
                 # exhausting evictable L1 space and breaking L2 load_back.
+                n_load_acks = 0
                 for ack in cc.ack_load_queue:
                     for ack_id in ack.node_ids:
                         end_node = self.ongoing_load_back.pop(ack_id, None)
                         if end_node is not None:
+                            n_load_acks += 1
                             self.dec_lock_ref(end_node)
                 cc.ack_load_queue.clear()
+                if n_write_acks or n_load_acks:
+                    logger.debug(
+                        f"check_hicache_events fallback: write_acks={n_write_acks}, "
+                        f"load_acks={n_load_acks}, "
+                        f"ongoing_write_through={len(self.ongoing_write_through)}, "
+                        f"ongoing_load_back={len(self.ongoing_load_back)}, "
+                        f"backup_queue={cc.backup_queue.qsize() if hasattr(cc.backup_queue, 'qsize') else 'N/A'}, "
+                        f"prefetch_queue={cc.prefetch_queue.qsize() if hasattr(cc.prefetch_queue, 'qsize') else 'N/A'}"
+                    )
             return result
 
         target.__init__ = override_init
