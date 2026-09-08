@@ -65,6 +65,17 @@ class RequestStats:
 
 
 @dataclass
+class StorageTierConfig:
+    name: str
+    ssd_config: Optional[str] = None
+    read_bandwidth_gb: float = 4.0
+    kvcm_storage_type: str = "pace"
+    kvcm_bandwidth_mbps: int = 4000
+    kvcm_capacity_gb: float = 10.0
+    kvcm_priority: int = 0
+
+
+@dataclass
 class PlatformConfig:
     device: Union[AcceleratorInfo, str]
     # Storage configuration for hierarchical cache management.
@@ -75,6 +86,8 @@ class PlatformConfig:
     memory_read_bandwidth_gb: Optional[float] = None
     memory_write_bandwidth_gb: Optional[float] = None
     num_device_per_node: int = 8
+    storage_tiers: list[StorageTierConfig] = field(default_factory=list)
+    tier_read_mode: str = "parallel"
 
     @property
     def disk_read_bandwidth(self):

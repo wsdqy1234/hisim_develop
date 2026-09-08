@@ -57,7 +57,9 @@ PYBIND11_MODULE(_native, module) {
     // 绑定insight_simulator_types.h中的结构体
     py::class_<kvcm::GetCacheLocationRes>(module, "GetCacheLocationRes")
         .def_readonly("trace_id", &kvcm::GetCacheLocationRes::trace_id)
-        .def_readonly("kvcm_hit_length", &kvcm::GetCacheLocationRes::kvcm_hit_length);
+        .def_readonly("kvcm_hit_length", &kvcm::GetCacheLocationRes::kvcm_hit_length)
+        .def_readonly("per_tier_hit_block_num", &kvcm::GetCacheLocationRes::per_tier_hit_block_num)
+        .def_readonly("tier_names", &kvcm::GetCacheLocationRes::tier_names);
 
     py::class_<kvcm::WriteCacheRes>(module, "WriteCacheRes")
         .def_readonly("trace_id", &kvcm::WriteCacheRes::trace_id)

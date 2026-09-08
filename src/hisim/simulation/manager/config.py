@@ -1,7 +1,7 @@
 import json
 
 from hisim.spec import ModelInfo, AcceleratorInfo, DataType
-from hisim.simulation.types import PlatformConfig, SchedulerConfig
+from hisim.simulation.types import PlatformConfig, SchedulerConfig, StorageTierConfig
 from hisim.simulation.manager import Envs
 from hisim.simulation.utils import (
     calc_kv_cache_cell_elems,
@@ -64,6 +64,18 @@ class ConfigManager:
             with open(Envs.config_path()) as f:
                 config: dict = json.load(f)
             platform_config = config.get("platform", {})
+            storage_tiers = [
+                StorageTierConfig(
+                    name=t.get("name", "default"),
+                    ssd_config=t.get("ssd_config"),
+                    read_bandwidth_gb=t.get("read_bandwidth_gb", 4.0),
+                    kvcm_storage_type=t.get("kvcm_storage_type", "pace"),
+                    kvcm_bandwidth_mbps=t.get("kvcm_bandwidth_mbps", 4000),
+                    kvcm_capacity_gb=t.get("kvcm_capacity_gb", 10.0),
+                    kvcm_priority=t.get("kvcm_priority", 0),
+                )
+                for t in platform_config.get("storage_tiers", [])
+            ]
             cls._platform_config = PlatformConfig(
                 device=hw,
                 disk_read_bandwidth_gb=platform_config.get("disk_read_bandwidth_gb"),
@@ -75,6 +87,8 @@ class ConfigManager:
                     "memory_write_bandwidth_gb"
                 ),
                 num_device_per_node=platform_config.get("num_device_per_node"),
+                storage_tiers=storage_tiers,
+                tier_read_mode=platform_config.get("tier_read_mode", "parallel"),
             )
 
             logger.info(

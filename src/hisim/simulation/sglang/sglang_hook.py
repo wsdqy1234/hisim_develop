@@ -278,6 +278,9 @@ class C_HiCacheController(BaseHook):
 
     _ssd_simulator = None
     _ssd_simulator_initialized = False
+    _tier_sims = None
+    _tier_bandwidths = None
+    _tier_read_mode = "parallel"
 
     @classmethod
     def _get_ssd_simulator(cls):
@@ -289,6 +292,37 @@ class C_HiCacheController(BaseHook):
     def _init_ssd_simulator(cls):
         cls._ssd_simulator_initialized = True
         env = os.environ.get("HISIM_SSD_SIM", "")
+
+        # Check for multi-tier config
+        try:
+            from hisim.simulation.manager import ConfigManager
+
+            platform_cfg = ConfigManager.get_platform_config()
+            tiers = platform_cfg.storage_tiers
+            cls._tier_read_mode = platform_cfg.tier_read_mode
+        except Exception:
+            tiers = []
+
+        if tiers:
+            cls._tier_sims = {}
+            cls._tier_bandwidths = {}
+            for tier in tiers:
+                cls._tier_bandwidths[tier.name] = tier.read_bandwidth_gb * 1e9
+                if env in ("1", "default", "true", "True", "simpyssd", "simpyssd_multi"):
+                    try:
+                        from simpyssd import SSDTimingSimulator
+
+                        cls._tier_sims[tier.name] = SSDTimingSimulator(tier.ssd_config)
+                        get_logger().info(
+                            f"SSD simulator enabled for tier '{tier.name}' with config: {tier.ssd_config}"
+                        )
+                    except Exception as e:
+                        get_logger().warning(
+                            f"Failed to init SSD simulator for tier '{tier.name}': {e}"
+                        )
+            return
+
+        # Single-tier fallback (existing behavior)
         if not env:
             return
         try:
@@ -328,14 +362,54 @@ class C_HiCacheController(BaseHook):
         return float(completed), max_dur
 
     @staticmethod
-    def calc_prefetch_pages(
-        required_pages: int, page_size_byte: int, max_dur: float, bandwidth: float
+    def _calc_prefetch_multi_tier(
+        per_tier_hits: dict, page_size_byte: int, max_dur: float
     ) -> tuple[float, float]:
+        tier_times = {}
+        for tier_name, hit_count in per_tier_hits.items():
+            if hit_count == 0:
+                continue
+            total_bytes = hit_count * page_size_byte
+            sim = C_HiCacheController._tier_sims.get(tier_name) if C_HiCacheController._tier_sims else None
+            if sim:
+                t = sim.predict_read_time(total_bytes, page_size_byte, is_sequential=True)
+            else:
+                bw = C_HiCacheController._tier_bandwidths.get(tier_name, 8e9) if C_HiCacheController._tier_bandwidths else 8e9
+                t = total_bytes / bw
+            tier_times[tier_name] = (hit_count, t)
+
+        if not tier_times:
+            return 0.0, 0.0
+
+        if C_HiCacheController._tier_read_mode == "serial":
+            total_dur = sum(t for _, t in tier_times.values())
+        else:
+            total_dur = max(t for _, t in tier_times.values())
+
+        total_completed = sum(c for c, _ in tier_times.values())
+
+        if total_dur <= max_dur:
+            return float(total_completed), total_dur
+        ratio = max_dur / total_dur
+        completed = sum(max(1, int(c * ratio)) for c, _ in tier_times.values())
+        return float(completed), max_dur
+
+    @staticmethod
+    def calc_prefetch_pages(
+        required_pages, page_size_byte: int, max_dur: float, bandwidth: float
+    ) -> tuple[float, float]:
+        # Multi-tier mode: required_pages is dict[str, int]
+        if isinstance(required_pages, dict):
+            return C_HiCacheController._calc_prefetch_multi_tier(
+                required_pages, page_size_byte, max_dur
+            )
+        # Single-tier SSD sim
         sim = C_HiCacheController._get_ssd_simulator()
         if sim is not None:
             return C_HiCacheController._calc_prefetch_pages_ssd(
                 sim, required_pages, page_size_byte, max_dur
             )
+        # Original bandwidth model
         _prefetch_dur = required_pages * page_size_byte / bandwidth
         if _prefetch_dur > max_dur:
             _completed_pages = max(max_dur * bandwidth / page_size_byte, 1)
@@ -392,9 +466,16 @@ class C_HiCacheController(BaseHook):
             if chunked_prefetch_operation is not None:
                 operation = chunked_prefetch_operation["operation"]
                 storage_hit_count = chunked_prefetch_operation["storage_hit_count"]
+                per_tier_hits = chunked_prefetch_operation.get("per_tier_hits")
+                remaining = storage_hit_count - operation.completed_tokens
+                if per_tier_hits and storage_hit_count > 0 and C_HiCacheController._tier_sims:
+                    ratio = remaining / storage_hit_count
+                    calc_arg = {k: max(0, int(v * ratio)) for k, v in per_tier_hits.items()}
+                else:
+                    calc_arg = remaining
                 completed_tokens, prefetch_dur = (
                     C_HiCacheController.calc_prefetch_pages(
-                        (storage_hit_count - operation.completed_tokens),
+                        calc_arg,
                         C_HiCacheController.KV_CACHE_BYTES,
                         remain_dur,
                         C_HiCacheController.DISK_READ_BANDWIDTH_BYTES,
@@ -439,9 +520,18 @@ class C_HiCacheController(BaseHook):
                         storage_hit_count // self.page_size * self.page_size
                     )
 
+                    # Get per-tier hits if multi-tier is configured
+                    per_tier_hits = None
+                    if C_HiCacheController._tier_sims:
+                        try:
+                            per_tier_hits = self.storage_backend.batch_exists_per_tier()
+                        except Exception:
+                            pass
+                    calc_arg = per_tier_hits if per_tier_hits else storage_hit_count
+
                     completed_tokens, prefetch_dur = (
                         C_HiCacheController.calc_prefetch_pages(
-                            storage_hit_count,
+                            calc_arg,
                             C_HiCacheController.KV_CACHE_BYTES,
                             remain_dur,
                             C_HiCacheController.DISK_READ_BANDWIDTH_BYTES,
@@ -456,6 +546,7 @@ class C_HiCacheController(BaseHook):
                             {
                                 "operation": operation,
                                 "storage_hit_count": storage_hit_count,
+                                "per_tier_hits": per_tier_hits,
                             },
                         )
                         remain_dur = 0

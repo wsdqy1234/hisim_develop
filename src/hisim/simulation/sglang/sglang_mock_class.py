@@ -1024,6 +1024,7 @@ def _pass_str_to_block_ids(hash_key):
 
 class MockHiCacheStorage:
     def __init__(self, *args, **kwargs):
+        self._last_per_tier_hits = None
         if kvcm_py_optimizer is not None:
             logger.info("Using KVCM HiCache storage")
             self.init_kvcm()
@@ -1053,6 +1054,37 @@ class MockHiCacheStorage:
         logger.info(f"Using temporary directory: {self.temp_dir}")
 
         config_path = os.environ.get("HISIM_KVCM_CONFIG_PATH") or kvcm_py_optimizer.get_config_path()
+
+        # If HiSim config defines storage_tiers, override kvcm's storages[] section
+        try:
+            from hisim.simulation.manager import ConfigManager
+
+            platform_cfg = ConfigManager.get_platform_config()
+            hisim_tiers = platform_cfg.storage_tiers
+        except Exception:
+            hisim_tiers = []
+
+        if hisim_tiers:
+            import json as _json
+
+            with open(config_path) as f:
+                kvcm_config = _json.load(f)
+            storages = []
+            for tier in hisim_tiers:
+                storages.append({
+                    "unique_name": tier.name,
+                    "storage_type": tier.kvcm_storage_type,
+                    "band_width_mbps": tier.kvcm_bandwidth_mbps,
+                    "capacity": int(tier.kvcm_capacity_gb * 1e9),
+                    "priority": tier.kvcm_priority,
+                })
+            kvcm_config["instance_groups"][0]["storages"] = storages
+            tmp_config = os.path.join(self.temp_dir, "kvcm_config.json")
+            with open(tmp_config, "w") as f:
+                _json.dump(kvcm_config, f)
+            config_path = tmp_config
+            logger.info(f"Overrode kvcm storages with {len(hisim_tiers)} HiSim tiers")
+
         self.config_loader = kvcm_py_optimizer.OptimizerConfigLoader()
 
         if not self.config_loader.load(str(config_path)):
@@ -1145,12 +1177,23 @@ class MockHiCacheStorage:
                 input_len,
             )
             logger.debug(f"{res.kvcm_hit_length=}")
+            # Cache per-tier hits for batch_exists_per_tier()
+            if hasattr(res, "tier_names") and hasattr(res, "per_tier_hit_block_num") and res.tier_names:
+                self._last_per_tier_hits = dict(zip(res.tier_names, res.per_tier_hit_block_num))
+            else:
+                self._last_per_tier_hits = {"default": res.kvcm_hit_length}
             return res.kvcm_hit_length
         else:
             for i in range(len(keys)):
                 if not self.exists(keys[i]):
                     return i
             return len(keys)
+
+    def batch_exists_per_tier(self) -> dict:
+        """Return per-tier hit counts from the last batch_exists() call. No extra kvcm call."""
+        if self._last_per_tier_hits is not None:
+            return self._last_per_tier_hits
+        return {"default": 0}
 
     def clear(self) -> bool:
         if hasattr(self, "storage_manager"):

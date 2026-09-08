@@ -10,6 +10,7 @@ HiSim 的 L3 层（SSD 存储）prefetch 时序默认用固定带宽模型 `time
 |------|--------|---------|------|
 | 原始（默认） | 无 | `time = data / bandwidth` | 低 |
 | SimpySSD | Python | NAND 延迟 + 多 channel 并行 | 中（规格书 ±5%） |
+| **多 Tier SimpySSD** | Python + kvcm | **每 tier 独立 SimpySSD 配置** | 中（多介质混合） |
 
 ## 安装
 
@@ -20,10 +21,13 @@ cd 3rdparty/simpyssd
 pip install -e .
 ```
 
-或通过 `PYTHONPATH` 直接使用（无需安装）：
+kvcm 需编译（含 per-tier 命中数支持）：
 
 ```bash
-export PYTHONPATH=/path/to/src/hisim/3rdparty:$PYTHONPATH
+cd 3rdparty/kvcm_l3
+cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+pip install build/kvcm_py_optimizer-*.whl  # 或直接用 PYTHONPATH
 ```
 
 ## 使用
@@ -36,77 +40,97 @@ export PYTHONPATH=/path/to/src/hisim/3rdparty:$PYTHONPATH
 | `1` 或 `simpyssd` | SimpySSD | 使用内置 `es3500p_pcie5.cfg` |
 | `/path/to.cfg` | SimpySSD | 使用指定配置文件 |
 
-### 示例
+### 单 Tier 示例
 
 ```bash
-# 原始模式（默认）
-python -m hisim.simulation.bench_serving --sim-config-path config.json ...
-
-# SimpySSD 模式
-HISIM_SSD_SIM=simpyssd python -m hisim.simulation.bench_serving --sim-config-path config.json ...
-
-# 自定义 SSD 配置
-HISIM_SSD_SIM=/path/to/my_ssd.cfg python -m hisim.simulation.bench_serving ...
+HISIM_SSD_SIM=simpyssd python -m hisim.simulation.bench_serving ...
 ```
 
-## 配置文件
+### 多 Tier 示例
 
-### 默认配置：ES3500P V7-3840 PCIe 5.0
+在 config JSON 的 `platform` 中配置 `storage_tiers`：
 
-位置：`3rdparty/simpyssd/configs/es3500p_pcie5.cfg`
-
-基于规格书参数：
-
-| 规格书参数 | 配置参数 | 值 |
-|-----------|---------|-----|
-| 平均读延时 @1QD: 60μs | `read_latency_us` | 60 |
-| 顺序读带宽: 14,600 MB/s | `channel_bw_mbps` | 1825 (= 14600/8) |
-| 随机 4K 读 IOPS: 3,100,000 | `num_chip` × `num_channel` | 24 × 8 = 192 (192/60μs ≈ 3.2M) |
-| NAND 类型: 3D TLC | `read_latency_us` = TLC 平均 | 60 (LSB=40/CSB=60/MSB=80, avg=60) |
-| 页大小: 4KB | `pg_sz_kb` | 4 |
-
-### SimpySSD 配置参数详解
-
-```ini
-[flash]
-channel_bw_mbps:     1825      # 每 channel DMA 带宽 (MB/s) = 顺序读带宽 ÷ channel 数
-read_latency_us:     60        # NAND 读延迟 (μs) = 规格书"平均读延时 @1QD"
-write_latency_us:    500       # NAND 写延迟 (μs) = TLC program 典型值
-pg_sz_kb:            4         # NAND 物理页大小 (KB)
-num_chip:            24        # 每 channel 芯片数 = IOPS × 读延迟 ÷ channel 数
-num_channel:         8         # NAND 通道数，企业级 NVMe 典型 8
+```json
+{
+  "platform": {
+    "tier_read_mode": "parallel",
+    "storage_tiers": [
+      {
+        "name": "local_nvme",
+        "ssd_config": "3rdparty/simpyssd/simpyssd/configs/es3500p_pcie5.cfg",
+        "read_bandwidth_gb": 14.6,
+        "kvcm_storage_type": "pace",
+        "kvcm_bandwidth_mbps": 14600,
+        "kvcm_capacity_gb": 100,
+        "kvcm_priority": 0
+      },
+      {
+        "name": "remote_nfs",
+        "ssd_config": "3rdparty/simpyssd/simpyssd/configs/nfs_ssd.cfg",
+        "read_bandwidth_gb": 3.0,
+        "kvcm_storage_type": "nfs",
+        "kvcm_bandwidth_mbps": 3000,
+        "kvcm_capacity_gb": 500,
+        "kvcm_priority": 1
+      }
+    ]
+  }
+}
 ```
 
-### 如何为不同 SSD 配置
+```bash
+HISIM_SSD_SIM=simpyssd python -m hisim.simulation.sglang.launch_server \
+  --enable-hierarchical-cache ...
+```
 
-1. 查 SSD 规格书，获取：
-   - 平均读延时 @1QD (μs) → `read_latency_us`
-   - 顺序读带宽 (MB/s) → `channel_bw_mbps` = 带宽 ÷ 8
-   - 随机 4K 读 IOPS → `num_chip` = IOPS × 读延迟 ÷ 8
-   - NAND 类型 → 写延迟: SLC=200, MLC=300, TLC=500 (μs)
-
-2. 写配置文件并使用：
-   ```bash
-   HISIM_SSD_SIM=/path/to/your_config.cfg python -m hisim.simulation.bench_serving ...
-   ```
-
-## 集成原理
-
-替换 `sglang_hook.py` 中 `C_HiCacheController.calc_prefetch_pages()`：
+## 多 Tier 工作原理
 
 ```
-原始:  time = required_pages × page_size / bandwidth
+HiSim config JSON (唯一配置源)
+  ├─ storage_tiers[].name           → kvcm storages[].unique_name (init 时动态覆盖)
+  ├─ storage_tiers[].ssd_config     → SimpySSD SSDTimingSimulator(cfg) per tier
+  ├─ storage_tiers[].kvcm_*         → kvcm storages[].storage_type/bandwidth/capacity/priority
+  └─ tier_read_mode                 → "parallel" (各 tier 并行读, 取 max) 或 "serial" (串行, 取 sum)
 
-SimpySSD:
-  1. 构造 N 个读命令 (N = required_pages)
-  2. 分配到 8×24=192 个并行单元 (顺序: 条带分配, 随机: 随机分配)
-  3. 事件驱动模拟 NAND 读 + channel 传输
-  4. 返回总时间 (含并行重叠)
+运行时:
+  batch_exists() → kvcm.GetCacheLocation()
+    → 返回 per_tier_hit_block_num + tier_names (不改返回类型, 缓存内部)
+  
+  batch_exists_per_tier() → 返回缓存的 {tier_name: hit_count}
+  
+  calc_prefetch_pages(per_tier_hits, ...)
+    → 对每个 tier 用对应 SimpySSD config 算读时间
+    → parallel: 总时间 = max(各 tier 时间)
+    → serial:   总时间 = sum(各 tier 时间)
 ```
+
+### 配置参数
+
+| 参数 | 说明 | 来源 |
+|------|------|------|
+| `name` | tier 名称，与 kvcm `unique_name` 对应 | HiSim config |
+| `ssd_config` | SimpySSD 配置路径 | HiSim config |
+| `read_bandwidth_gb` | fallback 带宽 (SimpySSD 未启用时) | HiSim config |
+| `kvcm_storage_type` | kvcm 存储类型 (pace/nfs/hf3fs 等) | HiSim config → kvcm |
+| `kvcm_bandwidth_mbps` | kvcm tier 带宽 | HiSim config → kvcm |
+| `kvcm_capacity_gb` | kvcm tier 容量 | HiSim config → kvcm |
+| `kvcm_priority` | kvcm tier 优先级 (0=最快) | HiSim config → kvcm |
+| `tier_read_mode` | 读模式: `parallel` 或 `serial` | HiSim config |
+
+### 向后兼容
+
+| 场景 | 行为 |
+|------|------|
+| 不配 `storage_tiers` + 不设 `HISIM_SSD_SIM` | 原始带宽模型（不变） |
+| 不配 `storage_tiers` + `HISIM_SSD_SIM=simpyssd` | 单 SimpySSD（不变） |
+| 配 `storage_tiers` + `HISIM_SSD_SIM=simpyssd` | 多 tier，每 tier 用各自 config |
+| 配 `storage_tiers` + 不设 `HISIM_SSD_SIM` | 多 tier，每 tier 用 `read_bandwidth_gb` |
+
+`batch_exists` 返回值不变，sglang 无感知。`batch_exists_per_tier` 是新方法，只 hisim hook 调用。
 
 ## 验证结果
 
-### vs ES3500P V7 PCIe 5.0 规格书
+### vs ES3500P V7 PCIe 5.0 规格书（单 tier）
 
 | 指标 | 规格 | SimpySSD | 比值 |
 |------|------|----------|------|
@@ -114,20 +138,17 @@ SimpySSD:
 | 4K 随机读 IOPS | 3,100,000 | 2,980,000 | 0.96x |
 | 128K 顺序读带宽 | 14,600 MB/s | 14,581 MB/s | 1.00x |
 
-三项指标均在规格书 ±5% 以内。
-
 ## 文件结构
 
 ```
 3rdparty/
-  simpyssd/                        # SimpySSD（纯 Python，无需编译）
-    __init__.py                    # 导出 SSDTimingSimulator
-    sim.py                         # 离散事件引擎
-    ssd_config.py                  # 配置解析
-    util.py                        # 辅助函数
-    ssd_estimate.py                # SSD 模型（Chip/Channel/SSD/Cmd）
-    ssd_timing_adapter.py          # 适配器: predict_read_time()
-    setup.py                       # pip install -e .
-    configs/
-      es3500p_pcie5.cfg            # ES3500P V7 PCIe 5.0 规格（默认）
+  simpyssd/                        # SimpySSD（纯 Python）
+    simpyssd/
+      __init__.py
+      sim.py, ssd_config.py, util.py, ssd_estimate.py, ssd_timing_adapter.py
+      configs/es3500p_pcie5.cfg
+    setup.py
+  kvcm_l3/                         # kvcm（C++ pybind11）
+    kvcm/kv_cache_manager/...      # 含 per_tier_hit_block_num 支持
+    kvcm_py_optimizer/             # Python binding
 ```

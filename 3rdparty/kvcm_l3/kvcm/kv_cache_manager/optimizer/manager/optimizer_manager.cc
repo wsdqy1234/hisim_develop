@@ -269,6 +269,10 @@ GetCacheLocationRes OptimizerManager::GetCacheLocation(const std::string &instan
     const auto *last_read = hit_rate_tracker_->LastReadRecord(instance_id);
     if (last_read) {
         res.kvcm_hit_length = last_read->remote_hit_blocks;
+        res.per_tier_hit_block_num.assign(
+            last_read->per_tier_hit_blocks.begin(),
+            last_read->per_tier_hit_blocks.end());
+        res.tier_names = last_read->tier_names;
     }
     return res;
 }

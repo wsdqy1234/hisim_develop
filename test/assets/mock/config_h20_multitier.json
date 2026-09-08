@@ -1,0 +1,47 @@
+{
+    "platform": {
+        "accelerator": {
+            "name": "H20"
+        },
+        "disk_read_bandwidth_gb": 14.6,
+        "disk_write_bandwidth_gb": 8,
+        "memory_read_bandwidth_gb": 64,
+        "memory_write_bandwidth_gb": 64,
+        "num_device_per_node": 8,
+        "tier_read_mode": "parallel",
+        "storage_tiers": [
+            {
+                "name": "local_nvme",
+                "ssd_config": "3rdparty/simpyssd/simpyssd/configs/es3500p_pcie5.cfg",
+                "read_bandwidth_gb": 14.6,
+                "kvcm_storage_type": "pace",
+                "kvcm_bandwidth_mbps": 14600,
+                "kvcm_capacity_gb": 100,
+                "kvcm_priority": 0
+            },
+            {
+                "name": "remote_nfs",
+                "ssd_config": "3rdparty/simpyssd/simpyssd/configs/es3500p_pcie5.cfg",
+                "read_bandwidth_gb": 3.0,
+                "kvcm_storage_type": "nfs",
+                "kvcm_bandwidth_mbps": 3000,
+                "kvcm_capacity_gb": 500,
+                "kvcm_priority": 1
+            }
+        ]
+    },
+    "predictor": {
+        "name": "aiconfigurator",
+        "device_name": "h20_sxm",
+        "database_path": "3rdparty/aic_data"
+    },
+    "scheduler": {
+        "tp_size": 1,
+        "ep_size": 1,
+        "dp_size": 1,
+        "data_type": "FP16",
+        "kv_cache_data_type": "FP16",
+        "backend_name": "sglang",
+        "backend_version": "0.5.6.post2"
+    }
+}

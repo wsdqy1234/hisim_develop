@@ -3,6 +3,8 @@ import dataclasses
 import json
 from typing import Optional
 
+from hisim.simulation.types import StorageTierConfig
+
 
 @dataclasses.dataclass
 class AcceleratorConfig:
@@ -18,6 +20,8 @@ class PlatformConfig:
     disk_write_bandwidth_gb: float = 4.0
     memory_read_bandwidth_gb: float = 64.0
     memory_write_bandwidth_gb: float = 64.0
+    storage_tiers: list = dataclasses.field(default_factory=list)
+    tier_read_mode: str = "parallel"
 
 
 @dataclasses.dataclass
@@ -151,6 +155,19 @@ class SimulationArgs:
         predictor = cfg.get("predictor", {})
         scheduler = cfg.get("scheduler", {})
 
+        storage_tiers = [
+            StorageTierConfig(
+                name=t.get("name", "default"),
+                ssd_config=t.get("ssd_config"),
+                read_bandwidth_gb=t.get("read_bandwidth_gb", 4.0),
+                kvcm_storage_type=t.get("kvcm_storage_type", "pace"),
+                kvcm_bandwidth_mbps=t.get("kvcm_bandwidth_mbps", 4000),
+                kvcm_capacity_gb=t.get("kvcm_capacity_gb", 10.0),
+                kvcm_priority=t.get("kvcm_priority", 0),
+            )
+            for t in platform.get("storage_tiers", [])
+        ]
+
         return SimulationArgs(
             config_path=path,
             platform=PlatformConfig(
@@ -161,6 +178,8 @@ class SimulationArgs:
                 memory_write_bandwidth_gb=platform.get(
                     "memory_write_bandwidth_gb", 64.0
                 ),
+                storage_tiers=storage_tiers,
+                tier_read_mode=platform.get("tier_read_mode", "parallel"),
             ),
             predictor=PredictorConfig(
                 name=predictor.get("name", "aiconfigurator"),
