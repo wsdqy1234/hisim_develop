@@ -1001,8 +1001,8 @@ class C_SchedulerHook(BaseHook):
     _L3_QUERY_COUNT: int = 0  # total batch_exists calls
     _L3_TOTAL_HITS: int = 0  # total hit blocks across all tiers
     _L3_PREFETCHED_TOKENS: int = 0  # total tokens actually prefetched from L3
-    _L2_LOAD_BACK_SUCC: int = 0  # successful load_back (l2_load_latency > 0)
-    _L2_LOAD_BACK_FAIL: int = 0  # failed/skipped load_back (host_hit>0 but no load)
+    _L2_HIT_TOKENS: int = 0  # total tokens matched in L2 (host_hit_length sum)
+    _L2_HIT_COUNT: int = 0  # number of requests with host_hit_length > 0
 
     SCHEDULE_REQ_STATS = []
 
@@ -1195,7 +1195,8 @@ class C_SchedulerHook(BaseHook):
                     # Track L2 host_hit_length (set by _prefetch_kvcache -> init_next_round_input)
                     host_hit = getattr(req, 'host_hit_length', 0)
                     if host_hit > 0:
-                        C_SchedulerHook._L2_LOAD_BACK_SUCC += 1
+                        C_SchedulerHook._L2_HIT_TOKENS += host_hit
+                        C_SchedulerHook._L2_HIT_COUNT += 1
             elif len(self.running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
                 # Prefetching
                 StateManager.step_global_clock(0.005)
@@ -1401,7 +1402,8 @@ class C_SchedulerHook(BaseHook):
                             f"per_tier={C_SchedulerHook._L3_HIT_STATS}"
                         )
                     logger.info(
-                        f"L2 cache stats: host_hit_count={C_SchedulerHook._L2_LOAD_BACK_SUCC}"
+                        f"L2 cache stats: hit_requests={C_SchedulerHook._L2_HIT_COUNT}, "
+                        f"hit_tokens={C_SchedulerHook._L2_HIT_TOKENS}"
                     )
 
                 except Exception as e:
@@ -1419,8 +1421,8 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook._L3_QUERY_COUNT = 0
             C_SchedulerHook._L3_TOTAL_HITS = 0
             C_SchedulerHook._L3_PREFETCHED_TOKENS = 0
-            C_SchedulerHook._L2_LOAD_BACK_SUCC = 0
-            C_SchedulerHook._L2_LOAD_BACK_FAIL = 0
+            C_SchedulerHook._L2_HIT_TOKENS = 0
+            C_SchedulerHook._L2_HIT_COUNT = 0
 
             ProfileReqOutput = getattr(
                 importlib.import_module("sglang.srt.managers.io_struct"),
