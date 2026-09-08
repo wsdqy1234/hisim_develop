@@ -948,7 +948,39 @@ class MockTokenToKVPoolHost:
                 ConfigManager.get_kv_cache_bytes_per_layer()
             )
 
-        size_bytes_arr = seg_len * float(MockTokenToKVPoolHost.KV_CACHE_BYTES_PER_LAYER)
+        bpl = float(MockTokenToKVPoolHost.KV_CACHE_BYTES_PER_LAYER)
+
+        direct_bw = None
+        try:
+            pcfg = ConfigManager.get_platform_config()
+            if pcfg.enable_l3_direct_to_l1:
+                direct_bw = pcfg.l3_to_l1_bandwidth
+        except Exception:
+            pass
+
+        if direct_bw is not None:
+            total = num_indices
+            l3_count = min(StateManager.get_l3_direct_load_count(), total)
+            l2_count = total - l3_count
+
+            if l2_count > 0:
+                l2_bytes = l2_count * bpl
+                if MockTokenToKVPoolHost.MEMORY_READ_BANDWIDTH_BYTES is None:
+                    MockTokenToKVPoolHost.MEMORY_READ_BANDWIDTH_BYTES = (
+                        ConfigManager.get_platform_config().memory_read_bandwidth
+                    )
+                eff_bw = MockTokenToKVPoolHost.MEMORY_READ_BANDWIDTH_BYTES * 0.85
+                t0 = 6.67e-6
+                h2d_dur = t0 + l2_bytes / eff_bw
+                StateManager.inc_hicache_l2_load_dur(h2d_dur)
+
+            if l3_count > 0:
+                l3_bytes = l3_count * bpl
+                direct_dur = l3_bytes / direct_bw
+                StateManager.inc_hicache_l3_direct_load_dur(direct_dur)
+            return
+
+        size_bytes_arr = seg_len * bpl
         bandwidth_arr = self.est_bandwidth_batch(size_bytes_arr, cat="H2D")
         total_time_cost = float(np.sum(size_bytes_arr / bandwidth_arr))
         # total_time_cost += 3.3e-6 * len(size_bytes_arr)  # CPU Overhead

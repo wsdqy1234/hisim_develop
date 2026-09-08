@@ -92,6 +92,16 @@ class PlatformConfig:
     storage_tiers: list[StorageTierConfig] = field(default_factory=list)
     tier_read_mode: str = "serial"
     tier_write_mode: str = "parallel"
+    enable_l3_direct_to_l1: bool = False
+    l3_to_l1_bandwidth_gb: Optional[float] = None
+
+    @property
+    def l3_to_l1_bandwidth(self):
+        return (
+            self.l3_to_l1_bandwidth_gb * 1e9
+            if self.l3_to_l1_bandwidth_gb
+            else None
+        )
 
     @property
     def disk_read_bandwidth(self):

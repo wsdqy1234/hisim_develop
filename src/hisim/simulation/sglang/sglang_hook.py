@@ -655,6 +655,74 @@ class C_HiCacheController(BaseHook):
                     ConfigManager.get_platform_config().disk_read_bandwidth
                 )
 
+            direct_mode = False
+            try:
+                direct_mode = ConfigManager.get_platform_config().enable_l3_direct_to_l1
+            except Exception:
+                pass
+
+            if direct_mode:
+                chunked = getattr(self, "chunked_prefetch_operation", None)
+                if chunked is not None:
+                    operation = chunked["operation"]
+                    storage_hit_count = chunked["storage_hit_count"]
+                    operation.completed_tokens = int(storage_hit_count)
+                    operation.mark_terminate()
+                    setattr(self, "chunked_prefetch_operation", None)
+                    self.append_host_mem_release(
+                        operation.host_indices[storage_hit_count:]
+                    )
+                    req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
+                    req_stats.prefetch_complete_tokens = operation.completed_tokens
+                    StateManager.inc_l3_direct_load_count(storage_hit_count)
+
+                while True:
+                    try:
+                        operation = self.prefetch_queue.get(block=False)
+                        if operation is None:
+                            return
+                        hash_value, storage_hit_count = self._storage_hit_query(operation)
+                        if storage_hit_count > 0:
+                            try:
+                                req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
+                                req_stats.l3_hit_tokens = storage_hit_count
+                            except Exception:
+                                pass
+                        if (
+                            self.prefetch_threshold is not None
+                            and storage_hit_count < self.prefetch_threshold
+                        ):
+                            operation.mark_terminate()
+                            self.append_host_mem_release(operation.host_indices)
+                            continue
+                        operation.hash_value = hash_value[
+                            : (storage_hit_count // self.page_size)
+                        ]
+                        storage_hit_count = (
+                            storage_hit_count // self.page_size * self.page_size
+                        )
+                        if C_HiCacheController._tier_sims:
+                            try:
+                                per_tier_hits = self.storage_backend.batch_exists_per_tier()
+                                C_SchedulerHook._L3_QUERY_COUNT += 1
+                                for tn, cnt in per_tier_hits.items():
+                                    C_SchedulerHook._L3_HIT_STATS[tn] = C_SchedulerHook._L3_HIT_STATS.get(tn, 0) + cnt
+                                    C_SchedulerHook._L3_TOTAL_HITS += cnt
+                            except Exception:
+                                pass
+                        operation.completed_tokens = int(storage_hit_count)
+                        operation.mark_terminate()
+                        C_SchedulerHook._L3_PREFETCHED_TOKENS += int(storage_hit_count)
+                        req_stats = C_SchedulerHook.REQUEST_STATS[operation.request_id]
+                        req_stats.prefetch_complete_tokens = operation.completed_tokens
+                        self.append_host_mem_release(
+                            operation.host_indices[storage_hit_count:]
+                        )
+                        StateManager.inc_l3_direct_load_count(storage_hit_count)
+                    except Empty:
+                        return
+                return
+
             # TODO: Overlap schedule
             remain_dur = StateManager.get_current_inference_dur()
 
@@ -969,6 +1037,56 @@ class C_HiRadixCacheHook(BaseHook):
         target.check_hicache_events = wrapped_check_hicache_events
         target.reset = wrapped_reset
 
+        # Node lifecycle tracking (enabled via HISIM_NODE_TRACK env var)
+        if os.environ.get("HISIM_NODE_TRACK", ""):
+            _orig_write_backup = target.write_backup
+            _orig_evict_backuped = target._evict_backuped
+            _orig_evict_regular = target._evict_regular
+            _orig_evict_host = target.evict_host
+            _orig_load_back = target.load_back
+
+            def _tracked_write_backup(self, node, write_back=False):
+                r = _orig_write_backup(self, node, write_back)
+                if r > 0:
+                    logger.info(f"NODE_BACKUP id={node.id} key_len={len(node.key)} backuped={node.backuped}")
+                return r
+
+            def _tracked_evict_backuped(self, node):
+                r = _orig_evict_backuped(self, node)
+                logger.info(f"NODE_EVICT_L1 id={node.id} key_len={len(node.key)} backuped={node.backuped} evicted={node.evicted}")
+                return r
+
+            def _tracked_evict_regular(self, node):
+                logger.info(f"NODE_DELETE id={node.id} key_len={len(node.key)} backuped={node.backuped}")
+                return _orig_evict_regular(self, node)
+
+            def _tracked_evict_host(self, num_tokens):
+                # Log before eviction (nodes still in tree)
+                leaves = list(self.evictable_host_leaves)
+                r = _orig_evict_host(self, num_tokens)
+                # Log what changed
+                after = list(self.evictable_host_leaves)
+                removed = [n for n in leaves if n not in after]
+                for n in removed:
+                    logger.info(f"NODE_EVICT_L2 id={n.id} key_len={len(n.key)} backuped={n.backuped} evicted={n.evicted}")
+                return r
+
+            def _tracked_load_back(self, node, mem_quota=None):
+                logger.info(f"NODE_LOAD_BACK_START id={node.id} key_len={len(node.key)} evicted={node.evicted} backuped={node.backuped}")
+                r = _orig_load_back(self, node, mem_quota)
+                if r is not None:
+                    logger.info(f"NODE_LOAD_BACK_OK id={node.id} tokens={len(r)}")
+                else:
+                    logger.info(f"NODE_LOAD_BACK_FAIL id={node.id}")
+                return r
+
+            target.write_backup = _tracked_write_backup
+            target._evict_backuped = _tracked_evict_backuped
+            target._evict_regular = _tracked_evict_regular
+            target.evict_host = _tracked_evict_host
+            target.load_back = _tracked_load_back
+            logger.info("Node lifecycle tracking enabled (HISIM_NODE_TRACK)")
+
 
 class C_StorageBackendFactory(BaseHook):
     HOOK_CLASS_NAME = "StorageBackendFactory"
@@ -1214,10 +1332,11 @@ class C_SchedulerHook(BaseHook):
                         l1_total = tc.token_to_kv_pool_allocator.available_size() + l1_evict if hasattr(tc, 'token_to_kv_pool_allocator') else -1
                         owt = len(getattr(tc, 'ongoing_write_through', {}))
                         olb = len(getattr(tc, 'ongoing_load_back', {}))
-                        logger.info(
-                            f"Cache state: L1_evict={l1_evict} L1_total={l1_total} "
-                            f"L2_avail={l2_avail} owt={owt} olb={olb}"
-                        )
+                    logger.info(
+                        f"Cache state: L1_evict={l1_evict} L1_total={l1_total} "
+                        f"L2_avail={l2_avail} L2_host_leaves={len(tc.evictable_host_leaves)} "
+                        f"owt={owt} olb={olb}"
+                    )
             elif len(self.running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
                 # Prefetching
                 StateManager.step_global_clock(0.005)
@@ -1305,6 +1424,14 @@ class C_SchedulerHook(BaseHook):
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
                 hicache_l3_backup_dur = StateManager.pop_hicache_l3_backup_dur()
                 current_inference_dur = StateManager.get_current_inference_dur()
+
+                try:
+                    if ConfigManager.get_platform_config().enable_l3_direct_to_l1:
+                        l3_direct_dur = StateManager.pop_hicache_l3_direct_load_dur()
+                        hicache_l2_load_dur = max(hicache_l2_load_dur, l3_direct_dur)
+                except Exception:
+                    pass
+                StateManager.pop_l3_direct_load_count()
 
                 # Save last values for next iteration's timing-aware SSD simulation
                 StateManager.set_last_l2_load_dur(hicache_l2_load_dur)

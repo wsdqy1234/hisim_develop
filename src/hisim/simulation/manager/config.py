@@ -92,6 +92,10 @@ class ConfigManager:
                 storage_tiers=storage_tiers,
                 tier_read_mode=platform_config.get("tier_read_mode", "serial"),
                 tier_write_mode=platform_config.get("tier_write_mode", "parallel"),
+                enable_l3_direct_to_l1=platform_config.get(
+                    "enable_l3_direct_to_l1", False
+                ),
+                l3_to_l1_bandwidth_gb=platform_config.get("l3_to_l1_bandwidth_gb"),
             )
 
             logger.info(
