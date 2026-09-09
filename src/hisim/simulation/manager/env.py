@@ -40,3 +40,17 @@ class Envs:
     @classmethod
     def reset_hicache_storage(cls) -> bool:
         return os.getenv("HISIM_RESET_HICACHE_STORAGE") == "1"
+
+    @classmethod
+    def persist_l3_storage(cls) -> bool:
+        """Persist the L3 key set across server restarts (default: in-memory only).
+
+        Set HISIM_PERSIST_L3_STORAGE=1 to simulate a warm remote/disk storage
+        tier that survives engine restarts."""
+        return os.getenv("HISIM_PERSIST_L3_STORAGE") == "1"
+
+    @classmethod
+    def l3_storage_path(cls) -> str:
+        return os.getenv(
+            "HISIM_L3_STORAGE_PATH", "/tmp/hisim/hicache/storage_keys.txt"
+        )

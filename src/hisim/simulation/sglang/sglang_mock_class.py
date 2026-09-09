@@ -1240,15 +1240,25 @@ class MockHiCacheStorage:
         else:
             logger.info("Using common set HiCache storage")
             self.storage: set = set()
-            self.storage_file_path: str = "/tmp/hisim/hicache/storage_keys.txt"
-            os.makedirs(os.path.dirname(self.storage_file_path), exist_ok=True)
+            # Persistence is opt-in (HISIM_PERSIST_L3_STORAGE=1): by default the
+            # key set is in-memory only so benchmark runs stay reproducible and
+            # isolated. Enabling it simulates a warm storage tier that survives
+            # engine restarts.
+            self.persist_storage = Envs.persist_l3_storage()
+            self.storage_file_path: str = Envs.l3_storage_path()
 
-            if os.path.exists(self.storage_file_path):
+            if self.persist_storage and os.path.exists(self.storage_file_path):
+                os.makedirs(os.path.dirname(self.storage_file_path), exist_ok=True)
                 with open(self.storage_file_path) as f:
                     line = f.readline()
                     while line:
                         self.storage.add(line.strip())
                         line = f.readline()
+            logger.info(
+                f"L3 storage persistence: "
+                f"{'enabled' if self.persist_storage else 'disabled (in-memory only)'}"
+                + (f", path={self.storage_file_path}" if self.persist_storage else "")
+            )
 
         if Envs.reset_hicache_storage():
             logger.info(
@@ -1256,7 +1266,10 @@ class MockHiCacheStorage:
             )
             if hasattr(self, "storage_manager"):
                 self.storage_manager.ClearAllCaches()
-            else:
+            elif self.persist_storage:
+                os.makedirs(
+                    os.path.dirname(self.storage_file_path), exist_ok=True
+                )
                 with open(self.storage_file_path, "w") as f:
                     pass
 
@@ -1328,8 +1341,10 @@ class MockHiCacheStorage:
         if self.exists(key):
             return True
         self.storage.add(key)
-        with open(self.storage_file_path, "a+") as f:
-            f.write(key + "\n")
+        if self.persist_storage:
+            os.makedirs(os.path.dirname(self.storage_file_path), exist_ok=True)
+            with open(self.storage_file_path, "a+") as f:
+                f.write(key + "\n")
         return True
 
     def batch_set(
@@ -1482,6 +1497,10 @@ class MockHiCacheStorage:
             return True
         else:
             self.storage.clear()
-            with open(self.storage_file_path, "w"):
-                pass
+            if self.persist_storage:
+                os.makedirs(
+                    os.path.dirname(self.storage_file_path), exist_ok=True
+                )
+                with open(self.storage_file_path, "w"):
+                    pass
             return True
