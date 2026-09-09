@@ -59,6 +59,33 @@ python hisim_cache_analyzer.py -i trace.jsonl --use-output-ids
 python hisim_cache_analyzer.py -i trace.jsonl -o results.jsonl
 ```
 
+### Weka Agentic Trace 输入（`--weka-traces`）
+
+v1/v2/v3 三个 analyzer 均可直接分析 SemiAnalysis cc-traces-weka 真实 Claude Code 会话数据集（无需安装仿真依赖，loader 模块纯标准库，自动通过 importlib 加载）：
+
+```bash
+python hisim_cache_analyzer.py \
+    --weka-traces /path/to/traces.jsonl \
+    --num-traces 4 --max-concurrent-traces 2 --trace-start-interval 0.5 \
+    --max-rounds-per-trace 10 [--max-round-tokens 100000]
+```
+
+| 参数 | 说明 | 默认值 |
+|---|---|---|
+| `--weka-traces` | 一个或多个 traces.jsonl 路径（`;` 分隔）；给定后 `-i` 可省略 | — |
+| `--num-traces` | 总共读取的 trace 数 | -1（全部） |
+| `--max-concurrent-traces` | 同时并发的 trace 数（槽位制） | 1 |
+| `--trace-start-interval` | 并发 trace 首轮之间的间隔（秒） | 0.5 |
+| `--max-rounds-per-trace` | 每条 trace 最多分析多少轮 | -1（无限） |
+| `--max-round-tokens` | 单轮长度上限（in+out tokens），首个超限轮前截断该 trace | -1（无限） |
+
+weka 模式语义要点：
+- **前缀复用**：每 trace 分配全局唯一 block base，块 h 展开为 tokens `[(base+h)*64, +64)`；共享 hash 前缀 ⟺ 共享 token 前缀，缓存命中结构与真实会话一致。
+- **output 推导**：轮 i 的 output tokens 取自轮 i+1 input 超出轮 i input 的部分，保证多轮前缀匹配不断链（weka 模式下 `--use-output-ids` 自动强制开启）。
+- **调度**：静态时间轴——并发 trace 首轮按 `trace_start_interval` 错峰，trace 内轮次保持录制时间间隔；请求按该时间轴排序处理。
+- **subagent**：当前仅分析主流请求（subagent 组暂不展开）。
+- v1 建议 weka 模式配 `--block-size 64`（对齐数据集块大小）。
+
 ## 参数说明
 
 | 参数 | 说明 | 默认值 |

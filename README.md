@@ -77,6 +77,43 @@ with `HISIM_KVCM_CONFIG_PATH=/path/to/config.json` if needed.
 
 * If you don’t have a dataset, Hisim provides data collection utilities. Refer to [README](benchmark/collection/README.md) for instructions on gathering real request traces.
 
+#### Agentic Multi-Turn Trace Dataset (`weka_trace`)
+
+Hisim can directly replay SemiAnalysis **cc-traces-weka** real Claude Code agentic session datasets (e.g. [semianalysisai/cc-traces-weka-062126-256k](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126-256k): 393 sessions / 6.89B input tokens / avg ISL ≈ 100K). These traces contain no text — only token counts and 64-token KV prefix block hash sequences (`hash_ids`); multi-turn prefix reuse is encoded in shared hash prefixes. The loader expands hash blocks into globally unique synthetic tokens (two requests share a token prefix ⟺ they share the hash prefix ⟺ the real KV prefix-reuse structure) and derives each round's output tokens from the next round's input so the prefix chain never breaks.
+
+* Dataset format (traces.jsonl, one full session per line):
+  ```json
+  {"id": "session-id", "block_size": 64, "hash_id_scope": "local", "requests": [
+    {"t": 10.6, "type": "s", "in": 65408, "out": 265, "hash_ids": [10, 11, ...], "api_time": 3.4},
+    {"type": "subagent", "agent_id": "...", "t": 86541.1, "requests": [ ... ]}
+  ]}
+  ```
+
+* Simulation side (via `dataset_args` of `SGLangBenchmarkRunner.async_benchmark`, registry name `weka_trace`):
+  ```python
+  from hisim.dataset import DatasetArgs
+  dataset_args = DatasetArgs(
+      name="weka_trace",
+      filepath="traces_a.jsonl;traces_b.jsonl",  # one or more jsonl files, ';' separated
+      num_traces=10,               # total traces to load (-1 = all)
+      max_concurrent_traces=2,     # concurrent trace slots (one finished -> next starts)
+      trace_start_interval=0.5,    # gap between first rounds of concurrent traces (default 0.5s)
+      max_rounds_per_trace=20,     # max rounds per trace (-1 = unlimited)
+      max_round_tokens=200000,     # per-round cap (in+out); trace ends before the first round exceeding it
+  )
+  ```
+  Scheduling is a static timeline (intra-trace round gaps follow the recorded timestamps), consumed by the OFFLINE simulation's virtual clock (FUTURE_QUEUE).
+
+* Offline cache analysis (no simulation dependencies, stdlib only):
+  ```bash
+  python test/hisim_cache_analyzer_v3.py \
+      --weka-traces /path/to/traces.jsonl \
+      --num-traces 4 --max-concurrent-traces 2 --max-rounds-per-trace 10
+  ```
+  All three analyzers (v1/v2/v3) support it (see `test/README_hisim_cache_analyzer_*.md`). Measured L1 reuse on 4 traces / 2 concurrent / 10 rounds: 82–85%.
+
+> Note: the `bench_serving` HTTP benchmark CLI is not wired to weka datasets yet (use the Python API above or the analyzer CLI); subagent group requests are not expanded in the current version (main-stream rounds only).
+
 ---
 
 ### Step 2: Mock Simulation

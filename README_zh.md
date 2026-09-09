@@ -69,6 +69,43 @@ cd .. && pip install .
 
 * 如果没有准备好请求数据集，本工具提供数据集采集功能，详情参考[README](benchmark/collection/README.md)获取请求数据集
 
+#### Agentic 多轮追踪数据集（weka_trace）
+
+支持直接回放 SemiAnalysis **cc-traces-weka** 系列真实 Claude Code Agentic 会话数据集（[semianalysisai/cc-traces-weka-062126-256k](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126-256k) 等，393 条会话 / 6.89B input tokens / 平均 ISL≈100K）。该数据集无文本内容，只有 token 计数与 64-token KV 前缀块哈希序列（`hash_ids`），多轮前缀复用关系隐含在共享 hash 前缀中。loader 将 hash 块展开为全局唯一的合成 token（两请求共享 token 前缀 ⟺ 共享 hash 前缀 ⟺ 真实 KV 前缀复用结构），并推导每轮 output tokens 对齐下一轮 input，保证多轮前缀匹配不断链。
+
+* 数据集格式（traces.jsonl，每行一条完整会话）：
+  ```json
+  {"id": "session-id", "block_size": 64, "hash_id_scope": "local", "requests": [
+    {"t": 10.6, "type": "s", "in": 65408, "out": 265, "hash_ids": [10, 11, ...], "api_time": 3.4},
+    {"type": "subagent", "agent_id": "...", "t": 86541.1, "requests": [ ... ]}
+  ]}
+  ```
+
+* 仿真侧使用（`SGLangBenchmarkRunner.async_benchmark` 的 `dataset_args`，注册名 `weka_trace`）：
+  ```python
+  from hisim.dataset import DatasetArgs
+  dataset_args = DatasetArgs(
+      name="weka_trace",
+      filepath="traces_a.jsonl;traces_b.jsonl",  # 一个或多个 jsonl，';' 分隔
+      num_traces=10,               # 总共读几条 trace（-1=全部）
+      max_concurrent_traces=2,     # 同时并发的 trace 数（槽位制，结束一条补一条）
+      trace_start_interval=0.5,    # 并发 trace 首轮之间的间隔（默认 0.5s）
+      max_rounds_per_trace=20,     # 每条 trace 最多跑多少轮（-1=无限）
+      max_round_tokens=200000,     # 单轮长度上限（in+out，超过即截断该 trace）
+  )
+  ```
+  调度为静态时间轴（trace 内轮次保持录制时间间隔），由 OFFLINE 仿真的虚拟时钟（FUTURE_QUEUE）消费。
+
+* 离线缓存分析（无需安装仿真依赖，纯标准库）：
+  ```bash
+  python test/hisim_cache_analyzer_v3.py \
+      --weka-traces /path/to/traces.jsonl \
+      --num-traces 4 --max-concurrent-traces 2 --max-rounds-per-trace 10
+  ```
+  V1/V2/V3 三个 analyzer 均支持（详见 `test/README_hisim_cache_analyzer_*.md`）。实测（4 traces / 并发 2 / 10 轮）L1 复用率 82~85%。
+
+> 注意：`bench_serving` 的 HTTP 压测 CLI 尚未接线 weka 数据集（当前通过上述 Python API 与 analyzer CLI 使用）；当前版本 subagent 组请求暂不展开（仅回放主流请求）。
+
 ---
 
 ### Step 2: Mock Simulation

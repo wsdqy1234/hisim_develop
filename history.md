@@ -1109,3 +1109,55 @@ python test/hisim_cache_analyzer_v3.py --weka-traces <traces.jsonl路径> \
 - `src/hisim/dataset/dataset_args.py` / `__init__.py` — 参数扩展与注册
 - `test/hisim_cache_analyzer_v{1,2,3}.py` — weka 参数组 + output_ids 支持
 - `test/test_weka_trace_loader.py` — loader 单元测试（10 用例）
+
+---
+
+## 2026-09-09 — weka loader 文档化 + subagent 展开 / 动态完成时间反馈特性分析
+
+**文档更新**：
+- `README.md` / `README_zh.md`：Step 1 新增 "Agentic 多轮追踪数据集（weka_trace）" 章节（数据集格式、DatasetArgs 用法、analyzer CLI、已知限制：bench_serving HTTP CLI 未接线、subagent 未展开）
+- `test/README_hisim_cache_analyzer_v1.md` / `v2.md`：新增 "Weka Agentic Trace 输入" 章节（参数表 + 语义要点 + 实测结果）
+- `test/README_hisim_cache_analyzer_v3.md`：新建（v3 相对 v2 的 HiSim 机制、参数表、weka 语义、实测结果）
+
+### 特性一：subagent 请求展开 —— 必要性：高（对容量竞争研究）
+
+**数据实测（cc-traces-weka-062126-256k，393 traces）**：
+
+| 指标 | 数值 | 含义 |
+|---|---|---|
+| 含 subagent 组的 trace | 175/393（44.5%） | 近半会话有 subagent |
+| subagent 请求数 | 39,822 / 68,266（**58.3%**） | 丢掉 subagent 丢掉过半负载 |
+| subagent 输入 token | 2.99B / 6.89B（**43.4%**） | 近半 token 流量 |
+| 平均 subagent 组 | 23.5 请求，单请求 ISL≈75K | 独立多轮会话 |
+| 缓存足迹（unique blocks） | 1.86M → 4.12M（**+121%**） | 容量压力翻倍 |
+| 主流/subagent 共享块 | 仅 0.9%（union 口径） | subagent ≈ 独立缓存压力 |
+
+结论：subagent 使 L1/L2/L3 的容量竞争压力翻倍以上，不展开会**系统性低估逐出与 L2/L3 复用率**——正是 reuse rate 研究的核心变量；并发重叠还影响调度与排队指标。
+
+**实现方案（改动集中在 weka_trace.py，~100 行，analyzer 核心零改动）**：
+1. `WekaRound` 增加 `stream_id`（主流 = "main"，subagent = agent_id）；`_extract_main_rounds` 改为可选展开（`include_subagents` 参数，默认 False 保持兼容）
+2. subagent 内部请求扁平化进同一 trace 的 rounds（`t` 已是 trace 级相对时间，天然与主流重叠）
+3. **关键**：output 推导的轮次链接从 `trace_idx` 改为 `(trace_idx, stream_id)` —— 每个 subagent 是独立会话流，轮内 output 对齐本流下一轮 input；主流与各 subagent 各自成链
+4. 槽位调度：trace 时长取 max(主流末轮结束, 所有 subagent 内部末请求结束)
+5. hash 空间无需改（subagent 与主流共享 trace 本地 hash 空间，block_base 机制已兼容）
+6. analyzer 加 `--include-subagents` 开关
+
+**特性二：动态完成时间反馈 —— 必要性：中高（完整仿真必需，analyzer 不需要）**
+
+静态时间轴的失真场景：仿真预测慢于录制 api_time（换硬件/配置探索——正是 hisim 的核心用途）时，下一轮在上一轮完成前到达：
+1. **缓存复用失真（最关键）**：上一轮未 finish → output KV 未 insert（`cache_finished_req` 未执行）→ 下一轮 input 中对齐上一轮 output 的 token 段 miss → L1 复用率被系统性低估
+2. 排队/TTFT 失真：会话内轮次本应串行（agent 等回复），静态轴产生假并发
+
+analyzer 不受影响（逐请求顺序处理，隐含"等完成"语义）；hisim OFFLINE 仿真受影响。
+
+**实现方案（sglang_hook 层，完成事件驱动的重定键 + 停靠，~200 行 / 5 文件，默认关闭）**：
+- 元数据透传：`weka_trace.py` 导出每轮 think 间隔 → `weka_trace_dataset.py` custom_params 增加 session_id/round_idx/think_time → `sglang_bench.py get_request`（复用 queue_start 通道模式）→ `sglang_hook.py` 收集阶段解析登记
+- 核心机制（`sglang_hook.py`）：
+  - 释放循环（L1257-1267）：堆顶到期但本会话上一轮未完成 → 弹出到 `PARKED[session]` 停靠（防队头阻塞其他会话）
+  - 完成挂钩（`wrapped_process_batch_result` L1470-1481）：`req.finished` 时取虚拟完成时刻，把 PARKED 中下一轮以 `max(静态时间, 完成时刻+间隔)` 重新 heappush
+  - 两个陷阱已识别：① 不能用拉取式门控（空闲跳跃 L1344-1350 会死锁，停靠条目必须在完成时获得数值化 key）；② 不能复用 L1293-1297 的 queue_start 时钟回拨（debug 专用）
+  - 防御：堆空且 PARKED 非空且 running 为空时强制放行
+- `types.py` BenchmarkConfig 加 `dynamic_completion_feedback` 开关，默认 False 对现有静态回放零影响
+- 无死锁证明：停靠期间上一轮必在 running_batch，循环持续；完成后停靠条目获得数值 key，空闲跳跃可跳达
+
+**优先级建议**：先做 subagent 展开（analyzer 侧立刻可用、直接改善 reuse rate 研究的负载保真度），动态完成时间反馈在跑完整 weka 仿真前实现。
