@@ -81,6 +81,70 @@ def _drive_hicache_timing_phases(cache_obj) -> None:
     cc.submit_l3_write_timing()
 
 
+def _l2_transfer_duration(direction: str, num_bytes: float) -> float:
+    """L2 (device <-> host) transfer duration following the <= 0.5.9
+    MockTokenToKVPoolHost bandwidth model:
+
+        duration = t0 + bytes / (raw_bandwidth * 0.85)
+
+    with t0 = 6.67us for host->device loads and 4us for device->host
+    write-through backups."""
+    from hisim.simulation.manager import ConfigManager
+
+    pc = ConfigManager.get_platform_config()
+    if direction == "H2D":
+        raw_bw = pc.memory_read_bandwidth
+        t0 = 6.67e-6
+    else:
+        raw_bw = pc.memory_write_bandwidth
+        t0 = 4e-6
+    if not raw_bw:
+        return 0.0
+    return t0 + num_bytes / (raw_bw * 0.85)
+
+
+def _record_l2_backup_timing(num_bytes: float) -> None:
+    """D2H (write-through backup) timing for sglang >= 0.5.10, where the
+    mocked synchronous start_writing replaces the MockTokenToKVPoolHost
+    backup path that used to record this on <= 0.5.9."""
+    StateManager.inc_hicache_l2_backup_dur(_l2_transfer_duration("D2H", num_bytes))
+
+
+def _record_l2_load_timing(num_bytes: float, num_tokens: int) -> None:
+    """H2D (load back) timing for sglang >= 0.5.10, with the L3
+    direct-to-L1 split of the <= 0.5.9 MockTokenToKVPoolHost model: tokens
+    prefetched straight from L3 are charged to the direct bandwidth while the
+    remaining L2-resident tokens are charged to the memory bandwidth (both
+    transfers overlap; the consumer takes the max)."""
+    from hisim.simulation.manager import ConfigManager
+
+    pc = ConfigManager.get_platform_config()
+    direct_bw = None
+    try:
+        if pc.enable_l3_direct_to_l1:
+            direct_bw = pc.l3_to_l1_bandwidth
+    except Exception:
+        direct_bw = None
+
+    if direct_bw is not None and num_tokens > 0:
+        l3_count = min(StateManager.get_l3_direct_load_count(), num_tokens)
+        l2_count = num_tokens - l3_count
+        bytes_per_token = num_bytes / num_tokens
+        if l2_count > 0:
+            StateManager.inc_hicache_l2_load_dur(
+                _l2_transfer_duration("H2D", l2_count * bytes_per_token)
+            )
+        if l3_count > 0:
+            StateManager.inc_hicache_l3_direct_load_dur(
+                (l3_count * bytes_per_token) / direct_bw
+            )
+        return
+
+    StateManager.inc_hicache_l2_load_dur(
+        _l2_transfer_duration("H2D", num_bytes)
+    )
+
+
 class C_EngineHook(BaseHook):
     HOOK_CLASS_NAME = "Engine"
     HOOK_MODULE_NAME = "sglang.srt.entrypoints.engine"
@@ -1214,6 +1278,7 @@ class C_HiCacheController(BaseHook):
                 finish_event = device_module.Event(enable_timing=False)
                 start_event.record()
                 finish_event.record()
+                write_bytes = self._transfer_num_bytes(op)
                 self.ack_write_queue.append(
                     HiCacheAck(
                         start_event=start_event,
@@ -1222,9 +1287,11 @@ class C_HiCacheController(BaseHook):
                         num_tokens=len(op.device_indices),
                         timing_enabled=False,
                         num_tokens_by_pool=self._num_tokens_by_pool(op),
-                        num_bytes=self._transfer_num_bytes(op),
+                        num_bytes=write_bytes,
                     )
                 )
+                # L2 write-through (D2H) timing.
+                _record_l2_backup_timing(write_bytes)
 
             def mock_start_loading(self):
                 from sglang.srt.managers.cache_controller import (
@@ -1251,6 +1318,7 @@ class C_HiCacheController(BaseHook):
                 finish_event = device_module.Event(enable_timing=False)
                 start_event.record()
                 finish_event.record()
+                load_bytes = self._transfer_num_bytes(op)
                 self.ack_load_queue.append(
                     HiCacheAck(
                         start_event=start_event,
@@ -1259,9 +1327,11 @@ class C_HiCacheController(BaseHook):
                         num_tokens=len(op.device_indices),
                         timing_enabled=False,
                         num_tokens_by_pool=self._num_tokens_by_pool(op),
-                        num_bytes=self._transfer_num_bytes(op),
+                        num_bytes=load_bytes,
                     )
                 )
+                # L2 load-back (H2D) timing, with the L3 direct-to-L1 split.
+                _record_l2_load_timing(load_bytes, len(op.device_indices))
                 return producer_id
 
             target.start_writing = mock_start_writing
