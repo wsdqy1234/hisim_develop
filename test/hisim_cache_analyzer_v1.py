@@ -260,7 +260,8 @@ Examples:
   %(prog)s -i trace.jsonl --l1-tokens 0
         """
     )
-    parser.add_argument("-i", "--input", required=True, help="Input JSONL trace file")
+    parser.add_argument("-i", "--input", default=None,
+                        help="Input JSONL trace file (hisim_collection format); optional if --weka-traces is given")
     parser.add_argument("-o", "--output", default=None, help="Output JSONL results file")
     parser.add_argument("--block-size", type=int, default=16, help="Block size in tokens (default: 16, kvcm block size)")
     parser.add_argument("--kv-bytes-per-token", type=int, default=262144,
@@ -271,7 +272,41 @@ Examples:
     parser.add_argument("--use-output-ids", action="store_true",
                         help="Include output_ids in token sequence (default: input_ids only)")
     parser.add_argument("--max-requests", type=int, default=0, help="Max requests to analyze (0 = all)")
-    return parser.parse_args()
+    _load_weka_module_for_args(parser)
+    args = parser.parse_args()
+    return args
+
+
+def _load_weka_module_for_args(parser):
+    """Register weka-trace arguments; returns nothing (args parsed later)."""
+    try:
+        from hisim.dataset import weka_trace
+        weka_trace.add_weka_arguments(parser)
+    except Exception:
+        import importlib.util
+        from pathlib import Path
+        p = (Path(__file__).resolve().parent.parent
+             / "src" / "hisim" / "dataset" / "weka_trace.py")
+        spec = importlib.util.spec_from_file_location("hisim_weka_trace", p)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        m.add_weka_arguments(parser)
+
+
+def _load_weka_module():
+    """Load the weka_trace loader without requiring the full hisim package."""
+    try:
+        from hisim.dataset import weka_trace
+        return weka_trace
+    except Exception:
+        import importlib.util
+        from pathlib import Path
+        p = (Path(__file__).resolve().parent.parent
+             / "src" / "hisim" / "dataset" / "weka_trace.py")
+        spec = importlib.util.spec_from_file_location("hisim_weka_trace", p)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
 
 
 def main():
@@ -281,7 +316,7 @@ def main():
     l3_tokens = int(args.l3_gb * 1e9 / args.kv_bytes_per_token) if args.l3_gb > 0 else 0
 
     print("HiSim 3-Tier Cache Analyzer")
-    print(f"  Input: {args.input}")
+    print(f"  Input: {args.weka_traces if args.weka_traces else args.input}")
     print(f"  Block size: {args.block_size} tokens")
     print(f"  KV bytes/token: {args.kv_bytes_per_token:,} ({args.kv_bytes_per_token / 1024:.0f} KB)")
     print(f"  L1 capacity: {args.l1_tokens:,} tokens ({args.l1_tokens * args.kv_bytes_per_token / 1e9:.1f} GB virtual)" if args.l1_tokens else "  L1 capacity: UNLIMITED")
@@ -300,21 +335,34 @@ def main():
     results = []
     total_input_tokens = 0
 
-    with open(args.input, "r") as f:
-        lines = f.readlines()
+    if args.weka_traces:
+        weka_mod = _load_weka_module()
+        plan = weka_mod.weka_plan_from_args(args)
+        print(f"  Weka plan: {plan.num_traces} traces, {len(plan.rounds)} rounds, "
+              f"block_size={plan.block_size}")
+        entries = weka_mod.iter_round_entries(plan)  # time-sorted generator
+        total = len(plan.rounds)
+        use_output = True  # derived output_ids must enter the tree for reuse
+    else:
+        if not args.input:
+            raise SystemExit("error: --input is required unless --weka-traces is given")
+        with open(args.input, "r") as f:
+            entries = [json.loads(l.strip()) for l in f]
+        entries.sort(key=lambda d: d.get("timestamp", 0))
+        total = len(entries)
+        use_output = args.use_output_ids
 
-    max_req = args.max_requests if args.max_requests > 0 else len(lines)
+    max_req = args.max_requests if args.max_requests > 0 else total
 
-    for idx, line in enumerate(lines):
+    for idx, data in enumerate(entries):
         if idx >= max_req:
             break
         try:
-            data = json.loads(line.strip())
             input_ids = data.get("input_ids", [])
             output_ids = data.get("output_ids", [])
             input_len = data.get("input_length", len(input_ids))
 
-            if args.use_output_ids:
+            if use_output:
                 tokens = input_ids + output_ids
             else:
                 tokens = input_ids

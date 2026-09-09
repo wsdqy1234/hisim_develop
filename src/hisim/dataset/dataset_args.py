@@ -12,6 +12,12 @@ class DatasetArgs:
     min_output_len: int = -1
     max_output_len: int = -1
     prefix_hit_rate: Optional[float] = None
+    # weka_trace dataset arguments (see hisim.dataset.weka_trace).
+    num_traces: int = -1
+    max_concurrent_traces: int = 1
+    trace_start_interval: float = 0.5
+    max_rounds_per_trace: int = -1
+    max_round_tokens: int = -1
 
     @property
     def mean_input_length(self):

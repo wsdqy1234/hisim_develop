@@ -280,7 +280,7 @@ class RadixTreeCache:
                     self.l3.add(h)
         self.pending_acks = []
 
-    def analyze(self, tokens, rid, output_tokens=None):
+    def analyze(self, tokens, rid, output_tokens=None, output_ids=None):
         """Models HiSim's full lifecycle:
         1. match_prefix (L1 hit = non-evicted, L2 hit = evicted suffix)
         2. load_back (re-materialize L2 hits to L1 for use — doesn't change accounting)
@@ -369,33 +369,67 @@ class RadixTreeCache:
             n.lock_ref = max(0, n.lock_ref - 1)
         return {'l1': l1, 'l2': hh, 'l3': l3, 'new': len(tokens)-l1-hh-l3}
 
+def _load_weka_module():
+    """Load the weka_trace loader without requiring the full hisim package."""
+    try:
+        from hisim.dataset import weka_trace
+        return weka_trace
+    except Exception:
+        import importlib.util
+        from pathlib import Path
+        p = (Path(__file__).resolve().parent.parent
+             / "src" / "hisim" / "dataset" / "weka_trace.py")
+        spec = importlib.util.spec_from_file_location("hisim_weka_trace", p)
+        m = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(m)
+        return m
+
+
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("-i", "--input", required=True)
+    p.add_argument("-i", "--input", default=None,
+                   help="Input JSONL (hisim_collection format); optional if --weka-traces is given")
     p.add_argument("--l1-tokens", type=int, default=200000)
     p.add_argument("--l2-gb", type=float, default=80)
     p.add_argument("--kv-bytes-per-token", type=int, default=262144)
     p.add_argument("--page-size", type=int, default=1)
     p.add_argument("--max-requests", type=int, default=0)
+    weka_mod = _load_weka_module()
+    weka_mod.add_weka_arguments(p)
     args = p.parse_args()
     l2t = int(args.l2_gb * 1e9 / args.kv_bytes_per_token) if args.l2_gb > 0 else 0
     print(f"Radix Tree Cache v3: L1={args.l1_tokens} L2={l2t} page={args.page_size}\n")
     cache = RadixTreeCache(args.l1_tokens, l2t, args.page_size)
     tl=tl2=tl3=tn=ti=0; l2r=0
-    entries = [json.loads(l) for l in open(args.input)]
-    entries.sort(key=lambda d: d.get('timestamp', 0))
-    mx = args.max_requests or len(entries)
+    if args.weka_traces:
+        plan = weka_mod.weka_plan_from_args(args)
+        print(f"Weka plan: {plan.num_traces} traces, {len(plan.rounds)} rounds, "
+              f"block_size={plan.block_size}\n")
+        entries = weka_mod.iter_round_entries(plan)  # time-sorted generator
+        total = len(plan.rounds)
+    else:
+        if not args.input:
+            p.error("--input is required unless --weka-traces is given")
+        entries = [json.loads(l) for l in open(args.input)]
+        entries.sort(key=lambda d: d.get('timestamp', 0))
+        total = len(entries)
+    mx = args.max_requests or total
     t0=time.time()
     for i, d in enumerate(entries):
         if i >= mx: break
         toks = d.get('input_ids', [])
+        out_ids = d.get('output_ids')
         out_len = d.get('output_length', 0)
         ti += d.get("input_length", len(toks))
-        r = cache.analyze(toks, i, output_tokens=out_len)
+        r = cache.analyze(toks, i,
+                          output_tokens=(None if out_ids else out_len),
+                          output_ids=out_ids)
         tl+=r['l1']; tl2+=r['l2']; tl3+=r['l3']; tn+=r['new']
         if r['l2']>0: l2r+=1
         if r['l2']>0 or r['l3']>0:
-            print(f"  #{i+1}: inp={len(toks)} L1={r['l1']} L2={r['l2']} L3={r['l3']} New={r['new']}")
+            tag = (f" tr{d['trace_idx']}r{d['round_idx']}"
+                   if 'trace_idx' in d else "")
+            print(f"  #{i+1}{tag}: inp={len(toks)} L1={r['l1']} L2={r['l2']} L3={r['l3']} New={r['new']}")
         if (i+1)%100==0: print(f"  {i+1} reqs {time.time()-t0:.0f}s", flush=True)
     print(f"\n{'='*60}")
     print(f"Total input: {ti:,}")

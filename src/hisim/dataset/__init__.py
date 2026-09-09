@@ -8,6 +8,7 @@ from hisim.dataset.random import (
 )
 from hisim.dataset.share_gpt import ShareGPTDataset
 from hisim.dataset.hisim_collection import HisimCollectionDataset
+from hisim.dataset.weka_trace_dataset import WekaTraceDataset
 from hisim.dataset.dataset_args import DatasetArgs
 from hisim.dataset.prefix_cache import PrefixCacheDecorator
 from hisim.utils import get_logger

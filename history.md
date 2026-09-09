@@ -1039,3 +1039,73 @@ pop_l3_direct_load_count()  # 复位
 - `test/hisim_cache_analyzer_v2.py` — radix tree 模型（sglang 风格）
 - `test/hisim_cache_analyzer_v3.py` — V2 + HiSim 逻辑（write_through/load_back/prefetch/contiguous prefix）
 - `docs/HiSim_Simulation_Test_Report.md` — 完整测试报告（含配置说明、运行方法、结果对比）
+
+---
+
+## 2026-09-09 — 接入 SemiAnalysis cc-traces-weka Agentic 追踪数据集（weka_trace loader）
+
+**背景**：InferenceX/AgentX 的 Agentic 追踪回放数据集（`semianalysisai/cc-traces-weka-062126-256k`，真实 Claude Code 会话，393 traces / 68,266 请求 / 6.89B input tokens / 平均 ISL≈100K）需要接入 hisim。该数据集**无文本内容**，只有 token 计数 + 64-token KV 前缀块哈希序列（`hash_ids`），多轮前缀复用关系隐含在共享 hash 前缀中；subagent 组与主流时间上并发重叠。
+
+**完成的事项**：
+
+### 1. weka_trace.py（`src/hisim/dataset/weka_trace.py`，纯标准库零依赖）
+
+核心规划模块，可被 analyzer 通过 importlib 文件加载直接复用（无需安装 transformers/sglang）：
+
+- **`plan_weka_traces()`**：解析一个或多个 traces.jsonl（`;` 分隔），构建**静态时间轴调度**（由 hisim 虚拟时钟消费）：
+  - `num_traces`：总共读几条 trace（-1 全部）
+  - `max_concurrent_traces`：并发 trace 槽位；第 j 个初始槽起始时间 = `j * trace_start_interval`
+  - `trace_start_interval`（默认 0.5s）：初始 trace 第一轮之间的间隔；trace 结束（最后保留轮的 `t + api_time`）后隔该间隔由下一条 trace 接替槽位（选最早空闲槽）
+  - `max_rounds_per_trace`（-1 无限）：截断 trace 到前 N 轮
+  - `max_round_tokens`（-1 无限）：轮长 = `in + out`，首个超限轮之前截断 trace，下一条接替
+  - trace 内后续轮保持录制相对时间间隔（录制时间已编码"等回复+思考"的依赖）
+- **`expand_hash_ids()`**：hash → 合成 token 展开。每 trace 分配全局唯一 block base（`max_hash+1` 递增），块 h 映射到 tokens `[(base+h)*64, +64)`。两请求共享 token 前缀 ⟺ 共享 hash 前缀 ⟺ 真实 KV 前缀复用结构，无损进入 radix tree。
+- **`derive_output_tokens()`**：**跨轮 output 推导**（关键正确性设计）——轮 i 的 output tokens 取自轮 i+1 input 超出轮 i input 的部分（对齐到 `out` 长度），使 output 插入树后下一轮前缀匹配不断链；无后继轮/上下文压缩时回退为唯一虚拟 token（`-(global_seq+1)`）。
+- **`iter_round_entries()`**：时间排序流式生成器（逐轮惰性展开，内存峰值 = 单请求大小），产出 analyzer 兼容 entry（timestamp/input_ids/output_ids/长度字段）。
+- **`add_weka_arguments()` / `weka_plan_from_args()`**：共享 argparse 参数组。
+
+### 2. WekaTraceDataset（`src/hisim/dataset/weka_trace_dataset.py`）
+
+注册名 `weka_trace`（`dataset/__init__.py`），`__getitem__` 惰性展开 token，`custom_params={"created_time", "rid"}` 供 sglang_hook 的 FUTURE_QUEUE 虚拟时钟调度。`DatasetArgs` 新增 5 个 weka 字段。**内存只存 hash_ids（~每块 1 int），不存展开 token**——避免 6.9B token 全量展开的 ~55GB 内存问题。
+
+### 3. analyzer V1/V2/V3 接入（复用同一 loader）
+
+- 三个 analyzer 均加 `--weka-traces` 参数组（`-i` 变为可选，与 `--weka-traces` 互斥）；`_load_weka_module()` 先试常规 import，失败则 importlib 按文件加载 `src/hisim/dataset/weka_trace.py`（绕开 `hisim.dataset.__init__` 的 transformers 依赖）。
+- **V2/V3**：`analyze()` 加 `output_ids` 参数——weka 模式插入推导的真实 output（多轮复用不断链），优先于原虚拟 output（V2 `[-(rid+1)]`、V3 `[1]*n`）；hisim_collection 老路径行为不变。
+- **V1**：weka 模式强制 `use_output=True`（tokens = input + derived output 一起入树）。
+- 逐请求打印加 `tr{trace_idx}r{round_idx}` 标签。
+
+### 4. 测试
+
+- **loader 单元测试**（`test/test_weka_trace_loader.py`，10/10 通过）：单 trace 时间保持、num_traces、并发槽调度（初始错峰 + 最早空闲槽接替）、max_rounds/max_round_tokens 截断（含整 trace 跳过）、hash 展开前缀语义（同 trace 跨轮前缀一致、跨 trace 不相交）、output 推导对齐、多文件输入、流式生成器。
+- **真实数据完整测试**（`cc-traces-weka-062126-256k`，4 traces / 并发 2 / 间隔 0.5s / 每 trace 10 轮，40 rounds，3.5M input tokens）：
+
+| Analyzer | L1 | L2 | L3 | New |
+|---|---|---|---|---|
+| V1（block 级，--block-size 64） | 82.29% (83.51% of input) | 1.84% | 1.84% | — |
+| V2（radix） | 84.88% | 0.52% | 1.87% | 12.73% |
+| V3（V2+HiSim 逻辑） | 83.96% | 0.52% | 1.87% | 13.64% |
+
+V2/V3 的 L3 完全一致（65,664 tokens = 一整轮逐出后恢复）；L1 82-85% 符合 agentic 多轮前缀复用预期（每轮 New ~13-14% 为新增上下文）。参数组合测试（并发 1 / 间隔 2 / 轮长 100K 截断 → 9 rounds，串行无逐出 L2/L3=0）与 hisim_collection 老 jsonl 路径回归均通过。
+
+**关键设计决策记录**：
+- **静态时间轴 vs 动态等待**：轮次间"max(trace 间隔, 上轮完成)"的依赖已编码在录制的 `t` 序列中；trace 间接替用录制 `api_time` 估算结束时间。不做动态完成时间反馈（与"先靠 hisim 虚拟时钟"的决策一致），后续如需动态化需在 sglang_hook 层实现。
+- **output_ids 必须真实推导**：若用虚拟 output（如 hisim 仿真 mock 全 1），下一轮 input 中对应上轮 output 的块全部 miss，L1 复用率被系统性大幅低估（前缀链在上轮 input 末尾断掉）。
+- **subagent 暂未展开**：当前只取主流请求（`type != "subagent"`）；subagent 并发对缓存竞争的影响留待后续版本。
+- **`in` 与 hash 100% 块对齐**（实测 3307 主流请求 0 mismatch），`input_length` 取 `len(hash_ids)*block_size`。
+
+**使用示例**：
+```
+# hisim 仿真（DatasetArgs: name="weka_trace", filepath="a.jsonl;b.jsonl", ...）
+# analyzer V3:
+python test/hisim_cache_analyzer_v3.py --weka-traces <traces.jsonl路径> \
+  --num-traces 4 --max-concurrent-traces 2 --trace-start-interval 0.5 \
+  --max-rounds-per-trace 10 [--max-round-tokens 100000]
+```
+
+**关键文件**：
+- `src/hisim/dataset/weka_trace.py` — 核心规划模块（零依赖，analyzer 复用入口）
+- `src/hisim/dataset/weka_trace_dataset.py` — WekaTraceDataset（仿真侧）
+- `src/hisim/dataset/dataset_args.py` / `__init__.py` — 参数扩展与注册
+- `test/hisim_cache_analyzer_v{1,2,3}.py` — weka 参数组 + output_ids 支持
+- `test/test_weka_trace_loader.py` — loader 单元测试（10 用例）
