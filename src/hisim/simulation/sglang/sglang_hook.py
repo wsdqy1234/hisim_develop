@@ -62,6 +62,25 @@ def _is_legacy_sglang() -> bool:
         return True
 
 
+def _drive_hicache_timing_phases(cache_obj) -> None:
+    """Run the hisim storage data/timing phases on a tree cache:
+
+    1. Data phase: batch_set writes the previous round's KV to the storage.
+    2. Data + read timing: batch_exists queries the storage (+ SSD read
+       timing on simulators).
+    3. Write timing: submit_write advances the SSD simulation state.
+
+    Called from the hooked check_hicache_events before the stock event
+    processing. Shared by the HiRadixCache (<= 0.5.9) and UnifiedRadixCache
+    (>= 0.5.10) hooks."""
+    cc = getattr(cache_obj, "cache_controller", None)
+    if cc is None or not getattr(cc, "enable_storage", False):
+        return
+    cc.handle_backup_operation()
+    cc.handle_prefetch_operation()
+    cc.submit_l3_write_timing()
+
+
 class C_EngineHook(BaseHook):
     HOOK_CLASS_NAME = "Engine"
     HOOK_MODULE_NAME = "sglang.srt.entrypoints.engine"
@@ -767,6 +786,10 @@ class C_HiCacheController(BaseHook):
                     bw = C_HiCacheController.DISK_WRITE_BANDWIDTH_BYTES or 8e9
                     write_time = total_write_bytes / bw
             StateManager.inc_hicache_l3_backup_dur(write_time)
+            logger.debug(
+                f"L3 write timing: tokens={total_write_tokens}, "
+                f"write_time={write_time:.3e}s"
+            )
 
         def handle_prefetch_operation(self):
             if not self.enable_storage:
@@ -1057,15 +1080,14 @@ class C_HiCacheController(BaseHook):
             ]
             return self.storage_backend.batch_set(hash_values, data, extra_info)
 
-        # Legacy sglang (<= 0.5.9): the async backup/prefetch threads must not
-        # run - the data/timing phases are driven by handle_backup_operation /
+        # The async backup/prefetch threads must not run: the data/timing
+        # phases are driven by handle_backup_operation /
         # handle_prefetch_operation from the hooked check_hicache_events
-        # instead. On sglang >= 0.5.10 the tree cache is UnifiedRadixCache and
-        # the storage queues are drained by the stock threads (pure CPU work
-        # against the mock storage), so keep them alive.
-        if _is_legacy_sglang():
-            target.prefetch_thread_func = override_prefetch_thread_func
-            target.backup_thread_func = override_backup_thread_func
+        # instead (scheduler-thread lockstep, deterministic timing). On
+        # sglang >= 0.5.10 HybridCacheController overrides backup_thread_func
+        # (shadowing this no-op); C_HybridCacheControllerHook handles that.
+        target.prefetch_thread_func = override_prefetch_thread_func
+        target.backup_thread_func = override_backup_thread_func
         target.handle_backup_operation = handle_backup_operation
         target.handle_prefetch_operation = handle_prefetch_operation
         target.submit_l3_write_timing = submit_l3_write_timing
@@ -1279,13 +1301,9 @@ class C_HiRadixCacheHook(BaseHook):
             target.__mro__[1].__init__(self, params=params)
 
         def wrapped_check_hicache_events(self, *args, **kwargs):
-            # 1. Data phase: batch_set writes previous round's KV to kvcm
-            self.cache_controller.handle_backup_operation()
-            # 2. Data + read timing: batch_exists queries kvcm + submit_read
-            #    (sees previous round's write avail_time)
-            self.cache_controller.handle_prefetch_operation()
-            # 3. Write timing: submit_write advances avail_time for next round
-            self.cache_controller.submit_l3_write_timing()
+            # 1-3. Data + timing phases (storage backend only); see
+            # _drive_hicache_timing_phases for the phase ordering rationale.
+            _drive_hicache_timing_phases(self)
             result = original_check_hicache_events(self, *args, **kwargs)
             # 4. Fix (legacy sglang <= 0.5.9 only): In CPU simulation, CUDA
             # events in ack_write_queue and ack_load_queue never complete, so
@@ -1391,6 +1409,57 @@ class C_HiRadixCacheHook(BaseHook):
             target.evict_host = _tracked_evict_host
             target.load_back = _tracked_load_back
             logger.info("Node lifecycle tracking enabled (HISIM_NODE_TRACK)")
+
+
+class C_HybridCacheControllerHook(BaseHook):
+    """sglang >= 0.5.10: HybridCacheController overrides backup_thread_func
+    (sidecar pools must be backed up on every TP rank), shadowing the no-op
+    installed on HiCacheController. The storage data phase is driven by
+    handle_backup_operation from the hooked check_hicache_events instead, so
+    the thread must stay idle to avoid double-consuming backup_queue."""
+
+    HOOK_CLASS_NAME = "HybridCacheController"
+    HOOK_MODULE_NAME = "sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller"
+
+    @classmethod
+    def hook(cls, target):
+        def override_backup_thread_func(self, *args, **kwargs):
+            # Async thread: perform no action.
+            # The action will be performed by `handle_backup_operation`.
+            pass
+
+        target.backup_thread_func = override_backup_thread_func
+
+
+class C_UnifiedRadixCacheHook(BaseHook):
+    """sglang >= 0.5.10 builds the hierarchical tree cache as
+    UnifiedRadixCache (registry.create_tree_cache) instead of HiRadixCache,
+    so C_HiRadixCacheHook never fires. Drive the same storage data/timing
+    phases from UnifiedRadixCache.check_hicache_events / reset."""
+
+    HOOK_CLASS_NAME = "UnifiedRadixCache"
+    HOOK_MODULE_NAME = "sglang.srt.mem_cache.unified_radix_cache"
+
+    @classmethod
+    def hook(cls, target):
+        original_check_hicache_events = target.check_hicache_events
+        original_reset = target.reset
+
+        def wrapped_check_hicache_events(self, *args, **kwargs):
+            _drive_hicache_timing_phases(self)
+            return original_check_hicache_events(self, *args, **kwargs)
+
+        def wrapped_reset(self):
+            # Flush the pending storage writes and their write timing before
+            # the tree state is destroyed.
+            cc = getattr(self, "cache_controller", None)
+            if cc is not None and getattr(cc, "enable_storage", False):
+                cc.handle_backup_operation()
+                cc.submit_l3_write_timing()
+            original_reset(self)
+
+        target.check_hicache_events = wrapped_check_hicache_events
+        target.reset = wrapped_reset
 
 
 class C_StorageBackendFactory(BaseHook):

@@ -22,6 +22,8 @@ hisim_hook.install_class_hooks(
         sglang_hook.C_HiCacheController,
         sglang_hook.C_HiRadixCacheHook,
         sglang_hook.C_SchedulerProfilerManagerHook,
+        sglang_hook.C_HybridCacheControllerHook,
+        sglang_hook.C_UnifiedRadixCacheHook,
     ]
 )
 
