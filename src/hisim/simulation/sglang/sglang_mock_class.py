@@ -28,6 +28,62 @@ _CURRENT_DIR = Path(__file__).parent.resolve()
 _KVCM_BLOCK_SIZE = 16
 
 
+class MockAttentionBackend:
+    """Attention backend stub for the mock ModelRunner.
+
+    sglang >= 0.5.10 dereferences ``model_runner.attn_backend`` in
+    ``ForwardBatch.init_new`` even though the forward pass itself is
+    intercepted, so a no-op stub is required instead of ``None``."""
+
+    def get_cpu_graph_seq_len_fill_value(self) -> int:
+        return 0
+
+    def get_cuda_graph_seq_len_fill_value(self) -> int:
+        return 0
+
+
+class MockWeightLoader:
+    """Weight loader stub (sglang >= 0.5.10 reads ``loader.preloaded_weights_bytes``)."""
+
+    preloaded_weights_bytes = 0
+
+
+class MockKVIndexTranslator:
+    """KV index translator stub (sglang >= 0.5.10 calls ``rebind_write_loc`` in
+    ``ForwardBatch.init_new``; real translation only matters for attention
+    kernels, which are intercepted)."""
+
+    is_translating = False
+
+    def rebind_write_loc(self, forward_batch) -> None:
+        pass
+
+    def build_index_table(self, *args, **kwargs):
+        return None
+
+    def index_table_for_batch(self, forward_batch):
+        return None
+
+    def sliding_window_write_loc_for(self, out_cache_loc):
+        return out_cache_loc
+
+    def make_capture_tables(self, *args, **kwargs):
+        return None
+
+
+class MockNgramEmbeddingManager:
+    """Ngram embedding manager stub (``ForwardBatch.init_new`` reads ``.enabled``)."""
+
+    enabled = False
+    table = None
+
+    def prepare_for_forward(self, batch, *args, **kwargs):
+        return batch
+
+    def update_after_decode(self, *args, **kwargs):
+        pass
+
+
 def alloc_extend_cpu(
     pre_lens_ptr: torch.Tensor,
     seq_lens_ptr: torch.Tensor,
@@ -221,6 +277,7 @@ class MockReqToTokenPool:
             self._alloc_v1,
         )
         _version_dispatcher.register_method("alloc", ["0.5.9"], self._alloc_v2)
+        _version_dispatcher.register_method("alloc", ["0.5.19"], self._alloc_v3)
 
         _version_dispatcher.register_method(
             "free",
@@ -228,9 +285,24 @@ class MockReqToTokenPool:
             self._free_v1,
         )
         _version_dispatcher.register_method("free", ["0.5.9"], self._free_v2)
+        _version_dispatcher.register_method("free", ["0.5.19"], self._free_v3)
 
         self._alloc_func = _version_dispatcher.get_compat_method("alloc")
         self._free_func = _version_dispatcher.get_compat_method("free")
+
+    def reset_aux_cache_allocator(self) -> None:
+        # sglang >= 0.5.10 calls this on flush_cache; the mock has no aux cache.
+        pass
+
+    def schedulable_token_capacity(self, physical_capacity: int) -> int:
+        # sglang >= 0.5.10: no aux cache means the full physical capacity.
+        return physical_capacity
+
+    def alloc_aux_to_lengths(
+        self, *, req_pool_indices_cpu=None, target_seq_lens_cpu=None
+    ) -> None:
+        # sglang >= 0.5.10: no aux cache in the mock, nothing to allocate.
+        pass
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -286,6 +358,42 @@ class MockReqToTokenPool:
         self.free_slots.append(req.req_pool_idx)
         req.req_pool_idx = None
 
+    def _alloc_v3(self, reqs: list) -> Optional[List[int]]:
+        # sglang >= 0.5.10: req pool slot is carried by `req.kv`.
+        def _kv_attr(req, name):
+            kv = getattr(req, "kv", None)
+            if kv is not None:
+                return getattr(kv, name, None)
+            return getattr(req, name, None)
+
+        reusing = [i for i, r in enumerate(reqs) if _kv_attr(r, "holds_kv")]
+        need_size = len(reqs) - len(reusing)
+        if need_size > len(self.free_slots):
+            return None
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        offset = 0
+        for r in reqs:
+            if _kv_attr(r, "holds_kv"):
+                continue
+            if getattr(r, "kv", None) is not None:
+                r.kv.req_pool_idx = select_index[offset]
+            else:
+                r.req_pool_idx = select_index[offset]
+            offset += 1
+        return [_kv_attr(r, "req_pool_idx") for r in reqs]
+
+    def _free_v3(self, req):
+        kv = getattr(req, "kv", None)
+        if kv is not None:
+            assert kv.req_pool_idx is not None, "request must have req_pool_idx"
+            self.free_slots.append(kv.req_pool_idx)
+            kv.req_pool_idx = None
+        else:
+            assert req.req_pool_idx is not None, "request must have req_pool_idx"
+            self.free_slots.append(req.req_pool_idx)
+            req.req_pool_idx = None
+
     def clear(self):
         self.free_slots = list(range(self.size))
 
@@ -296,6 +404,9 @@ def get_tensor_size_bytes(t: torch.Tensor):
 
 class MockTokenToKVPool:
     # from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+
+    # sglang >= 0.5.10: post-capture KV pool resize feature; not used by the mock.
+    post_capture_active = False
 
     def __init__(
         self,
@@ -565,6 +676,41 @@ class MockBaseTokenToKVPoolAllocator:
             self.release_pages = torch.empty(
                 (0,), dtype=self.release_pages.dtype, device=self.device
             )
+
+    # --- sglang >= 0.5.10 allocator interface (no-op / trivial for the mock) --- #
+
+    def free_segment(self, free_index: torch.Tensor, *, start_pos: int = 0):
+        # Default semantics of sglang's allocator base: plain free().
+        self.free(free_index)
+
+    def free_segments(self, segments):
+        for free_index, _start_pos in segments:
+            self.free(free_index)
+
+    def flush_opportunistic(self):
+        pass
+
+    def set_disagg_move_gate(self, *args, **kwargs):
+        pass
+
+    def verify_byte_accounting(self, *args, **kwargs):
+        return 0
+
+    def set_latest_forward_done_event(self, *args, **kwargs):
+        pass
+
+    def set_inflight_forward(self, *args, **kwargs):
+        pass
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+        # sglang >= 0.5.10: default shared token-count eviction.
+        from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+        evict_from_tree_cache(tree_cache, num_tokens)
+
+    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+        return self.available_size() >= num_tokens
 
     def get_cpu_copy(self, *args, **kwargs):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
@@ -1065,6 +1211,11 @@ class MockTokenToKVPoolHost:
         self.free_slots = torch.cat([self.free_slots, indices])
         return len(indices)
 
+    def destroy(self):
+        # sglang >= 0.5.10 calls this when flushing the host pool; the mock
+        # keeps no real buffers.
+        pass
+
 
 def _pass_str_to_block_ids(hash_key):
     int_hash = int(hash_key, 16)
@@ -1263,6 +1414,19 @@ class MockHiCacheStorage:
         if self._last_per_tier_hits is not None:
             return self._last_per_tier_hits
         return {"default": 0}
+
+    def batch_get(
+        self,
+        keys: List[str],
+        target_locations=None,
+        target_sizes=None,
+        extra_info=None,
+    ):
+        """sglang >= 0.5.10 page-get interface.
+
+        The mock backend only tracks keys (no real KV data), so every load is
+        reported as a miss (``None`` -> 0 pages loaded by the controller)."""
+        return None
 
     def get_last_write_per_tier(self) -> dict:
         """Return per-tier newly-inserted write block counts from the last batch_set() call.

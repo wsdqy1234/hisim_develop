@@ -25,12 +25,16 @@ from hisim.time_predictor import (
     ScheduleBatch as HisimScheduleBatch,
 )
 from hisim.simulation.sglang.sglang_mock_class import (
+    MockAttentionBackend,
+    MockHiCacheStorage,
+    MockKVIndexTranslator,
+    MockNgramEmbeddingManager,
+    MockPagedTokenToKVPoolAllocator,
     MockReqToTokenPool,
     MockTokenToKVPool,
     MockTokenToKVPoolAllocator,
-    MockPagedTokenToKVPoolAllocator,
     MockTokenToKVPoolHost,
-    MockHiCacheStorage,
+    MockWeightLoader,
 )
 from hisim.simulation.utils import (
     calc_metrics,
@@ -101,7 +105,7 @@ class C_ModelRunnerHook(BaseHook):
 
             # Attributes that may not be set by the hook but are expected by sglang
             self.use_ngram_embedding = False
-            # None matches the non-SWA semantics of sglang 0.5.6-0.5.9, where
+            # None matches the non-SWA semantics of sglang >= 0.5.6, where
             # `is_hybrid_swa is not None` is used as the hybrid-SWA check.
             self.is_hybrid_swa = None
             self.is_draft_worker = False
@@ -133,6 +137,8 @@ class C_ModelRunnerHook(BaseHook):
                 self.max_total_num_tokens = (
                     self.max_total_num_tokens // self.page_size * self.page_size
                 )
+            self.full_max_total_num_tokens = self.max_total_num_tokens
+            self.swa_max_total_num_tokens = self.max_total_num_tokens
 
             max_num_reqs = min(
                 max(
@@ -202,9 +208,52 @@ class C_ModelRunnerHook(BaseHook):
                 )
 
             # self.init_memory_pool(50)
-            self.attn_backend = None
+            # sglang >= 0.5.10 dereferences attn_backend and several other
+            # attributes in ForwardBatch.init_new / downstream code paths even
+            # though the forward pass itself is intercepted, so provide stubs.
+            self.attn_backend = MockAttentionBackend()
             self.graph_mem_usage = 0
             self.weight_load_mem_usage = 10
+            self.lora_manager = None
+            self.loader = MockWeightLoader()
+            self.canary_manager = None
+            self.prefill_aware_swa = False
+            self.ngram_embedding_manager = MockNgramEmbeddingManager()
+            self.prefill_attention_backend_str = "torch_native"
+            self.decode_attention_backend_str = "torch_native"
+            self.kv_index_translator = MockKVIndexTranslator()
+            try:
+                from sglang.srt.layers.sampler import create_sampler
+
+                self.sampler = create_sampler()
+            except Exception:
+                self.sampler = None
+            try:
+                from sglang.srt.eplb.expert_location_updater import (
+                    ExpertLocationUpdater,
+                )
+
+                self.expert_location_updater = ExpertLocationUpdater()
+            except Exception:
+                self.expert_location_updater = None
+            # sglang >= 0.5.10 allocates the memory pools from
+            # Scheduler.init_memory_pools via ModelRunner.alloc_memory_pool,
+            # which would overwrite the mock pools. A non-None
+            # memory_pool_config makes init_target_memory_pool() skip it.
+            try:
+                from sglang.srt.model_executor.pool_configurator import (
+                    MemoryPoolConfig,
+                )
+
+                self.memory_pool_config = MemoryPoolConfig(
+                    max_total_num_tokens=self.max_total_num_tokens
+                )
+            except Exception:
+                import types as _types
+
+                self.memory_pool_config = _types.SimpleNamespace(
+                    max_total_num_tokens=self.max_total_num_tokens
+                )
 
             self.max_running_requests = min(
                 (
@@ -250,7 +299,9 @@ class C_ModelRunnerHook(BaseHook):
             )
 
         _version_dispatcher.register_method(
-            "forward", ["0.5.7", "0.5.8", "0.5.8.post1", "0.5.9"], wrapped_forward_v2
+            "forward",
+            ["0.5.7", "0.5.8", "0.5.8.post1", "0.5.9", "0.5.19"],
+            wrapped_forward_v2,
         )
 
         def wrapped_sample(self, *args, **kwargs):
@@ -269,6 +320,41 @@ class C_ModelRunnerHook(BaseHook):
         target.forward = _version_dispatcher.get_compat_method("forward")
         target.sample = wrapped_sample
         target.compute_logprobs_only = wrapped_compute_logprobs_only
+
+        # sglang >= 0.5.10 runs torch distributed init inside
+        # ModelRunner.__init__ (before `initialize`), and its CPU bootstrap
+        # path calls torch.ops.sgl_kernel.* ops that are unavailable in
+        # CPU-only builds without the sgl-kernel extension. Neutralize
+        # `_init_cpu_threads_env` for the duration of the call.
+        if hasattr(target, "init_torch_distributed"):
+            _original_init_torch_distributed = target.init_torch_distributed
+
+            def wrapped_init_torch_distributed(self, *args, **kwargs):
+                try:
+                    from sglang.srt.distributed import bootstrap as _bootstrap
+                except ImportError:
+                    return _original_init_torch_distributed(self, *args, **kwargs)
+                if not hasattr(_bootstrap, "_init_cpu_threads_env"):
+                    return _original_init_torch_distributed(self, *args, **kwargs)
+                _original = _bootstrap._init_cpu_threads_env
+                _bootstrap._init_cpu_threads_env = lambda *a, **k: None
+                try:
+                    return _original_init_torch_distributed(self, *args, **kwargs)
+                finally:
+                    _bootstrap._init_cpu_threads_env = _original
+
+            target.init_torch_distributed = wrapped_init_torch_distributed
+
+        # sglang >= 0.5.10 builds real attention backends from
+        # Scheduler.init_all_attention_backends; the mock forward pass only
+        # needs the stub backend installed above.
+        if hasattr(target, "init_attention_backends"):
+            target.init_attention_backends = lambda self, *args, **kwargs: None
+        # sglang >= 0.5.10 triggers cuda graph capture from
+        # Scheduler.init_all_cuda_graphs; graphs are irrelevant for the
+        # simulation (the forward pass is intercepted).
+        if hasattr(target, "init_cuda_graphs"):
+            target.init_cuda_graphs = lambda self, *args, **kwargs: None
 
 
 class C_HiCacheController(BaseHook):
@@ -943,11 +1029,7 @@ class C_HiRadixCacheHook(BaseHook):
                 StorageMetricsCollector = None
 
             self.load_cache_event = threading.Event()
-            self.cache_controller = HiCacheController(
-                params.token_to_kv_pool_allocator,
-                self.token_to_kv_pool_host,
-                self.page_size,
-                self.tp_group,
+            controller_kwargs = dict(
                 load_cache_event=self.load_cache_event,
                 write_policy=server_args.hicache_write_policy,
                 io_backend=server_args.hicache_io_backend,
@@ -955,6 +1037,25 @@ class C_HiRadixCacheHook(BaseHook):
                 prefetch_threshold=self.prefetch_threshold,
                 model_name=server_args.served_model_name,
                 storage_backend_extra_config=extra_config,
+            )
+            # sglang >= 0.5.10 introduced extra constructor parameters.
+            import inspect as _inspect
+
+            _ctor_params = _inspect.signature(HiCacheController.__init__).parameters
+            if "enable_storage_metrics" in _ctor_params:
+                controller_kwargs["enable_storage_metrics"] = (
+                    self.enable_storage_metrics
+                )
+            if "host_memory_mode" in _ctor_params:
+                controller_kwargs["host_memory_mode"] = getattr(
+                    server_args, "hicache_host_memory_mode", "cache"
+                )
+            self.cache_controller = HiCacheController(
+                params.token_to_kv_pool_allocator,
+                self.token_to_kv_pool_host,
+                self.page_size,
+                self.tp_group,
+                **controller_kwargs,
             )
             if self.enable_storage_metrics and StorageMetricsCollector is not None:
                 # TODO: support pp
@@ -1146,14 +1247,286 @@ class C_SchedulerHook(BaseHook):
 
     SCHEDULE_REQ_STATS = []
 
+    # ------------------------------------------------------------------
+    # Helpers shared by the legacy (<= 0.5.9) and new (>= 0.5.10) request
+    # paths. `sampling_params` is a `SamplingParams` object on old versions
+    # and may arrive as a plain dict on newer msgspec-based IO structs.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def get_simulation_params(req):
+        sp = getattr(req, "sampling_params", None)
+        if sp is None:
+            return None
+        if isinstance(sp, dict):
+            custom_params = sp.get("custom_params")
+        else:
+            custom_params = getattr(sp, "custom_params", None)
+        if not isinstance(custom_params, dict):
+            return None
+        return custom_params.get("simulation")
+
+    @staticmethod
+    def get_max_new_tokens(req):
+        sp = getattr(req, "sampling_params", None)
+        if isinstance(sp, dict):
+            return sp.get("max_new_tokens")
+        return getattr(sp, "max_new_tokens", None)
+
+    @staticmethod
+    def get_extend_input_len(req):
+        """Number of new tokens processed by the current extend batch."""
+        extend_range = getattr(req, "extend_range", None)  # sglang >= 0.5.10
+        if extend_range is not None:
+            return extend_range.length
+        extend_input_len = getattr(req, "extend_input_len", None)  # sglang <= 0.5.9
+        if extend_input_len is not None:
+            return extend_input_len
+        return len(req.origin_input_ids) - len(req.prefix_indices)
+
+    @staticmethod
+    def is_chunked_req(scheduler, req):
+        is_chunked = getattr(req, "is_chunked", None)  # sglang <= 0.5.9
+        if is_chunked is not None:
+            return is_chunked != 0
+        return req is scheduler.chunked_req  # sglang >= 0.5.10
+
+    @classmethod
+    def record_request_stats(cls, req, now):
+        req_stats = cls.REQUEST_STATS[req.rid]
+        req_stats.rid = req.rid
+        req_stats.input_length = len(req.input_ids)
+        req_stats.output_length = cls.get_max_new_tokens(req)
+        simulation_args = cls.get_simulation_params(req)
+        if cls.SIM_MODE == MockSimulationMode.BLOCKING:
+            if simulation_args is None:
+                # Health-check / warm-up request without simulation parameters.
+                logger.warning(
+                    "The request's simulation parameters are missing, using the "
+                    "current time as the creation time."
+                )
+                simulation_args = {}
+            req_stats.created_time = simulation_args.get("server_created_time", now)
+            req_stats.last_event_time = req_stats.created_time
+            req_stats.queue_start = now
+        elif cls.SIM_MODE == MockSimulationMode.OFFLINE:
+            if simulation_args is None:
+                # Warm-up requests are excluded from the statistics.
+                cls.REQUEST_STATS.pop(req.rid, None)
+                return
+            req_stats.created_time = simulation_args["created_time"]
+            req_stats.last_event_time = req_stats.created_time
+            # Align with the real queue start timestamp if queue_start is not None. For debugging only.
+            queue_start = simulation_args.get("queue_start")
+            if queue_start is not None:
+                StateManager.set_global_clock(queue_start)
+            req_stats.queue_start = StateManager.get_global_clock()
+
+    @classmethod
+    def _offline_collect_and_release(cls, scheduler, recv_reqs, dispatch):
+        """OFFLINE-mode buffering for sglang >= 0.5.10.
+
+        Generate requests are collected into FUTURE_QUEUE until all of them
+        (`total_request`) have arrived; afterwards the requests whose simulated
+        arrival time is due are released to the dispatcher. Returns the
+        requests that should be dispatched in this call."""
+        if not cls.OFFLINE_RECV_ALL_REQUEST:
+            gen_requests = []
+            extra_requests = []
+            time.sleep(0.05)  # waiting requests
+
+            for req in recv_reqs:
+                if req.__class__.__name__ in [
+                    "BatchTokenizedGenerateReqInput",
+                    "TokenizedGenerateReqInput",
+                ]:
+                    gen_requests.append(req)
+                else:
+                    # Such as: /profile_start, /flush_cache, etc.
+                    extra_requests.append(req)
+
+            for req in gen_requests:
+                sim_params = cls.get_simulation_params(req)
+                if sim_params is None:
+                    # There are some warm-up requests when starting the server without --skip-server-warmup.
+                    extra_requests.append(req)
+                    logger.warning(
+                        "Failed to extract the simulation parameters required for simulation from the request. Ignore this warning if the request is a warm-up request."
+                    )
+                    continue
+                if sim_params.get("queue_start"):
+                    logger.debug(
+                        "Add request to waiting queue with custom queue start timestamp."
+                    )
+                cls.FUTURE_QUEUE.append(
+                    (
+                        sim_params.get("queue_start") or sim_params["created_time"],
+                        time.time_ns(),  # The request is not comparable, so add the salt to avoid comparison.
+                        req,
+                    )
+                )
+
+            if len(cls.FUTURE_QUEUE) != 0:
+                _, _, gen_req = cls.FUTURE_QUEUE[-1]
+                total_request = cls.get_simulation_params(gen_req)["total_request"]
+
+                if len(cls.FUTURE_QUEUE) == total_request:
+                    cls.OFFLINE_RECV_ALL_REQUEST = True
+                    heapq.heapify(cls.FUTURE_QUEUE)
+                    logger.info("All requests received. Starting simulation now.")
+                else:
+                    logger.info(
+                        f"Offline simulation mode enabled. {total_request} requests expected in total. "
+                        f"Received {len(cls.FUTURE_QUEUE)} requests so far."
+                    )
+
+            if extra_requests:
+                # Schedule the extra requests immediately.
+                dispatch(scheduler, extra_requests)
+            return []
+
+        # All generate requests have been buffered. Pass through newly arrived
+        # requests (flush, abort, health check, etc.) and release the buffered
+        # generate requests that are due.
+        released = list(recv_reqs)
+        current_timestamp = StateManager.get_global_clock()
+        while len(cls.FUTURE_QUEUE) > 0:
+            enqueue_time, _, req = cls.FUTURE_QUEUE[0]
+            if enqueue_time > current_timestamp:
+                break
+            released.append(req)
+            heapq.heappop(cls.FUTURE_QUEUE)
+        return released
+
+    @classmethod
+    def dump_profile_results(cls):
+        """Dump the simulation results (metrics/iteration/request files) and
+        reset the state. Shared by the legacy `Scheduler.profile` hook and the
+        sglang >= 0.5.10 `SchedulerProfilerManager` hook."""
+        stats: list[RequestStats] = []
+        for item in cls.REQUEST_STATS.values():
+            if item.rid is not None and item.input_length > 0:
+                stats.append(item)
+
+        stats = sorted(stats, key=lambda req: req.created_time)
+
+        output_dir = Envs.output_dir()
+        os.makedirs(output_dir, exist_ok=True)
+
+        if len(stats) > 0:
+            # Remove warmup requests.
+            if len(stats) > Envs.num_warmup():
+                metrics_stats = stats[Envs.num_warmup() :]
+            else:
+                metrics_stats = stats
+
+            min_created_time = metrics_stats[0].created_time
+            # Align timestamps
+            for item in stats:
+                item.created_time -= min_created_time
+                item.queue_start -= min_created_time
+                item.queue_end -= min_created_time
+                item.last_event_time -= min_created_time
+
+            metrics = calc_metrics(metrics_stats)
+            metrics["time_cost"] = time.time() - cls.LAST_FLUSH_TS
+
+            try:
+                with open(f"{output_dir}/metrics.json", "w") as f:
+                    f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
+
+                with open(f"{output_dir}/iteration.jsonl", "w") as f:
+                    for item in cls.ITERATION_STATS:
+                        f.write(json.dumps(item) + "\n")
+
+                with open(f"{output_dir}/request.jsonl", "w") as f:
+                    for item in stats:
+                        f.write(json.dumps(asdict(item)) + "\n")
+
+                logger.info(f"Simulation results saved to {output_dir}.")
+
+                # Log L2/L3 cache hit statistics
+                from hisim.simulation.sglang.sglang_mock_class import MockHiCacheStorage
+                logger.info(
+                    f"Storage stats: batch_set={MockHiCacheStorage._DEBUG_BATCH_SET_COUNT}, "
+                    f"batch_exists={MockHiCacheStorage._DEBUG_BATCH_EXISTS_COUNT}, "
+                    f"hits={MockHiCacheStorage._DEBUG_BATCH_EXISTS_HITS}"
+                )
+                if cls._L3_QUERY_COUNT > 0:
+                    logger.info(
+                        f"L3 cache stats: queries={cls._L3_QUERY_COUNT}, "
+                        f"total_hits={cls._L3_TOTAL_HITS} blocks, "
+                        f"prefetched={cls._L3_PREFETCHED_TOKENS} tokens, "
+                        f"per_tier={cls._L3_HIT_STATS}"
+                    )
+                logger.info(
+                    f"L2 cache stats: hit_requests={cls._L2_HIT_COUNT}, "
+                    f"hit_tokens={cls._L2_HIT_TOKENS}"
+                )
+                # Log per-request L1/L2/L3 hit breakdown
+                for item in metrics_stats:
+                    # final_reused_tokens (cached_tokens) includes both L1 prefix match
+                    # AND L2 load_back (init_load_back extends prefix_indices).
+                    # Subtract L2 to get L1-only.
+                    l2 = item.l2_hit_tokens
+                    l1 = item.final_reused_tokens - l2
+                    l3 = item.l3_hit_tokens
+                    new_tok = item.input_length - l1 - l2 - l3
+                    logger.info(
+                        f"Req #{item.rid}: input={item.input_length} "
+                        f"L1={l1} L2={l2} L3={l3} New={new_tok}"
+                    )
+
+            except Exception as e:
+                logger.error(f"Failed to dump results. Error: {e}")
+        else:
+            logger.warning("No request statistics available.")
+
+        StateManager.reset()
+        cls.REQUEST_STATS.clear()
+        cls.ITERATION_STATS.clear()
+        cls.LAST_CPU_TS = 0
+        cls.LAST_FLUSH_TS = time.time()
+        cls.OFFLINE_RECV_ALL_REQUEST = False
+        cls._L3_HIT_STATS = {}
+        cls._L3_QUERY_COUNT = 0
+        cls._L3_TOTAL_HITS = 0
+        cls._L3_PREFETCHED_TOKENS = 0
+        cls._L2_HIT_TOKENS = 0
+        cls._L2_HIT_COUNT = 0
+        cls.SESSION_STATE.clear()
+        cls.PARKED.clear()
+        cls.REQ_SESSION.clear()
+
+        ProfileReqOutput = getattr(
+            importlib.import_module("sglang.srt.managers.io_struct"),
+            "ProfileReqOutput",
+        )
+        result = {
+            "total_request": len(stats),
+            "output_directory": output_dir,
+        }
+
+        # sglang >= 0.5.10 defines ProfileReqOutput as a kw-only msgspec
+        # struct, so keyword arguments are required.
+        return ProfileReqOutput(success=True, message=json.dumps(result))
+
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
-        original_recv_requests = target.recv_requests
         original_get_new_batch_prefill = target.get_new_batch_prefill
         original_run_batch = target.run_batch
         original_process_batch_result = target.process_batch_result
         original_event_loop_normal = target.event_loop_normal
+
+        # sglang >= 0.5.10 removed `Scheduler.recv_requests`: requests are now
+        # received by a separate `SchedulerRequestReceiver` and dispatched via
+        # `Scheduler.process_input_requests`.
+        legacy_request_path = hasattr(target, "recv_requests")
+        if legacy_request_path:
+            original_recv_requests = target.recv_requests
+        else:
+            original_process_input_requests = target.process_input_requests
 
         def override_event_loop_overlap(self, *args, **kwargs):
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
@@ -1167,12 +1540,25 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.OVERLAP_SCHEDULE = not getattr(
                 server_args, "disable_overlap_schedule", False
             )
-            setattr(server_args, "disable_overlap_schedule", True)
+            # sglang >= 0.5.10 resolves ServerArgs into a read-only struct, so
+            # the mutation may fail there; `launch_server` disables overlap
+            # before resolution and the instance attribute is overridden below.
+            try:
+                setattr(server_args, "disable_overlap_schedule", True)
+            except (AttributeError, TypeError):
+                pass
             logger.debug(
                 f"Overlap schedule simulation mode: {C_SchedulerHook.OVERLAP_SCHEDULE}."
             )
 
             original_init(self, *args, **kwargs)
+
+            # sglang >= 0.5.10: ServerArgs may be read-only, so disable the
+            # overlap schedule on the scheduler instance instead. This drives
+            # both dispatch_event_loop() and the run_batch() branch selection.
+            if getattr(self, "enable_overlap", False):
+                self.enable_overlap = False
+                self.enable_overlap_mlx = False
 
             try:
                 model = ConfigManager.get_model_info(
@@ -1363,8 +1749,41 @@ class C_SchedulerHook(BaseHook):
 
             return recv_reqs
 
+        def wrapped_process_input_requests(self, recv_reqs, *args, **kwargs):
+            """sglang >= 0.5.10 request path.
+
+            Replaces the legacy `recv_requests` interception: requests are
+            dispatched through `process_input_requests`, so the OFFLINE
+            buffering (collect all generate requests first, release them by
+            simulation timestamp) and the per-request statistics recording are
+            implemented around the original dispatcher."""
+            recv_reqs = list(recv_reqs) if recv_reqs else []
+
+            if C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE:
+                recv_reqs = C_SchedulerHook._offline_collect_and_release(
+                    self, recv_reqs, original_process_input_requests
+                )
+
+            now = time.time()
+            for req in recv_reqs:
+                if req.__class__.__name__ in [
+                    "BatchTokenizedGenerateReqInput",
+                    "TokenizedGenerateReqInput",
+                ]:
+                    C_SchedulerHook.record_request_stats(req, now)
+
+            if recv_reqs and C_SchedulerHook.LAST_CPU_TS == 0:
+                C_SchedulerHook.LAST_CPU_TS = time.time()
+                StateManager.set_global_clock(0)
+
+            if recv_reqs:
+                original_process_input_requests(self, recv_reqs, *args, **kwargs)
+
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
-            new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
+            result = original_get_new_batch_prefill(self, *args, **kwargs)
+            # sglang >= 0.5.10 returns NextBatchPlan(batch_to_run, running_batch)
+            # instead of the ScheduleBatch itself.
+            new_batch = getattr(result, "batch_to_run", result)
             now = time.time()
             if new_batch is not None:
                 for req in new_batch.reqs:
@@ -1442,7 +1861,7 @@ class C_SchedulerHook(BaseHook):
                 f"waiting queue={len(self.waiting_queue)}"
             )
 
-            return new_batch
+            return result
 
         def wrapped_run_batch(self, *args, **kwargs):
             ret = original_run_batch(self, *args, **kwargs)
@@ -1457,7 +1876,7 @@ class C_SchedulerHook(BaseHook):
                     for req in batch.reqs:
                         hisim_batch.reqs.append(
                             FakeRequest(
-                                input_length=req.extend_input_len,
+                                input_length=C_SchedulerHook.get_extend_input_len(req),
                                 past_kv_length=len(req.prefix_indices)
                                 + len(req.output_ids),
                             )
@@ -1557,7 +1976,7 @@ class C_SchedulerHook(BaseHook):
                     request_response_time = StateManager.get_global_clock()
                 # Request statistics
                 for req in batch.reqs:
-                    if req.is_chunked == 0:
+                    if not C_SchedulerHook.is_chunked_req(self, req):
                         req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
                         req_stats.gen_token_latencies.append(
                             request_response_time
@@ -1610,116 +2029,36 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_profile(self, req, *args, **kwargs):
-            stats: list[RequestStats] = []
-            for item in C_SchedulerHook.REQUEST_STATS.values():
-                if item.rid is not None and item.input_length > 0:
-                    stats.append(item)
-
-            stats = sorted(stats, key=lambda req: req.created_time)
-
-            output_dir = Envs.output_dir()
-            os.makedirs(output_dir, exist_ok=True)
-
-            if len(stats) > 0:
-                # Remove warmup requests.
-                if len(stats) > Envs.num_warmup():
-                    metrics_stats = stats[Envs.num_warmup() :]
-                else:
-                    metrics_stats = stats
-
-                min_created_time = metrics_stats[0].created_time
-                # Align timestamps
-                for item in stats:
-                    item.created_time -= min_created_time
-                    item.queue_start -= min_created_time
-                    item.queue_end -= min_created_time
-                    item.last_event_time -= min_created_time
-
-                metrics = calc_metrics(metrics_stats)
-                metrics["time_cost"] = time.time() - C_SchedulerHook.LAST_FLUSH_TS
-
-                try:
-                    with open(f"{output_dir}/metrics.json", "w") as f:
-                        f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
-
-                    with open(f"{output_dir}/iteration.jsonl", "w") as f:
-                        for item in C_SchedulerHook.ITERATION_STATS:
-                            f.write(json.dumps(item) + "\n")
-
-                    with open(f"{output_dir}/request.jsonl", "w") as f:
-                        for item in stats:
-                            f.write(json.dumps(asdict(item)) + "\n")
-
-                    logger.info(f"Simulation results saved to {output_dir}.")
-
-                    # Log L2/L3 cache hit statistics
-                    from hisim.simulation.sglang.sglang_mock_class import MockHiCacheStorage
-                    logger.info(
-                        f"Storage stats: batch_set={MockHiCacheStorage._DEBUG_BATCH_SET_COUNT}, "
-                        f"batch_exists={MockHiCacheStorage._DEBUG_BATCH_EXISTS_COUNT}, "
-                        f"hits={MockHiCacheStorage._DEBUG_BATCH_EXISTS_HITS}"
-                    )
-                    if C_SchedulerHook._L3_QUERY_COUNT > 0:
-                        logger.info(
-                            f"L3 cache stats: queries={C_SchedulerHook._L3_QUERY_COUNT}, "
-                            f"total_hits={C_SchedulerHook._L3_TOTAL_HITS} blocks, "
-                            f"prefetched={C_SchedulerHook._L3_PREFETCHED_TOKENS} tokens, "
-                            f"per_tier={C_SchedulerHook._L3_HIT_STATS}"
-                        )
-                    logger.info(
-                        f"L2 cache stats: hit_requests={C_SchedulerHook._L2_HIT_COUNT}, "
-                        f"hit_tokens={C_SchedulerHook._L2_HIT_TOKENS}"
-                    )
-                    # Log per-request L1/L2/L3 hit breakdown
-                    for item in metrics_stats:
-                        # final_reused_tokens (cached_tokens) includes both L1 prefix match
-                        # AND L2 load_back (init_load_back extends prefix_indices).
-                        # Subtract L2 to get L1-only.
-                        l2 = item.l2_hit_tokens
-                        l1 = item.final_reused_tokens - l2
-                        l3 = item.l3_hit_tokens
-                        new_tok = item.input_length - l1 - l2 - l3
-                        logger.info(
-                            f"Req #{item.rid}: input={item.input_length} "
-                            f"L1={l1} L2={l2} L3={l3} New={new_tok}"
-                        )
-
-                except Exception as e:
-                    logger.error(f"Failed to dump results. Error: {e}")
-            else:
-                logger.warning("No request statistics available.")
-
-            StateManager.reset()
-            C_SchedulerHook.REQUEST_STATS.clear()
-            C_SchedulerHook.ITERATION_STATS.clear()
-            C_SchedulerHook.LAST_CPU_TS = 0
-            C_SchedulerHook.LAST_FLUSH_TS = time.time()
-            C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False
-            C_SchedulerHook._L3_HIT_STATS = {}
-            C_SchedulerHook._L3_QUERY_COUNT = 0
-            C_SchedulerHook._L3_TOTAL_HITS = 0
-            C_SchedulerHook._L3_PREFETCHED_TOKENS = 0
-            C_SchedulerHook._L2_HIT_TOKENS = 0
-            C_SchedulerHook._L2_HIT_COUNT = 0
-            C_SchedulerHook.SESSION_STATE.clear()
-            C_SchedulerHook.PARKED.clear()
-            C_SchedulerHook.REQ_SESSION.clear()
-
-            ProfileReqOutput = getattr(
-                importlib.import_module("sglang.srt.managers.io_struct"),
-                "ProfileReqOutput",
-            )
-            result = {
-                "total_request": len(stats),
-                "output_directory": output_dir,
-            }
-
-            return ProfileReqOutput(True, json.dumps(result))
+            return C_SchedulerHook.dump_profile_results()
 
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
-        target.recv_requests = wrapped_recv_requests
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill
         target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result
-        target.profile = wrapped_profile
+        if legacy_request_path:
+            # sglang <= 0.5.9: requests are received by Scheduler.recv_requests
+            # and profile requests are handled by Scheduler.profile.
+            target.recv_requests = wrapped_recv_requests
+            target.profile = wrapped_profile
+        else:
+            # sglang >= 0.5.10: requests are dispatched via
+            # Scheduler.process_input_requests; profile requests are handled by
+            # SchedulerProfilerManager (hooked by C_SchedulerProfilerManagerHook).
+            target.process_input_requests = wrapped_process_input_requests
+
+
+class C_SchedulerProfilerManagerHook(BaseHook):
+    """sglang >= 0.5.10 moved profile handling from `Scheduler.profile` to
+    `SchedulerProfilerManager._profile`; hook it to dump the simulation
+    results (the legacy path keeps hooking `Scheduler.profile`)."""
+
+    HOOK_CLASS_NAME = "SchedulerProfilerManager"
+    HOOK_MODULE_NAME = "sglang.srt.managers.scheduler_components.profiler_manager"
+
+    @classmethod
+    def hook(cls, target):
+        def wrapped_profile(self, recv_req, *args, **kwargs):
+            return C_SchedulerHook.dump_profile_results()
+
+        target._profile = wrapped_profile

@@ -48,8 +48,13 @@ def estimate_kv_cache_pool_capacity(
     # Count weights on a single GPU
     weights /= perf_model.config.pp_size
     framework_reserved_mem_gb = 1.4
+    # ServerArgs leaves mem_fraction_static as None on CPU platforms unless it
+    # is explicitly provided on the CLI; fall back to the sglang CPU default.
+    mem_fraction_static = scheduler_config.mem_fraction_static
+    if mem_fraction_static is None:
+        mem_fraction_static = 0.9
     rest_memory = (
-        scheduler_config.mem_fraction_static * device.hbm_capacity_gb
+        mem_fraction_static * device.hbm_capacity_gb
         - framework_reserved_mem_gb
     ) * (1 << 30) - weights
     kv_cache_space_per_token = (

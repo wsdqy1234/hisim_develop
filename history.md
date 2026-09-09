@@ -1214,3 +1214,63 @@ analyzer 不受影响（逐请求顺序处理，隐含"等完成"语义）；his
 - pytest：17 passed / 1 skipped；`test_dataset`（需 HF 网络）、`test_aic_xgb_predictor`（Abort，aiconfigurator 环境问题）为本机网络/环境限制，非代码回归
 
 **已知说明**：bench_serving HTTP CLI 未接 weka 数据集（用 Python API 或 analyzer CLI）；`num_traces` 取文件前 N 个会话。
+## 2026-09-09 — HiSim 适配 sglang 0.5.19（分支 develop_lfz_0.5.19）
+
+**背景**：hisim 原只支持 sglang 0.5.6~0.5.9（`COMPATIBLE_VERSIONS`），本机环境是 sglang 0.5.19（editable 安装于 `/sgl-workspace/sglang`），直接启动 server 在 Scheduler hook 安装阶段即失败。目标是让 hisim 在 0.5.19 上跑通，同时不破坏 0.5.6~0.5.9 的兼容（新分支 `develop_lfz_0.5.19`，单 commit 合入全部改动）。
+
+**0.5.19 关键破坏性变化（相对 0.5.6，经逐点比对确认）**：
+- `Scheduler.recv_requests` 方法被移除：请求接收移到独立组件 `SchedulerRequestReceiver`（`srt/managers/scheduler_components/request_receiver.py`），事件循环改为 `recv_reqs = self.request_receiver.recv_requests(); self.process_input_requests(recv_reqs)`。
+- `get_new_batch_prefill` 返回 `NextBatchPlan(batch_to_run, running_batch)`（msgspec.Struct），不再是 ScheduleBatch。
+- `Req.extend_input_len`/`req.is_chunked` 被移除：改为 `req.extend_range.length`（`Range` NamedTuple）与 `req is self.chunked_req` 判断。
+- `ReqToTokenPool.alloc/free` 语义变化：req pool slot 从 `req.req_pool_idx` 移到 `req.kv.req_pool_idx`（holds_kv/kv_allocated_len）。
+- `Scheduler.profile` 被移除，profile 走 `SchedulerProfilerManager._profile`（新 io_struct `ProfileReq/ProfileReqType`）；`ProfileReqOutput` 变 kw-only msgspec struct（不能位置传参）。
+- `ModelRunner.init_torch_distributed` 从 `initialize()` 移到 `__init__`（hook 接管 initialize 前就会执行）；显存池分配从 initialize 内移到 `Scheduler.init_memory_pools → tp_worker.alloc_memory_pool`（会覆盖 hook 的 mock pool）；另新增 `Scheduler.init_all_attention_backends/init_all_cuda_graphs` 两条调用链。
+- CPU 启动路径：`bootstrap._init_cpu_threads_env` 在 ARM 上（`_is_cpu_arm64`）无条件调用 `torch.ops.sgl_kernel.init_cpu_threads_env/initialize`，sgl-kernel 无 aarch64 CPU wheel → 必崩（且上游把 `Optional[List[int]]` 传成了 str）。
+- `ServerArgs` 解析后只读（setattr 报 "assigned after resolution"）；CPU 下 `mem_fraction_static` 默认 None（0.5.6 同）。
+- `Scheduler.__init__` 中 `is_hybrid_swa` 判定是 `tp_worker.is_hybrid_swa = model_runner.is_hybrid_swa is not None`——mock 里设 `False` 会误入 hybrid-SWA 分支（0.5.6 语义：非 SWA 模型该值为 None）。
+- allocator/host pool/kv pool 新增一批被无条件调用的接口：`check_decode_capacity`/`evict_to_free_tokens`/`free_segment(s)`/`flush_opportunistic`/`verify_byte_accounting`/`set_disagg_move_gate`/`schedulable_token_capacity`/`alloc_aux_to_lengths`/`reset_aux_cache_allocator`/`post_capture_active`/host pool `destroy` 等。
+
+**修改的文件（6 个，+653/-127）**：
+
+1. `src/hisim/simulation/sglang/version.py`：`COMPATIBLE_VERSIONS` 加 `"0.5.19"`；ModelRunner `forward` dispatcher 注册 0.5.19（沿用 0.5.9 的 `wrapped_forward_v2`，`ModelRunnerOutput` 字段兼容）。
+
+2. `src/hisim/simulation/sglang/sglang_hook.py`（核心）：
+   - **C_SchedulerHook 双路径接线**：hook 安装时用 `hasattr(target, "recv_requests")` 判版本。≤0.5.9 走原路径（recv_requests/profile hook，行为不变）；≥0.5.10 改挂 `Scheduler.process_input_requests`：OFFLINE 缓冲逻辑（收满 `total_request` 后按仿真时钟释放）重写为 `_offline_collect_and_release`，BLOCKING/OFFLINE 的 per-request 统计抽成 `record_request_stats`；`get_new_batch_prefill` 适配 `NextBatchPlan`（`getattr(result, "batch_to_run", result)`）；`run_batch` 用 `get_extend_input_len()`（extend_range 优先、extend_input_len 回退）；`process_batch_result` 用 `is_chunked_req()`（is_chunked 属性优先、`req is chunked_req` 回退）。
+   - **profile 落盘**：原 `wrapped_profile` 大函数抽成 `C_SchedulerHook.dump_profile_results()` classmethod（metrics.json/iteration.jsonl/request.jsonl + StateManager.reset），legacy 路径仍挂 `Scheduler.profile`，新路径由新增 `C_SchedulerProfilerManagerHook` 挂 `SchedulerProfilerManager._profile`（`ProfileReqOutput` 改 kw 传参）。
+   - **C_ModelRunnerHook**：`override_initialize` 补 0.5.10+ 下游必需属性 stub——`lora_manager=None`、`loader=MockWeightLoader`（`preloaded_weights_bytes` 属性被 `effective_max_total_num_tokens` 链路读取）、`canary_manager=None`、`prefill_aware_swa=False`、`attn_backend=MockAttentionBackend`（0.5.19 `ForwardBatch.init_new` 在 CPU 分支无条件调 `get_cpu_graph_seq_len_fill_value()`）、`kv_index_translator=MockKVIndexTranslator`（init_new 无条件调 `rebind_write_loc`）、`ngram_embedding_manager=MockNgramEmbeddingManager`（读 `.enabled` + `prepare_for_forward`）、`prefill/decode_attention_backend_str="torch_native"`、`sampler`（try import create_sampler）、`expert_location_updater`（try import）、`memory_pool_config=MemoryPoolConfig(max_total_num_tokens=...)`（非 None 使 `init_target_memory_pool` 短路，保住 mock pool 不被真实分配覆盖）。另外：对 `target.init_torch_distributed` 包一层——调用期间临时把 `bootstrap._init_cpu_threads_env` 换成 no-op（CPU 无 sgl-kernel 时绕开 torch.ops.sgl_kernel 崩溃）；`init_attention_backends`/`init_cuda_graphs`（0.5.10+ 新方法）no-op。同时保留此前的 0.5.6 修复：`sliding_window_size=None`、`full/swa_max_total_num_tokens`、`is_hybrid_swa=None`（注释说明 None 语义）。
+   - **C_HiCacheController**：构造 `HiCacheController` 时用 `inspect.signature` 探测新参数（`enable_storage_metrics`/`host_memory_mode`）按版本传参。
+   - hook 注册尾部按 `legacy_request_path` 分叉挂接。
+
+3. `src/hisim/simulation/sglang/sglang_mock_class.py`：
+   - 新增 stub 类：`MockAttentionBackend`/`MockWeightLoader`/`MockKVIndexTranslator`/`MockNgramEmbeddingManager`。
+   - `MockReqToTokenPool`：注册 `_alloc_v3`/`_free_v3`（0.5.19，走 `req.kv.holds_kv/req_pool_idx`，兼容旧 `req.req_pool_idx`）；补 `reset_aux_cache_allocator`/`schedulable_token_capacity`/`alloc_aux_to_lengths`。
+   - `MockBaseTokenToKVPoolAllocator`：补 `free_segment`/`free_segments`/`flush_opportunistic`/`set_disagg_move_gate`/`verify_byte_accounting`/`set_latest_forward_done_event`/`set_inflight_forward`/`evict_to_free_tokens`（复用 sglang `evict_from_tree_cache`）/`check_decode_capacity`（evict 后判 available_size，对齐 stock 语义）。
+   - `MockTokenToKVPool`：类属性 `post_capture_active=False`（0.5.19 Scheduler `init_model_worker` 无条件读）。
+   - `MockTokenToKVPoolHost`：补 `destroy()`（flush_cache 路径）。
+   - `MockHiCacheStorage`：补 `batch_get()`（返回 None = miss，0.5.19 `_generic_page_get` 语义；此前只跟踪 key 无数据，属既有缺口的显式化）。
+
+4. `src/hisim/simulation/sglang/launch_server.py`：`ServerArgs.from_cli_args` 后立即 `disable_overlap_schedule=True`（必须在 resolution 前改，只读后 setattr 会炸；仿真强制非 overlap 调度）；hook 安装列表加 `C_SchedulerProfilerManagerHook`。`wrapped_init` 里的 setattr 改 try/except（0.5.19 只读时忽略，靠 launch 期提前改 + 实例属性兜底：`original_init` 后 `self.enable_overlap=False`，同时驱动 `dispatch_event_loop` 和 `run_batch` 分支选择）。
+
+5. `src/hisim/simulation/sglang/sglang_bench.py`：hook 安装列表加 `C_SchedulerProfilerManagerHook`。
+
+6. `src/hisim/simulation/utils.py`：`estimate_kv_cache_pool_capacity` 对 `mem_fraction_static=None` 兜底 0.9（CPU 默认不填该值，0.5.6/0.5.19 皆然）。
+
+**验证结果（本机 aarch64，sglang 0.5.19，系统环境；mock model = 本地 config+tokenizer + `--load-format dummy`）**：
+- server 启动：`health: 200`（"The server is fired up and ready to roll!"），hook 全部安装成功、无 Scheduler hook 失败告警。
+- 回放模式（`--dataset-name hisim-collection`）：4/4 请求成功，Mean TTFT 0.44ms / TPOT 456ms（含 trace 时间戳回放的排队）。
+- random 模式（10 prompts, 256/256, rate 4）：10/10 成功，Mean TTFT 0.51ms / TPOT 0.45ms / E2E 114ms。
+- server 端 profile 落盘正常（`/tmp/hisim/output/{metrics,iteration,request}`，确认 ProfilerManager hook 生效）。
+- **0.5.6 回归**（/tmp/opencode/venv 内 sglang 0.5.6.post2）：回放 4/4 成功、TTFT 0.37ms / TPOT 0.31ms，与改动前基线一致，legacy 路径未破坏。
+
+**注意事项 / 后续需关注**：
+- ⚠️ L2/L3 分层场景（`--enable-hierarchical-cache`）在 0.5.19 上尚未端到端实测：`HiRadixCache.__init__/check_hicache_events/evictable_host_leaves` 等已确认存在且 hook 兼容，`HiCacheController` 的 `backup_queue` 等队列在 0.5.19 改为 `attach_storage_backend` 懒创建（storage_backend 非空时构造即 attach，理论兼容），但 prefetch/backup 时序管线未跑真实数据验证。
+- ⚠️ `mock model`（/tmp/opencode/mock-model）与 0.5.6 venv（/tmp/opencode/venv）都是临时产物，重建环境时需：aiconfigurator 安装必须用 git clone + git-lfs 拉真实数据（PyPI wheel 的 systems/data 是 LFS 指针，性能数据库加载会 KeyError）；sglang 0.5.6 从 GitHub tag 克隆装 venv（`--system-site-packages`）。
+- ⚠️ 0.5.19 默认 `hicache_write_policy="write_through_selective"`（0.5.6 是 "write_through"），行为差异未评估。
+- ⚠️ 本机为 torch_npu 环境（aarch64），`_is_cpu_arm64=True` 导致 0.5.19 CPU 启动必走 sgl_kernel 路径；x86 非 AMX 机器走 warning 分支，不受此问题影响，但 hook 的 no-op 补丁同样无害。
+- 分支 `develop_lfz_0.5.19` 基于 `develop_lfz`，未 push 远端。
+
+**关键文件**：
+- `src/hisim/simulation/sglang/sglang_hook.py` — 双路径 Scheduler hook、ModelRunner stub、ProfilerManager hook
+- `src/hisim/simulation/sglang/sglang_mock_class.py` — Mock 类 0.5.10+ 接口补齐
+- `src/hisim/simulation/sglang/launch_server.py` — overlap 禁用时机（resolution 前）
+- 对照参考：sglang 0.5.6 源码 `/tmp/opencode/sglang056`、0.5.19 源码 `/sgl-workspace/sglang`

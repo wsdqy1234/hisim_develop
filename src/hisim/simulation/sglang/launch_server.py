@@ -21,6 +21,7 @@ hisim_hook.install_class_hooks(
         sglang_hook.C_StorageBackendFactory,
         sglang_hook.C_HiCacheController,
         sglang_hook.C_HiRadixCacheHook,
+        sglang_hook.C_SchedulerProfilerManagerHook,
     ]
 )
 
@@ -53,6 +54,14 @@ if __name__ == "__main__":
     raw_args = parser.parse_args(sys.argv[1:])
     server_args = ServerArgs.from_cli_args(raw_args)
     simulation_args = SimulationArgs.from_cli_args(raw_args)
+
+    # The simulation intercepts `run_batch` and needs the non-overlap
+    # scheduling loop; ServerArgs becomes read-only once resolved, so the flag
+    # must be disabled before subprocesses are launched.
+    try:
+        server_args.disable_overlap_schedule = True
+    except (AttributeError, TypeError):
+        logger.warning("Could not disable the overlap schedule on ServerArgs.")
 
     config_path = os.getenv("HISIM_CONFIG_PATH")
     if config_path and os.path.exists(config_path):
