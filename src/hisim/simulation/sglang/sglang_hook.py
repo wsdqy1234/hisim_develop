@@ -46,6 +46,22 @@ from hisim.simulation.sglang.version import VersionDispatcher
 logger = get_logger("hisim")
 
 
+def _is_legacy_sglang() -> bool:
+    """True for sglang <= 0.5.9 (async hicache transfer threads + CUDA events
+    that never complete on CPU); False for >= 0.5.10 (synchronous transfers,
+    event-driven acks)."""
+    try:
+        from sglang.version import __version__ as _v
+    except Exception:
+        return True
+    try:
+        from packaging.version import InvalidVersion, Version
+
+        return Version(_v) < Version("0.5.10")
+    except InvalidVersion:
+        return True
+
+
 class C_EngineHook(BaseHook):
     HOOK_CLASS_NAME = "Engine"
     HOOK_MODULE_NAME = "sglang.srt.entrypoints.engine"
@@ -355,6 +371,27 @@ class C_ModelRunnerHook(BaseHook):
         # simulation (the forward pass is intercepted).
         if hasattr(target, "init_cuda_graphs"):
             target.init_cuda_graphs = lambda self, *args, **kwargs: None
+
+        # sglang >= 0.5.10 host pools allocate their buffers with
+        # cudaHostRegister by default, which is unavailable on CPU-only
+        # builds; route CPU allocations to plain (non-pinned) host tensors.
+        try:
+            import torch as _torch
+            from sglang.srt.mem_cache.pool_host import common as _host_common
+
+            def _cpu_host_alloc(
+                dims,
+                dtype,
+                device,
+                pin_memory,
+                allocator=None,
+                registration_granularity_bytes=None,
+            ):
+                return _torch.empty(dims, dtype=dtype, device=device, pin_memory=False)
+
+            _host_common.ALLOC_MEMORY_FUNCS.setdefault("cpu", _cpu_host_alloc)
+        except Exception:  # pragma: no cover - older sglang has no pool_host pkg
+            pass
 
 
 class C_HiCacheController(BaseHook):
@@ -815,6 +852,67 @@ class C_HiCacheController(BaseHook):
             # TODO: Overlap schedule
             remain_dur = StateManager.get_current_inference_dur()
 
+            if not _is_legacy_sglang():
+                # sglang >= 0.5.10: the storage query result is handed to the
+                # stock drain path (prefetch_hit_queue -> host allocation ->
+                # ack), simulating an instantly completed storage query. The
+                # legacy chunked-prefetch machinery does not apply.
+                while True:
+                    try:
+                        operation = self.prefetch_queue.get(block=False)
+                        if operation is None:
+                            return
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                        try:
+                            req_stats = C_SchedulerHook.REQUEST_STATS[
+                                operation.request_id
+                            ]
+                            req_stats.l3_hit_tokens = storage_hit_count
+                        except Exception:
+                            pass
+                        C_SchedulerHook._L3_QUERY_COUNT += 1
+                        C_SchedulerHook._L3_TOTAL_HITS += storage_hit_count
+                        try:
+                            per_tier = self.storage_backend.batch_exists_per_tier()
+                            for tn, cnt in per_tier.items():
+                                C_SchedulerHook._L3_HIT_STATS[tn] = (
+                                    C_SchedulerHook._L3_HIT_STATS.get(tn, 0) + cnt
+                                )
+                        except Exception:
+                            pass
+                        # Mirror prefetch_thread_func (minus the real IO).
+                        operation.hash_value = hash_value[
+                            : (storage_hit_count // self.page_size)
+                        ]
+                        operation.storage_hit_count = storage_hit_count
+                        try:
+                            storage_hit_count_tensor = torch.tensor(
+                                storage_hit_count, dtype=torch.int
+                            )
+                            self._all_reduce(
+                                storage_hit_count_tensor,
+                                torch.distributed.ReduceOp.MIN,
+                                self.prefetch_hits_sync_groups,
+                            )
+                        except Exception:
+                            pass
+                        C_SchedulerHook._L3_PREFETCHED_TOKENS += storage_hit_count
+                        direct_mode = False
+                        try:
+                            direct_mode = (
+                                ConfigManager.get_platform_config().enable_l3_direct_to_l1
+                            )
+                        except Exception:
+                            pass
+                        if direct_mode and storage_hit_count > 0:
+                            StateManager.inc_l3_direct_load_count(storage_hit_count)
+                        self.prefetch_hit_queue.put(operation)
+                    except Empty:
+                        return
+                return
+
             chunked_prefetch_operation = getattr(
                 self, "chunked_prefetch_operation", None
             )
@@ -941,18 +1039,114 @@ class C_HiCacheController(BaseHook):
             self, hash_values, host_indices, extra_info=None
         ) -> bool:
             # Always pass extra_info to storage_backend.
+            host_pool = self.mem_pool_host
+            # sglang >= 0.5.10 wraps host pools in a HostPoolGroup; unwrap the
+            # primary (KV) pool for page-level access.
+            get_pool = getattr(host_pool, "get_pool", None)
+            if get_pool is not None:
+                try:
+                    host_pool = get_pool(None)
+                except Exception:
+                    try:
+                        host_pool = host_pool.entries[0].host_pool
+                    except Exception:
+                        pass
             data = [
-                self.mem_pool_host.get_data_page(host_indices[i * self.page_size])
+                host_pool.get_data_page(host_indices[i * self.page_size])
                 for i in range(len(hash_values))
             ]
             return self.storage_backend.batch_set(hash_values, data, extra_info)
 
-        target.prefetch_thread_func = override_prefetch_thread_func
-        target.backup_thread_func = override_backup_thread_func
+        # Legacy sglang (<= 0.5.9): the async backup/prefetch threads must not
+        # run - the data/timing phases are driven by handle_backup_operation /
+        # handle_prefetch_operation from the hooked check_hicache_events
+        # instead. On sglang >= 0.5.10 the tree cache is UnifiedRadixCache and
+        # the storage queues are drained by the stock threads (pure CPU work
+        # against the mock storage), so keep them alive.
+        if _is_legacy_sglang():
+            target.prefetch_thread_func = override_prefetch_thread_func
+            target.backup_thread_func = override_backup_thread_func
         target.handle_backup_operation = handle_backup_operation
         target.handle_prefetch_operation = handle_prefetch_operation
         target.submit_l3_write_timing = submit_l3_write_timing
         target._generic_page_set = override_generic_page_set
+
+        # sglang >= 0.5.10 performs L2 transfers synchronously via
+        # start_writing/start_loading (CUDA kernels + events). The mock host
+        # pool holds no real KV data, so the "transfer" is instantaneous:
+        # keep the stock bookkeeping but complete the ack events right away.
+        if not _is_legacy_sglang() and hasattr(target, "start_writing"):
+            def mock_start_writing(self):
+                from sglang.srt.managers.cache_controller import (
+                    CacheOperation,
+                    HiCacheAck,
+                )
+                from sglang.srt.utils import get_device_module
+
+                if len(self.write_queue) == 0:
+                    return
+                op = CacheOperation.merge_ops(self.write_queue)
+                host_indices, device_indices, pool_transfers = (
+                    self._move_write_operation(op)
+                )
+                self.write_queue.clear()
+                device_module = get_device_module()
+                start_event = device_module.Event(enable_timing=False)
+                finish_event = device_module.Event(enable_timing=False)
+                start_event.record()
+                finish_event.record()
+                self.ack_write_queue.append(
+                    HiCacheAck(
+                        start_event=start_event,
+                        finish_event=finish_event,
+                        node_ids=op.node_ids,
+                        num_tokens=len(op.device_indices),
+                        timing_enabled=False,
+                        num_tokens_by_pool=self._num_tokens_by_pool(op),
+                        num_bytes=self._transfer_num_bytes(op),
+                    )
+                )
+
+            def mock_start_loading(self):
+                from sglang.srt.managers.cache_controller import (
+                    CacheOperation,
+                    HiCacheAck,
+                )
+                from sglang.srt.utils import get_device_module
+
+                if len(self.load_queue) == 0:
+                    return -1
+                producer_id = self.layer_done_counter.update_producer()
+                op = CacheOperation.merge_ops(self.load_queue)
+                host_indices, device_indices, pool_transfers = self._move_op_indices(
+                    op
+                )
+                self.load_queue.clear()
+                producer_event = self.layer_done_counter.events[producer_id]
+                producer_event.start_event.record()
+                # Simulate the per-layer completion of the host->device copy.
+                for layer_index in range(self.layer_num):
+                    producer_event.complete(layer_index)
+                device_module = get_device_module()
+                start_event = device_module.Event(enable_timing=False)
+                finish_event = device_module.Event(enable_timing=False)
+                start_event.record()
+                finish_event.record()
+                self.ack_load_queue.append(
+                    HiCacheAck(
+                        start_event=start_event,
+                        finish_event=finish_event,
+                        node_ids=op.node_ids,
+                        num_tokens=len(op.device_indices),
+                        timing_enabled=False,
+                        num_tokens_by_pool=self._num_tokens_by_pool(op),
+                        num_bytes=self._transfer_num_bytes(op),
+                    )
+                )
+                return producer_id
+
+            target.start_writing = mock_start_writing
+            target.start_loading = mock_start_loading
 
 
 class C_HiRadixCacheHook(BaseHook):
@@ -1093,11 +1287,18 @@ class C_HiRadixCacheHook(BaseHook):
             # 3. Write timing: submit_write advances avail_time for next round
             self.cache_controller.submit_l3_write_timing()
             result = original_check_hicache_events(self, *args, **kwargs)
-            # 4. Fix: In CPU simulation, CUDA events in ack_write_queue and
-            # ack_load_queue never complete, so writing_check() and
-            # loading_check() never process their queues. We process them
-            # here as a fallback, skipping the CUDA event check.
-            if hasattr(self, 'cache_controller') and self.enable_storage:
+            # 4. Fix (legacy sglang <= 0.5.9 only): In CPU simulation, CUDA
+            # events in ack_write_queue and ack_load_queue never complete, so
+            # writing_check() and loading_check() never process their queues.
+            # We process them here as a fallback, skipping the CUDA event
+            # check. On sglang >= 0.5.10 the transfers are synchronous with
+            # instantly-completed mock events, and the stock checks above
+            # already reap the acks.
+            if (
+                _is_legacy_sglang()
+                and hasattr(self, 'cache_controller')
+                and self.enable_storage
+            ):
                 cc = self.cache_controller
                 # ack_write_queue fallback: mirrors sglang's writing_check()
                 # normal path (hiradix_cache.py:698-706). Must call

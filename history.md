@@ -1274,3 +1274,44 @@ analyzer 不受影响（逐请求顺序处理，隐含"等完成"语义）；his
 - `src/hisim/simulation/sglang/sglang_mock_class.py` — Mock 类 0.5.10+ 接口补齐
 - `src/hisim/simulation/sglang/launch_server.py` — overlap 禁用时机（resolution 前）
 - 对照参考：sglang 0.5.6 源码 `/tmp/opencode/sglang056`、0.5.19 源码 `/sgl-workspace/sglang`
+
+---
+
+## 2026-09-09（下午） — 0.5.19 L2/L3 分层缓存全场景验证与修复
+
+**背景**：上一条记录的 0.5.19 适配只验证了 L1 基线。本条记录 L2（host 分层缓存）、L3（storage backend）、多 tier 配置、L3 direct-to-L1 四类场景在 0.5.19 上的验证过程、发现的缺口与修复，以及 0.5.6 legacy 路径的回归。
+
+**0.5.19 hierarchical cache 的架构性变化（重要）**：
+- tree cache 不再是 `HiRadixCache`，而是 **`UnifiedRadixCache`**（`srt/mem_cache/unified_radix_cache.py`）+ `init_hicache()`（`registry.py: create_tree_cache` 路由）。hisim 的 `C_HiRadixCacheHook`（挂 HiRadixCache 类）在 0.5.19 hierarchical 路径上**不生效**。
+- controller 是 **`HybridCacheController`**（`hybrid_cache/hybrid_cache_controller.py`，继承 `HiCacheController`）→ hisim 在 HiCacheController 类上的 hook（mock start_writing/start_loading、handle_backup_operation 等）**通过继承继续生效**；但 HybridCacheController override 了 `backup_thread_func`（hisim 的 no-op 被覆盖，stock 线程真实运行）。
+- host pool 不再由 cache 层构造：`kv_cache_builder → hybrid_pool_assembler.build_kv_host_pool` 在 hook 之前构造**真实 host pool**（读 `device_pool.head_dim/v_head_dim` 选类），并包成 `HostPoolGroup`（`pool_host/group.py`，`mem_pool_host` 变为组对象）。
+- L2 transfer 从异步线程改为同步 `start_writing/start_loading`（直驱 CUDA kernel + CUDA events）；storage 队列（prefetch/backup）仍由后台线程消费，ack 由 `check_hicache_events → _sync_hicache_ready_counts/writing_check/loading_check`（CPU event 可同步）收割。
+
+**发现并修复的缺口（本轮 5 个）**：
+1. `MockTokenToKVPool` 缺 `v_head_dim`（host pool 类选择读取）→ 补 `v_head_dim=1`（与 mock 的 1x1 head 对称，选 MHA host pool）。
+2. 真实 host pool 分配走 `ALLOC_MEMORY_FUNCS["cpu"] → alloc_with_host_register → cudaHostRegister`，纯 CPU 必崩 → `C_ModelRunnerHook.hook` 里给 `pool_host.common.ALLOC_MEMORY_FUNCS` 注册 CPU 平铺分配（`torch.empty(pin_memory=False)`）。
+3. L2 写/读同步路径调用 CUDA kernel → `C_HiCacheController.hook` 里为 0.5.10+ 替换 `start_writing/start_loading` 为 mock 版：保留 stock 的队列合并/host 索引分配/bookkeeping，ack events 用 `device_module.Event()` 立即 record（writing_check/loading_check 的 `finish_event.synchronize()` 即时通过）。
+4. `MockHiCacheStorage` 缺 0.5.10+ 接口：`register_mem_host_pool_v2`（HybridCacheController attach 必调）、`get_stats`、`close`、`batch_get_v1/v2`、`batch_set_v1/v2`、`batch_exists_v2`、`get` → 全部补齐（v2 为空实现，页级 v1 接口为主路径）。
+5. `override_generic_page_set`（L3 页写）里 `mem_pool_host.get_data_page` 在 0.5.19 是 HostPoolGroup → 加 `get_pool(None)`/`entries[0].host_pool` 解包，取主 KV host pool。
+
+**行为对齐调整**：
+- legacy 的 `prefetch_thread_func/backup_thread_func` no-op 改为**仅 0.5.9- 生效**：0.5.19 下 storage 队列由 stock 线程消费（纯 CPU 操作），否则 prefetch_queue 无人消费（根因：batch_exists 始终为 0）。
+- `wrapped_check_hicache_events` 的 ack fallback（跳过 CUDA event 直接收割）限定 legacy：0.5.19 的 mock events 立即完成，stock writing_check/loading_check 正常收割，fallback 反而会重复处理。
+- `MockHiCacheStorage` 的 set() fallback 分支补 `_DEBUG_BATCH_SET_COUNT/_DEBUG_BATCH_EXISTS_*/_last_per_tier_hits` 统计（原只挂在 kvcm 分支，导致 Storage stats 恒 0 的误报）。
+
+**验证结果（0.5.19，L1=16 tokens 强制逐出，prefetch_threshold=1）**：
+- **L2 场景**（`--enable-hierarchical-cache --hicache-ratio 4`）：第二轮起 `L2 cache stats: hit_requests=4, hit_tokens=14`，逐出→write_through→load_back 链路完整。
+- **L3 场景**（`--hicache-storage-backend file`）：RUN1 `batch_set=8`（storage_keys.txt 27 keys 持久化）；**重启 server 后**（L1/host 清空）RUN `batch_exists=4, hits=13`（L3 冷启动查询命中）；下一轮 `L2 hit_requests=4`（L3→host→L2→请求复用，端到端 ✓）。
+- **多 tier + direct-to-L1**（storage_tiers[nvme/nfs] + `enable_l3_direct_to_l1: true`）：启动正常、3 轮 bench 全部 4/4、L3 写/查/L2 命中同上。
+- **0.5.6 回归**（venv）：同 L3 场景，per-request `L3=1` 请求级命中、`L2 hit 4/4`，legacy 时序管线（handle_backup/prefetch_operation + StateManager）完好。
+
+**注意事项 / 已知差异（0.5.19）**：
+- ⚠️ **hisim 时序仿真层在 0.5.19 L2/L3 路径上暂不参与**：`check_hicache_events` 的 wrapped 版挂在 HiRadixCache 上（0.5.19 用 UnifiedRadixCache），因此 handle_backup_operation/handle_prefetch_operation/submit_l3_write_timing（L2/L3 带宽与 SSD 时序、per-tier 统计、L3 direct-to-L1 的时序/统计）不会被驱动；L2/L3 功能正确但时延由 stock 即时完成（预置 mock ack）。若要在 0.5.19 恢复完整时序仿真，需针对 UnifiedRadixCache + HybridCacheController 重做 hook 管线（后续工作）。
+- ⚠️ 0.5.19 默认 `hicache_storage_prefetch_threshold=256` tokens，小 prefix 数据集测 L3 需传 `--hicache-storage-backend-extra-config '{"prefetch_threshold": 1}'`。
+- ⚠️ dump_profile 的 per-request `L1 = final_reused_tokens - L2` 在"仅 L2 命中"（final_reused=0）时显示负数，属统计口径显示瑕疵，不影响 L2/L3 命中本身。
+- L3 prefetch 是异步的：本轮查询命中，数据下一轮才可被同前缀请求复用（0.5.6/0.5.19 一致）。
+
+**关键文件**：
+- `src/hisim/simulation/sglang/sglang_hook.py` — CPU alloc 补丁、start_writing/start_loading mock、线程 no-op 版本分叉、HostPoolGroup 解包
+- `src/hisim/simulation/sglang/sglang_mock_class.py` — v_head_dim、MockHiCacheStorage v2 接口、debug 计数
+- 对照参考：`unified_radix_cache.py`（init_hicache/prefetch_from_storage/check_hicache_events）、`hybrid_cache/hybrid_cache_controller.py`、`pool_host/{group.py,mha.py,common.py}`

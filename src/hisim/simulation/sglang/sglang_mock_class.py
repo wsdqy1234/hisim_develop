@@ -449,6 +449,9 @@ class MockTokenToKVPool:
         # Overwrite to 1x1 to save memory (actual buffers stay tiny)
         self.head_num = 1
         self.head_dim = 1
+        # sglang >= 0.5.10 host-pool class selection reads v_head_dim; keep it
+        # symmetric with the (overwritten) head_dim so the MHA host pool is picked.
+        self.v_head_dim = 1
 
         self.custom_mem_pool = None
 
@@ -1365,6 +1368,7 @@ class MockHiCacheStorage:
                 self._last_per_tier_write = {"default": res.kvcm_write_length}
             return True
         else:
+            MockHiCacheStorage._DEBUG_BATCH_SET_COUNT += 1
             for key, value in zip(keys, values):
                 if not self.set(key, value):
                     return False
@@ -1404,10 +1408,15 @@ class MockHiCacheStorage:
                 self._last_per_tier_hits = {"default": res.kvcm_hit_length}
             return res.kvcm_hit_length
         else:
+            MockHiCacheStorage._DEBUG_BATCH_EXISTS_COUNT += 1
+            hit = 0
             for i in range(len(keys)):
                 if not self.exists(keys[i]):
-                    return i
-            return len(keys)
+                    break
+                hit = i + 1
+            MockHiCacheStorage._DEBUG_BATCH_EXISTS_HITS += hit
+            self._last_per_tier_hits = {"default": hit}
+            return hit
 
     def batch_exists_per_tier(self) -> dict:
         """Return per-tier hit counts from the last batch_exists() call. No extra kvcm call."""
@@ -1427,6 +1436,37 @@ class MockHiCacheStorage:
         The mock backend only tracks keys (no real KV data), so every load is
         reported as a miss (``None`` -> 0 pages loaded by the controller)."""
         return None
+
+    def get(self, key: str, target_location=None, target_sizes=None):
+        return None
+
+    # --- sglang >= 0.5.10 storage backend interfaces (HybridCacheController) --- #
+
+    def register_mem_host_pool_v2(self, host_pool, host_pool_name):
+        if not hasattr(self, "registered_pools"):
+            self.registered_pools = {}
+        self.registered_pools[host_pool_name] = host_pool
+
+    def batch_get_v1(self, keys, host_indices, extra_info=None):
+        return [False] * len(keys)
+
+    def batch_set_v1(self, keys, host_indices, extra_info=None):
+        return self.batch_set(keys, [None] * len(keys), extra_info)
+
+    def batch_get_v2(self, transfers, extra_info=None):
+        return {}
+
+    def batch_set_v2(self, transfers, extra_info=None):
+        return {}
+
+    def batch_exists_v2(self, keys, pool_transfers=None, extra_info=None):
+        return self.batch_exists(keys, extra_info)
+
+    def get_stats(self) -> dict:
+        return {}
+
+    def close(self):
+        pass
 
     def get_last_write_per_tier(self) -> dict:
         """Return per-tier newly-inserted write block counts from the last batch_set() call.
