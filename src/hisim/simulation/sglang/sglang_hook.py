@@ -810,6 +810,164 @@ class C_HiCacheController(BaseHook):
             except Exception:
                 pass
 
+            if not _is_legacy_sglang():
+                # sglang >= 0.5.10: the storage query result is released to the
+                # stock drain path (prefetch_hit_queue -> host allocation ->
+                # io_aux ack -> tree insert) only after the simulated storage
+                # read completes, advancing across rounds within the current
+                # inference budget (chunked, mirroring the <= 0.5.9 semantics).
+                remain_dur = StateManager.get_current_inference_dur()
+
+                # 1. Continue a partially "read" operation from the previous
+                #    round. NOTE: the simulated read progress is tracked in
+                #    the chunked stash only - `operation.completed_tokens`
+                #    belongs to the stock io_aux ack path (real pages read)
+                #    and is asserted to stay <= the acked count.
+                chunked = getattr(self, "chunked_prefetch_operation", None)
+                if chunked is not None:
+                    operation = chunked["operation"]
+                    storage_hit_count = chunked["storage_hit_count"]
+                    per_tier_hits = chunked.get("per_tier_hits")
+                    progress = chunked.get("progress", 0)
+                    remaining = storage_hit_count - progress
+                    if (
+                        per_tier_hits
+                        and storage_hit_count > 0
+                        and C_HiCacheController._tier_sims
+                    ):
+                        ratio = remaining / storage_hit_count
+                        calc_arg = {
+                            k: max(0, int(v * ratio))
+                            for k, v in per_tier_hits.items()
+                        }
+                    else:
+                        calc_arg = remaining
+                    completed_tokens, _prefetch_dur = (
+                        C_HiCacheController.calc_prefetch_pages(
+                            calc_arg,
+                            C_HiCacheController.KV_CACHE_BYTES,
+                            remain_dur,
+                            C_HiCacheController.DISK_READ_BANDWIDTH_BYTES,
+                        )
+                    )
+                    if completed_tokens < remaining:
+                        # The read cannot finish within this round's budget;
+                        # keep holding the operation and retry next round.
+                        chunked["progress"] = progress + int(completed_tokens)
+                        C_SchedulerHook._L3_PREFETCHED_TOKENS += int(
+                            completed_tokens
+                        )
+                        return
+                    C_SchedulerHook._L3_PREFETCHED_TOKENS += int(remaining)
+                    try:
+                        req_stats = C_SchedulerHook.REQUEST_STATS[
+                            operation.request_id
+                        ]
+                        req_stats.prefetch_complete_tokens = storage_hit_count
+                    except Exception:
+                        pass
+                    if direct_mode and storage_hit_count > 0:
+                        StateManager.inc_l3_direct_load_count(storage_hit_count)
+                    self.prefetch_hit_queue.put(operation)
+                    setattr(self, "chunked_prefetch_operation", None)
+
+                # 2. Query newly enqueued operations.
+                while True:
+                    try:
+                        operation = self.prefetch_queue.get(block=False)
+                        if operation is None:
+                            return
+                        hash_value, storage_hit_count = self._storage_hit_query(
+                            operation
+                        )
+                        try:
+                            req_stats = C_SchedulerHook.REQUEST_STATS[
+                                operation.request_id
+                            ]
+                            req_stats.l3_hit_tokens = storage_hit_count
+                        except Exception:
+                            pass
+                        C_SchedulerHook._L3_QUERY_COUNT += 1
+                        C_SchedulerHook._L3_TOTAL_HITS += storage_hit_count
+                        per_tier_hits = None
+                        if C_HiCacheController._tier_sims:
+                            try:
+                                per_tier_hits = (
+                                    self.storage_backend.batch_exists_per_tier()
+                                )
+                                for tn, cnt in per_tier_hits.items():
+                                    C_SchedulerHook._L3_HIT_STATS[tn] = (
+                                        C_SchedulerHook._L3_HIT_STATS.get(tn, 0)
+                                        + cnt
+                                    )
+                            except Exception:
+                                per_tier_hits = None
+
+                        if (
+                            self.prefetch_threshold is not None
+                            and storage_hit_count < self.prefetch_threshold
+                        ):
+                            # Not enough benefit: release as terminated; the
+                            # stock drain revokes it and frees host memory.
+                            operation.mark_terminate()
+                            operation.storage_hit_count = 0
+                            self.prefetch_hit_queue.put(operation)
+                            continue
+
+                        operation.hash_value = hash_value[
+                            : (storage_hit_count // self.page_size)
+                        ]
+                        storage_hit_count = (
+                            storage_hit_count // self.page_size * self.page_size
+                        )
+                        operation.storage_hit_count = storage_hit_count
+
+                        calc_arg = (
+                            per_tier_hits if per_tier_hits else storage_hit_count
+                        )
+                        completed_tokens, _prefetch_dur = (
+                            C_HiCacheController.calc_prefetch_pages(
+                                calc_arg,
+                                C_HiCacheController.KV_CACHE_BYTES,
+                                remain_dur,
+                                C_HiCacheController.DISK_READ_BANDWIDTH_BYTES,
+                            )
+                        )
+                        if completed_tokens < storage_hit_count:
+                            # Hold the operation and continue the read next
+                            # round (chunked prefetch). The progress lives in
+                            # the stash; operation.completed_tokens is owned
+                            # by the stock io_aux ack path.
+                            C_SchedulerHook._L3_PREFETCHED_TOKENS += int(
+                                completed_tokens
+                            )
+                            setattr(
+                                self,
+                                "chunked_prefetch_operation",
+                                {
+                                    "operation": operation,
+                                    "storage_hit_count": storage_hit_count,
+                                    "per_tier_hits": per_tier_hits,
+                                    "progress": int(completed_tokens),
+                                },
+                            )
+                            return  # This round's budget is exhausted.
+
+                        C_SchedulerHook._L3_PREFETCHED_TOKENS += storage_hit_count
+                        try:
+                            req_stats = C_SchedulerHook.REQUEST_STATS[
+                                operation.request_id
+                            ]
+                            req_stats.prefetch_complete_tokens = storage_hit_count
+                        except Exception:
+                            pass
+                        if direct_mode and storage_hit_count > 0:
+                            StateManager.inc_l3_direct_load_count(storage_hit_count)
+                        self.prefetch_hit_queue.put(operation)
+                    except Empty:
+                        return
+                return
+
             if direct_mode:
                 chunked = getattr(self, "chunked_prefetch_operation", None)
                 if chunked is not None:
@@ -874,67 +1032,6 @@ class C_HiCacheController(BaseHook):
 
             # TODO: Overlap schedule
             remain_dur = StateManager.get_current_inference_dur()
-
-            if not _is_legacy_sglang():
-                # sglang >= 0.5.10: the storage query result is handed to the
-                # stock drain path (prefetch_hit_queue -> host allocation ->
-                # ack), simulating an instantly completed storage query. The
-                # legacy chunked-prefetch machinery does not apply.
-                while True:
-                    try:
-                        operation = self.prefetch_queue.get(block=False)
-                        if operation is None:
-                            return
-                        hash_value, storage_hit_count = self._storage_hit_query(
-                            operation
-                        )
-                        try:
-                            req_stats = C_SchedulerHook.REQUEST_STATS[
-                                operation.request_id
-                            ]
-                            req_stats.l3_hit_tokens = storage_hit_count
-                        except Exception:
-                            pass
-                        C_SchedulerHook._L3_QUERY_COUNT += 1
-                        C_SchedulerHook._L3_TOTAL_HITS += storage_hit_count
-                        try:
-                            per_tier = self.storage_backend.batch_exists_per_tier()
-                            for tn, cnt in per_tier.items():
-                                C_SchedulerHook._L3_HIT_STATS[tn] = (
-                                    C_SchedulerHook._L3_HIT_STATS.get(tn, 0) + cnt
-                                )
-                        except Exception:
-                            pass
-                        # Mirror prefetch_thread_func (minus the real IO).
-                        operation.hash_value = hash_value[
-                            : (storage_hit_count // self.page_size)
-                        ]
-                        operation.storage_hit_count = storage_hit_count
-                        try:
-                            storage_hit_count_tensor = torch.tensor(
-                                storage_hit_count, dtype=torch.int
-                            )
-                            self._all_reduce(
-                                storage_hit_count_tensor,
-                                torch.distributed.ReduceOp.MIN,
-                                self.prefetch_hits_sync_groups,
-                            )
-                        except Exception:
-                            pass
-                        C_SchedulerHook._L3_PREFETCHED_TOKENS += storage_hit_count
-                        direct_mode = False
-                        try:
-                            direct_mode = (
-                                ConfigManager.get_platform_config().enable_l3_direct_to_l1
-                            )
-                        except Exception:
-                            pass
-                        if direct_mode and storage_hit_count > 0:
-                            StateManager.inc_l3_direct_load_count(storage_hit_count)
-                        self.prefetch_hit_queue.put(operation)
-                    except Empty:
-                        return
-                return
 
             chunked_prefetch_operation = getattr(
                 self, "chunked_prefetch_operation", None
