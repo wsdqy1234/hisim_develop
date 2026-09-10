@@ -1368,3 +1368,25 @@ analyzer 不受影响（逐请求顺序处理，隐含"等完成"语义）；his
 **验证**（system python + sglang 0.5.19，与 0.5.6 同一 weka 数据集/配置对照）：
 - 12/12 轮完成，L1 复用 79.1%（与 0.5.6 完全一致），L2 命中 23.1%（0.5.6 为 30.7%，host_hit_length 统计口径差异），动态反馈开/关一致，全程 0 异常
 - 0.5.19 时序管线（storage/L3/L2 stats）在 rebase 后完整保留
+
+## 2026-09-10 — 任务3：hisim 仿真 vs analyzer V1/V2/V3 复用率对比（同 L1/L2/L3 大小）
+
+**口径**：同一 weka 工作负载（/tmp/opencode/weka_small_traces.jsonl 选取的 4 个会话，`num_traces=4 max_concurrent_traces=2 max_rounds_per_trace=6 max_round_tokens=65536`，24 轮 / 808,960 input tokens，两侧用同一 planner、同顺序）；同一容量：L1=65,536 tokens（`max_total_tokens`）、L2=131,072 tokens（`hicache_ratio=2`；analyzer 侧 `--l2-gb 2.147483648 --kv-bytes-per-token 16384`）、L3=无限（file 后端 / `--l3-gb 0`）；kv bytes/token=16384（mock 4 层×8 kv头×128 head_dim×2(KV)×bf16）。
+
+| 层级 | hisim 仿真 (0.5.19) | V1 | V2 | V3 |
+|---|---|---|---|---|
+| L1 | **44.07%** (356,479) | 36.06% | 43.43% | **44.07%** (356,480) |
+| L2 | 30.52% (246,912) | 34.45% | 12.53% | 24.82% |
+| L3 | 0.02% (128) | 6.31% | 6.37% | 7.96% |
+| New | 25.40% | 23.17% | 37.67% | 23.16% |
+
+**结论**：
+1. **L1 完全对齐**：仿真与 V3 的 L1 命中 tokens 仅差 1（356,479 vs 356,480）——V3（HiSim 感知 radix 树模型）就是按 hisim 语义校准的，交叉验证通过；V2 接近（-0.6pp）；V1 偏低 8pp（块粒度 LRU L1，无 radix 精确前缀/重插语义，属 V1 模型固有近似）。
+2. **L2 仿真偏高 (+5.7pp vs V3)**：仿真 write_through 把每条 L1 驱逐链都备份到 host 且 mock ACK 即时完成，host 池保留更多；V3 的 pending-ack 锁/连续前缀不变量/host-leaf 驱逐更严格。且 host 命中的 token 不再走 L3。
+3. **L3 仿真≈0 vs 理论 6~8%**：主因是 (1) 仿真 L2 保留多——请求在前缀里就命中了 L2，无需查 L3（对比 #24：仿真 l2=32,768/l3=128，V3 L2=16,384/L3=34,624）；(2) sglang `prefetch_from_storage` 只查 host match 之后的"新尾部"，而多轮 agent 会话的新尾部本来就是新内容。仿真 23 次 batch_exists 仅最后 1 次命中 128 tokens，机制正常但触发面窄。**若要仿真体现 L3 复用，需减小 L2（hicache_ratio<2）或跨 pass 持久化（HISIM_PERSIST_L3_STORAGE=1）**。
+4. 仿真 L2 统计口径注意：request.jsonl 的 `l2_hit_tokens` 在 chunked prefill 下后 chunk 覆盖前 chunk（总量 246,912），scheduler 日志的全局累加器（307,328）按 chunk 事件累计；对比以 per-request 口径为准（与 V3 L1 对齐佐证其一致性）。
+
+**复现命令**：
+- 仿真：`weka_compare_sim.py`（ServerArgs: max_total_tokens=65536, hicache_ratio=2, hicache_storage_backend=file, prefetch_policy=timeout, prefetch_threshold=1）
+- V3：`python3 test/hisim_cache_analyzer_v3.py --weka-traces /tmp/opencode/weka_small_traces.jsonl --num-traces 4 --max-concurrent-traces 2 --max-rounds-per-trace 6 --max-round-tokens 65536 --l1-tokens 65536 --l2-gb 2.147483648 --kv-bytes-per-token 16384 --page-size 1`
+- V2 同 V3；V1 用 `--block-size 1`（其余同）
