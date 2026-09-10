@@ -427,7 +427,7 @@ def main():
         tl+=r['l1']; tl2+=r['l2']; tl3+=r['l3']; tn+=r['new']
         if r['l2']>0: l2r+=1
         if r['l2']>0 or r['l3']>0:
-            tag = (f" tr{d['trace_idx']}r{d['round_idx']}"
+            tag = (f" tr{d['trace_idx']}.{d.get('stream_id','m')}r{d['round_idx']}"
                    if 'trace_idx' in d else "")
             print(f"  #{i+1}{tag}: inp={len(toks)} L1={r['l1']} L2={r['l2']} L3={r['l3']} New={r['new']}")
         if (i+1)%100==0: print(f"  {i+1} reqs {time.time()-t0:.0f}s", flush=True)

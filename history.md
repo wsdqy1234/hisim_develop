@@ -1161,3 +1161,39 @@ analyzer 不受影响（逐请求顺序处理，隐含"等完成"语义）；his
 - 无死锁证明：停靠期间上一轮必在 running_batch，循环持续；完成后停靠条目获得数值 key，空闲跳跃可跳达
 
 **优先级建议**：先做 subagent 展开（analyzer 侧立刻可用、直接改善 reuse rate 研究的负载保真度），动态完成时间反馈在跑完整 weka 仿真前实现。
+
+## 2026-09-09 — 实现 subagent 展开 + 动态完成时间反馈
+
+两个特性均已实现并测试通过（默认关闭，对现有行为零影响）。
+
+### 一、subagent 请求展开
+
+按上一节方案落地，`include_subagents` 默认 False：
+
+- `weka_trace.py`：`_extract_streams` 取代 `_extract_main_rounds`，返回 `[(stream_id, reqs)]` 流列表（主流 = "main"，subagent 按 `agent_id` 分组合并排序）；`WekaRound` 增加 `stream_id`；output 推导链按 `(trace_idx, stream_id)` 逐流链接；trace 时长取所有流末轮结束的最大值；`add_weka_arguments` 增加 `--include-subagents`
+- `dataset_args.py`：`include_subagents` 字段；`weka_trace_dataset.py` 透传给 planner
+- analyzer V1/V2/V3：`--include-subagents` 开关（复用 `add_weka_arguments`），L2/L3 命中输出标签带 `tr{N}.{stream_id}r{M}`
+
+**实测（cc-traces-weka-062126-256k，5 traces / 每流 20 轮上限，V3）**：
+- 不含 subagent：100 轮，10.18M input tokens，L1 88.58%
+- 含 subagent：327 轮（+227），22.10M input tokens（+117%，与前期"缓存足迹 +121%"的统计一致），L1 88.13%，subagent 流的 L2 命中正常出现在输出中
+- V1/V2 同样本验证通过（V2 含 subagent：22.10M tokens，L1 83.10%）
+
+### 二、动态完成时间反馈
+
+按上一节方案落地（完成事件驱动的停靠 + 重定键），`BenchmarkConfig.dynamic_completion_feedback` 默认 False：
+
+- **元数据链**：`iter_round_entries`/`WekaTraceDataset` 输出 `session=f"{trace_idx}:{stream_id}"`、`round_idx`、`recorded_finish`（= timestamp + api_time，计划时间轴上的录制完成时刻）→ `sglang_bench.get_request(dynamic_feedback=True)` 透传到 simulation_params → `sglang_hook` 收集阶段登记
+- **核心机制（sglang_hook.py）**：
+  - 释放循环（`wrapped_recv_requests`）：堆顶到期但本会话上一轮仍在飞行 → 停靠 `PARKED[session]`（不阻塞其他会话）；上一轮已完成 → 以 `shift = max(0, finish_vtime - recorded_finish)` 延迟释放
+  - 完成挂钩（`wrapped_process_batch_result`）：`req.finished` 时记录虚拟完成时刻，释放该会话全部停靠轮（`enqueue_time + shift` 重新入堆）；等价于 max(静态时间, 实际完成 + 录制间隔)
+  - 防死锁：堆空 + PARKED 非空 + running/waiting 均空时强制放行最早停靠轮（防御完成事件丢失）
+- **session 元数据语义**：`recorded_finish` 直接携带计划轴上的录制完成时刻，下一轮静态时间已含录制 think 间隔，shift 平移即可，无需单独导出 think_time
+
+**验证**：loader 侧 session 元数据由单测覆盖（`test_iter_round_entries_stream`：session 格式、recorded_finish = timestamp + api_time、时间单调性）；hook 层逻辑因本机无 sglang 环境未跑完整仿真，待有环境后用 `BenchmarkConfig(dynamic_completion_feedback=True)` + weka 数据集验证。
+
+### 三、测试与文档
+
+- `test/test_weka_trace_loader.py`：14/14 通过（新增 4 个 subagent 用例 + 会话元数据断言）
+- `README.md`/`README_zh.md`：补 `include_subagents`、动态完成时间反馈说明、`--include-subagents` 示例及实测数据
+

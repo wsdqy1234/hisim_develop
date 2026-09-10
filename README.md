@@ -100,19 +100,23 @@ Hisim can directly replay SemiAnalysis **cc-traces-weka** real Claude Code agent
       trace_start_interval=0.5,    # gap between first rounds of concurrent traces (default 0.5s)
       max_rounds_per_trace=20,     # max rounds per trace (-1 = unlimited)
       max_round_tokens=200000,     # per-round cap (in+out); trace ends before the first round exceeding it
+      include_subagents=False,     # expand subagent groups as independent per-agent session streams
   )
   ```
   Scheduling is a static timeline (intra-trace round gaps follow the recorded timestamps), consumed by the OFFLINE simulation's virtual clock (FUTURE_QUEUE).
+
+  **Dynamic completion feedback** (optional, `BenchmarkConfig(dynamic_completion_feedback=True)`): the next round of a session is released at max(static planned time, previous round's actual finish vtime + recorded gap). This avoids cache-reuse distortion ("previous round not finished while next round already arrived", causing the aligned prefix segment to miss because the previous round's output KV is not inserted yet) when the simulation runs slower than the recorded `api_time`. Only takes effect for requests carrying session metadata (weka_trace); off by default.
 
 * Offline cache analysis (no simulation dependencies, stdlib only):
   ```bash
   python test/hisim_cache_analyzer_v3.py \
       --weka-traces /path/to/traces.jsonl \
-      --num-traces 4 --max-concurrent-traces 2 --max-rounds-per-trace 10
+      --num-traces 4 --max-concurrent-traces 2 --max-rounds-per-trace 10 \
+      --include-subagents
   ```
-  All three analyzers (v1/v2/v3) support it (see `test/README_hisim_cache_analyzer_*.md`). Measured L1 reuse on 4 traces / 2 concurrent / 10 rounds: 82–85%.
+  All three analyzers (v1/v2/v3) support it (see `test/README_hisim_cache_analyzer_*.md`). Measured L1 reuse on 4 traces / 2 concurrent / 10 rounds: 82–85%. With `--include-subagents`, subagent group requests are expanded as additional per-agent streams that share the trace's hash space and time-overlap with the main stream (round limits apply per stream); on the same 5-trace sample this roughly doubles the replayed load (100 → 327 rounds, 10.2M → 22.1M input tokens).
 
-> Note: the `bench_serving` HTTP benchmark CLI is not wired to weka datasets yet (use the Python API above or the analyzer CLI); subagent group requests are not expanded in the current version (main-stream rounds only).
+> Note: the `bench_serving` HTTP benchmark CLI is not wired to weka datasets yet (use the Python API above or the analyzer CLI). Subagent expansion is off by default; enable it with `include_subagents=True` (Python API) or `--include-subagents` (analyzer CLI).
 
 ---
 

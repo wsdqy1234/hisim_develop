@@ -92,19 +92,23 @@ cd .. && pip install .
       trace_start_interval=0.5,    # 并发 trace 首轮之间的间隔（默认 0.5s）
       max_rounds_per_trace=20,     # 每条 trace 最多跑多少轮（-1=无限）
       max_round_tokens=200000,     # 单轮长度上限（in+out，超过即截断该 trace）
+      include_subagents=False,     # 展开 subagent 组为独立会话流（按 agent_id）
   )
   ```
   调度为静态时间轴（trace 内轮次保持录制时间间隔），由 OFFLINE 仿真的虚拟时钟（FUTURE_QUEUE）消费。
+
+  **动态完成时间反馈**（可选，`BenchmarkConfig(dynamic_completion_feedback=True)`）：会话内下一轮的释放时间 = max(静态计划时间, 上一轮实际完成虚拟时间 + 录制间隔)。当仿真预测慢于录制 api_time 时避免"上一轮未完成、下一轮已到达"造成的缓存复用失真（上一轮 output KV 未插入，下一轮对齐段 miss）。仅在请求携带 session 元数据（weka_trace）时生效，默认关闭。
 
 * 离线缓存分析（无需安装仿真依赖，纯标准库）：
   ```bash
   python test/hisim_cache_analyzer_v3.py \
       --weka-traces /path/to/traces.jsonl \
-      --num-traces 4 --max-concurrent-traces 2 --max-rounds-per-trace 10
+      --num-traces 4 --max-concurrent-traces 2 --max-rounds-per-trace 10 \
+      --include-subagents
   ```
-  V1/V2/V3 三个 analyzer 均支持（详见 `test/README_hisim_cache_analyzer_*.md`）。实测（4 traces / 并发 2 / 10 轮）L1 复用率 82~85%。
+  V1/V2/V3 三个 analyzer 均支持（详见 `test/README_hisim_cache_analyzer_*.md`）。实测（4 traces / 并发 2 / 10 轮）L1 复用率 82~85%。开启 `--include-subagents` 后，subagent 组请求展开为共享 trace hash 空间、与主流时间重叠的独立会话流（轮次限制按流生效）；同样 5 条 trace 样本下回放负载约翻倍（100 → 327 轮，10.2M → 22.1M input tokens）。
 
-> 注意：`bench_serving` 的 HTTP 压测 CLI 尚未接线 weka 数据集（当前通过上述 Python API 与 analyzer CLI 使用）；当前版本 subagent 组请求暂不展开（仅回放主流请求）。
+> 注意：`bench_serving` 的 HTTP 压测 CLI 尚未接线 weka 数据集（当前通过上述 Python API 与 analyzer CLI 使用）。subagent 展开默认关闭，通过 `include_subagents=True`（Python API）或 `--include-subagents`（analyzer CLI）开启。
 
 ---
 

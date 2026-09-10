@@ -12,6 +12,10 @@ class BenchmarkConfig:
         False  # For hisim hooks: include queue start time in replay schedule.
     )
     ignore_request_timestamp: bool = False
+    # For hisim hooks: session-aware replay where the next round of a session
+    # is released at max(static time, previous round's actual finish + gap).
+    # Requires per-request session metadata (e.g. weka_trace datasets).
+    dynamic_completion_feedback: bool = False
 
 
 @dataclass

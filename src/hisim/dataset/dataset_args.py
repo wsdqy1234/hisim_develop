@@ -18,6 +18,7 @@ class DatasetArgs:
     trace_start_interval: float = 0.5
     max_rounds_per_trace: int = -1
     max_round_tokens: int = -1
+    include_subagents: bool = False
 
     @property
     def mean_input_length(self):

@@ -21,8 +21,10 @@ Key semantics:
   Anthropic). Prefix reuse across rounds is encoded in shared `hash_ids`
   prefixes.
 - `in == len(hash_ids) * block_size` (block-aligned).
-- Subagent groups run concurrently with the main stream; this version skips
-  them (main-stream rounds only).
+- Subagent groups run concurrently with the main stream; pass
+  `include_subagents=True` to expand them as per-agent streams (each an
+  independent conversation with its own output chain, sharing the trace's
+  hash space and time-overlap).
 
 Scheduling model (static timeline, consumed by hisim's virtual clock):
 - Traces are loaded from one or more jsonl files in order, up to `num_traces`.
@@ -45,18 +47,28 @@ from typing import Iterator, List, Optional, Sequence
 
 @dataclass
 class WekaRound:
-    """One planned (scheduled) main-stream round of a weka trace."""
+    """One planned (scheduled) round of a weka trace stream.
+
+    A stream is either the main agent conversation ("main") or one subagent
+    group (stream_id = agent_id). Rounds of different streams within the same
+    trace overlap in time, mirroring the recorded concurrency.
+    """
 
     global_seq: int  # sequence number in the planned, time-sorted stream
     trace_idx: int  # index of the owning trace (in load order)
-    round_idx: int  # round index within the trace (0-based)
+    round_idx: int  # round index within the stream (0-based)
     timestamp: float  # planned arrival time (seconds, 0-based)
     api_time: float  # recorded request duration (seconds)
     hash_ids: tuple  # per-trace local block hashes of this round's input
     block_base: int  # global block-id offset assigned to the owning trace
     input_length: int  # tokens = len(hash_ids) * block_size
     output_length: int  # recorded output token count
-    # Link to the next round of the same trace (set by the planner). Used to
+    stream_id: str = "main"  # "main" or a subagent agent_id
+    # Recorded finish time on the planned timeline (timestamp + api_time).
+    # Consumed by the dynamic-completion-feedback scheduler to compute the
+    # release shift of the next round of the same stream.
+    recorded_finish: float = 0.0
+    # Link to the next round of the same stream (set by the planner). Used to
     # derive this round's output tokens so they match the next round's input.
     next_hash_ids: tuple = ()
     next_block_base: int = 0
@@ -89,15 +101,39 @@ def _load_trace_lines(filepaths: Sequence[str]) -> Iterator[dict]:
                 yield json.loads(line)
 
 
-def _extract_main_rounds(trace_obj: dict) -> List[dict]:
-    """Main-stream requests only (skip subagent groups), sorted by `t`."""
-    reqs = [
+def _extract_streams(trace_obj: dict, include_subagents: bool) -> List[tuple]:
+    """Extract conversation streams as [(stream_id, reqs sorted by t), ...].
+
+    The main stream has stream_id "main". Each subagent group (inner requests
+    keyed by agent_id, groups with the same agent_id merged) is its own
+    stream; subagent inner `t` values are already trace-relative, so their
+    time overlap with the main stream is preserved.
+    """
+    main = [
         r
         for r in trace_obj.get("requests", [])
         if r.get("type") != "subagent" and r.get("hash_ids")
     ]
-    reqs.sort(key=lambda r: r["t"])
-    return reqs
+    main.sort(key=lambda r: r["t"])
+    streams = [("main", main)] if main else []
+    if include_subagents:
+        groups: dict = {}
+        order: List[str] = []
+        for r in trace_obj.get("requests", []):
+            if r.get("type") != "subagent":
+                continue
+            sid = r.get("agent_id") or f"subagent_{len(order)}"
+            inner = [q for q in r.get("requests", []) if q.get("hash_ids")]
+            if not inner:
+                continue
+            if sid not in groups:
+                groups[sid] = []
+                order.append(sid)
+            groups[sid].extend(inner)
+        for sid in order:
+            reqs = sorted(groups[sid], key=lambda r: r["t"])
+            streams.append((sid, reqs))
+    return [s for s in streams if s[1]]
 
 
 def _apply_round_limits(
@@ -126,28 +162,39 @@ def plan_weka_traces(
     max_rounds_per_trace: int = -1,
     max_round_tokens: int = -1,
     block_size: int = 64,
+    include_subagents: bool = False,
 ) -> WekaPlan:
     """Parse weka traces.jsonl file(s) and build a static schedule.
 
-    See the module docstring for the scheduling model.
+    See the module docstring for the scheduling model. When
+    `include_subagents` is True, subagent group requests are expanded as
+    additional per-agent streams that share the trace's hash space and
+    time-overlap with the main stream; round limits apply per stream.
     """
     traces = []
     for obj in _load_trace_lines(filepaths):
-        reqs = _extract_main_rounds(obj)
-        reqs, n_cut = _apply_round_limits(
-            reqs, max_rounds_per_trace, max_round_tokens
-        )
-        if not reqs:
+        streams = _extract_streams(obj, include_subagents)
+        limited = []
+        n_cut = 0
+        for sid, reqs in streams:
+            reqs, cut = _apply_round_limits(
+                reqs, max_rounds_per_trace, max_round_tokens
+            )
+            n_cut += cut
+            if reqs:
+                limited.append((sid, reqs))
+        if not limited:
             continue
         bs = obj.get("block_size") or block_size
         max_hash = 0
-        for r in reqs:
-            if r["hash_ids"]:
-                max_hash = max(max_hash, max(r["hash_ids"]))
+        for _, reqs in limited:
+            for r in reqs:
+                if r["hash_ids"]:
+                    max_hash = max(max_hash, max(r["hash_ids"]))
         traces.append(
             {
                 "id": obj.get("id"),
-                "reqs": reqs,
+                "streams": limited,
                 "block_size": bs,
                 "max_hash": max_hash,
                 "n_cut_by_tokens": n_cut,
@@ -173,50 +220,57 @@ def plan_weka_traces(
     for ti, t in enumerate(traces):
         slot = min(range(n_slots), key=lambda k: slots[k])
         start = slots[slot]
-        reqs = t["reqs"]
-        t0 = reqs[0]["t"]
-        last = reqs[-1]
-        duration = (last["t"] - t0) + last.get("api_time", 0.0)
+        # Trace time origin: earliest kept round; duration: until the last
+        # round of ANY stream finishes (subagents may outlive the main stream).
+        t0 = min(reqs[0]["t"] for _, reqs in t["streams"])
+        end = max(
+            reqs[-1]["t"] + reqs[-1].get("api_time", 0.0)
+            for _, reqs in t["streams"]
+        )
+        duration = end - t0
         slots[slot] = start + duration + trace_start_interval
-        t["start"] = start
-        t["duration"] = duration
+        num_rounds = 0
+        for sid, reqs in t["streams"]:
+            # Build rounds in stream order and link consecutive rounds of the
+            # same stream (output derivation chain) as we go.
+            prev_rd: Optional[WekaRound] = None
+            for ri, r in enumerate(reqs):
+                api = r.get("api_time", 0.0)
+                rd = WekaRound(
+                    global_seq=0,  # assigned below after sorting
+                    trace_idx=ti,
+                    round_idx=ri,
+                    timestamp=start + (r["t"] - t0),
+                    api_time=api,
+                    hash_ids=tuple(r["hash_ids"]),
+                    block_base=t["block_base"],
+                    input_length=len(r["hash_ids"]) * t["block_size"],
+                    output_length=r["out"],
+                    stream_id=sid,
+                    recorded_finish=start + (r["t"] - t0) + api,
+                )
+                if prev_rd is not None:
+                    prev_rd.next_hash_ids = rd.hash_ids
+                    prev_rd.next_block_base = rd.block_base
+                rounds.append(rd)
+                prev_rd = rd
+            num_rounds += len(reqs)
         trace_infos.append(
             {
                 "trace_idx": ti,
                 "trace_id": t["id"],
-                "num_rounds": len(reqs),
+                "num_rounds": num_rounds,
+                "num_streams": len(t["streams"]),
                 "n_cut_by_tokens": t["n_cut_by_tokens"],
                 "start": start,
                 "duration": duration,
                 "slot": slot,
             }
         )
-        for ri, r in enumerate(reqs):
-            rounds.append(
-                WekaRound(
-                    global_seq=0,  # assigned below after sorting
-                    trace_idx=ti,
-                    round_idx=ri,
-                    timestamp=start + (r["t"] - t0),
-                    api_time=r.get("api_time", 0.0),
-                    hash_ids=tuple(r["hash_ids"]),
-                    block_base=t["block_base"],
-                    input_length=len(r["hash_ids"]) * t["block_size"],
-                    output_length=r["out"],
-                )
-            )
 
     rounds.sort(key=lambda r: r.timestamp)
     for seq, rd in enumerate(rounds):
         rd.global_seq = seq
-
-    # Link consecutive rounds of the same trace (for output derivation).
-    prev: Optional[WekaRound] = None
-    for rd in rounds:
-        if prev is not None and prev.trace_idx == rd.trace_idx:
-            prev.next_hash_ids = rd.hash_ids
-            prev.next_block_base = rd.block_base
-        prev = rd
 
     return WekaPlan(
         rounds=rounds,
@@ -271,8 +325,9 @@ def iter_round_entries(plan: WekaPlan) -> Iterator[dict]:
     """Stream planned rounds as analyzer-compatible entries (time-sorted).
 
     Yields dicts with: timestamp, input_ids, output_ids, input_length,
-    output_length, trace_idx, round_idx. Tokens are expanded lazily, one
-    round at a time, so peak memory stays at a single request's size.
+    output_length, trace_idx, stream_id, round_idx, session, recorded_finish.
+    Tokens are expanded lazily, one round at a time, so peak memory stays at
+    a single request's size.
     """
     for rd in plan.rounds:
         yield {
@@ -282,7 +337,10 @@ def iter_round_entries(plan: WekaPlan) -> Iterator[dict]:
             "input_length": rd.input_length,
             "output_length": rd.output_length,
             "trace_idx": rd.trace_idx,
+            "stream_id": rd.stream_id,
             "round_idx": rd.round_idx,
+            "session": f"{rd.trace_idx}:{rd.stream_id}",
+            "recorded_finish": rd.recorded_finish,
         }
 
 
@@ -333,6 +391,15 @@ def add_weka_arguments(parser) -> None:
             "first round exceeding this (-1 = unlimited)."
         ),
     )
+    g.add_argument(
+        "--include-subagents",
+        action="store_true",
+        help=(
+            "Expand subagent group requests as additional per-agent streams "
+            "(share the trace hash space and time-overlap with the main "
+            "stream; round limits apply per stream)."
+        ),
+    )
 
 
 def weka_plan_from_args(args) -> WekaPlan:
@@ -344,4 +411,5 @@ def weka_plan_from_args(args) -> WekaPlan:
         trace_start_interval=args.trace_start_interval,
         max_rounds_per_trace=args.max_rounds_per_trace,
         max_round_tokens=args.max_round_tokens,
+        include_subagents=getattr(args, "include_subagents", False),
     )

@@ -84,6 +84,7 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
         ignore_timestamp: bool = False,
         with_queue_start: bool = False,
         request_rate: float = float("inf"),
+        dynamic_feedback: bool = False,
     ) -> Iterator[tuple[GenericRequest, dict]]:
         yield_delay = 0
         for req in dataset:
@@ -99,6 +100,15 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
             }
             if with_queue_start:
                 simulation_params["queue_start"] = req.custom_params.get("queue_start")
+            if dynamic_feedback and req.custom_params.get("session") is not None:
+                # Session metadata for the dynamic-completion-feedback scheduler
+                # (sglang_hook): rounds of the same session wait for
+                # max(static time, previous round's actual finish).
+                simulation_params["session"] = req.custom_params["session"]
+                simulation_params["round_idx"] = req.custom_params.get("round_idx")
+                simulation_params["recorded_finish"] = req.custom_params.get(
+                    "recorded_finish"
+                )
 
             yield (req, simulation_params)
 
@@ -137,6 +147,7 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
             ignore_timestamp=benchmark_config.ignore_request_timestamp,
             with_queue_start=benchmark_config.with_queue_start,
             request_rate=benchmark_config.request_rate,
+            dynamic_feedback=benchmark_config.dynamic_completion_feedback,
         ):
             task = asyncio.create_task(
                 self.engine.async_generate(

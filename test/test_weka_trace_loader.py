@@ -162,6 +162,94 @@ def test_derive_output_tokens():
         assert out2 == [-3] * 60  # global_seq 2 -> -(2+1)
 
 
+def _mk_subagent_trace(trace_id, main_rounds, sub_rounds, agent_id="ag1"):
+    """sub_rounds: inner requests of one subagent group (trace-relative t)."""
+    reqs = [
+        {"t": t, "type": "s", "in": n * BS, "out": out, "hash_ids": list(range(100, 100 + n)), "api_time": api}
+        for t, n, out, api in main_rounds
+    ]
+    inner = [
+        {"t": t, "type": "n", "in": n * BS, "out": out, "hash_ids": list(range(200, 200 + n)), "api_time": api}
+        for t, n, out, api in sub_rounds
+    ]
+    reqs.append({"t": inner[0]["t"], "type": "subagent", "agent_id": agent_id,
+                 "requests": inner})
+    return {"id": trace_id, "models": ["m"], "block_size": BS,
+            "hash_id_scope": "local", "requests": reqs}
+
+
+def test_subagent_expansion_off_by_default():
+    tr = _mk_subagent_trace(
+        "SA", [(0.0, 5, 20, 1.0)], [(1.0, 3, 10, 0.5), (3.0, 6, 10, 0.5)])
+    with tempfile.TemporaryDirectory() as tmp:
+        plan = _plan_with(tmp, tr)
+        assert plan.num_traces == 1
+        assert len(plan.rounds) == 1  # main only
+        assert plan.rounds[0].stream_id == "main"
+
+
+def test_subagent_expansion_streams():
+    # Main: t=0(5 blocks), t=10(8 blocks). Subagent: t=1(3), t=3(6) —
+    # overlapping in time with main.
+    tr = _mk_subagent_trace(
+        "SA", [(0.0, 5, 20, 1.0), (10.0, 8, 30, 2.0)],
+        [(1.0, 3, 10, 0.5), (3.0, 6, 10, 0.5)])
+    with tempfile.TemporaryDirectory() as tmp:
+        plan = _plan_with(tmp, tr, include_subagents=True)
+        assert plan.num_traces == 1
+        assert len(plan.rounds) == 4
+        assert plan.trace_infos[0]["num_streams"] == 2
+        streams = {}
+        for rd in plan.rounds:
+            streams.setdefault(rd.stream_id, []).append(rd)
+        assert set(streams) == {"main", "ag1"}
+        # subagent keeps recorded times (t=1, t=3), overlapping the main stream
+        assert [r.timestamp for r in streams["ag1"]] == [1.0, 3.0]
+        assert [r.timestamp for r in streams["main"]] == [0.0, 10.0]
+        # per-stream round_idx and output chains
+        for sid, rs in streams.items():
+            assert [r.round_idx for r in rs] == [0, 1]
+            assert rs[0].next_hash_ids == rs[1].hash_ids
+            assert rs[1].next_hash_ids == ()
+        # subagent uses same trace block base; hashes differ (100s vs 200s)
+        main_r = streams["main"][0]
+        sa_r = streams["ag1"][0]
+        assert main_r.block_base == sa_r.block_base
+        assert main_r.hash_ids != sa_r.hash_ids
+        # trace duration covers the latest-finishing stream (main ends at 12)
+        assert abs(plan.trace_infos[0]["duration"] - 12.0) < 1e-9
+
+
+def test_subagent_round_limits_per_stream():
+    tr = _mk_subagent_trace(
+        "SA", [(0.0, 5, 20, 1.0), (10.0, 8, 30, 2.0), (20.0, 9, 30, 2.0)],
+        [(1.0, 3, 10, 0.5), (3.0, 6, 10, 0.5)])
+    with tempfile.TemporaryDirectory() as tmp:
+        plan = _plan_with(tmp, tr, include_subagents=True,
+                          max_rounds_per_trace=2)
+        # main truncated to 2, subagent (2 rounds) untouched -> 4 total
+        assert len(plan.rounds) == 4
+
+
+def test_subagent_derive_output_chain():
+    # Sub round1 input extends round0 input beyond its length by the output.
+    tr = _mk_subagent_trace(
+        "SA", [(0.0, 5, 20, 1.0)],
+        [(1.0, 3, 2 * BS // 8, 0.5), (3.0, 6, 10, 0.5)])
+    # round0: 3 blocks in, out=16 tokens; round1: 6 blocks — shares 3-block
+    # prefix? No: hash ranges are disjoint slices (200..202 vs 200..205) so
+    # round1 shares round0's prefix and adds 3 blocks; out of round0 (16
+    # tokens) must come from round1's input right after round0's input.
+    with tempfile.TemporaryDirectory() as tmp:
+        plan = _plan_with(tmp, tr, include_subagents=True)
+        sa_rounds = [r for r in plan.rounds if r.stream_id == "ag1"]
+        out0 = weka.derive_output_tokens(sa_rounds[0], BS)
+        t1 = weka.expand_hash_ids(sa_rounds[1].hash_ids,
+                                  sa_rounds[1].block_base, BS)
+        assert out0 == t1[sa_rounds[0].input_length:
+                          sa_rounds[0].input_length + sa_rounds[0].output_length]
+
+
 def test_multi_file_input():
     with tempfile.TemporaryDirectory() as tmp:
         f1 = os.path.join(tmp, "a.jsonl")
@@ -185,6 +273,14 @@ def test_iter_round_entries_stream():
         assert len(e0["input_ids"]) == 10 * BS
         assert e0["output_length"] == 100
         assert len(e0["output_ids"]) == 100
+        # Session metadata for the dynamic-completion-feedback scheduler.
+        for e in entries:
+            assert e["session"] == f"{e['trace_idx']}:main"
+            assert e["stream_id"] == "main"
+            assert isinstance(e["round_idx"], int)
+            assert e["recorded_finish"] >= e["timestamp"]
+        for rd in plan.rounds:
+            assert abs(rd.recorded_finish - (rd.timestamp + rd.api_time)) < 1e-9
 
 
 def main():

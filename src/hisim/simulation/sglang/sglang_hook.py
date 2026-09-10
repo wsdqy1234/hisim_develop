@@ -1121,6 +1121,18 @@ class C_SchedulerHook(BaseHook):
         tuple[float, int, RequestStats]
     ] = []  # tuple(created time, salt, request)
 
+    # --- Dynamic completion feedback (session-aware replay) ---
+    # Active only for requests carrying `session` metadata in their simulation
+    # params (e.g. weka_trace rounds). The next round of a session is released
+    # at max(static time, previous round's actual finish + recorded gap).
+    # session -> {"round_idx", "recorded_finish", "finished", "finish_vtime"}
+    SESSION_STATE: dict = {}
+    # session -> [(enqueue_time, salt, req)] rounds whose static time arrived
+    # but whose session predecessor has not finished yet
+    PARKED: dict = {}
+    # rid -> session, populated when a session-aware request is released
+    REQ_SESSION: dict = {}
+
     # L2/L3 cache hit statistics
     _L3_HIT_STATS: dict = {}  # tier_name -> total hit blocks
     _L3_QUERY_COUNT: int = 0  # total batch_exists calls
@@ -1260,11 +1272,51 @@ class C_SchedulerHook(BaseHook):
                     C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST
                     and len(C_SchedulerHook.FUTURE_QUEUE) > 0
                 ):
-                    enqueue_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
+                    enqueue_time, salt, req = C_SchedulerHook.FUTURE_QUEUE[0]
                     if enqueue_time > current_timestamp:
                         break
-                    recv_reqs.append(req)
                     heapq.heappop(C_SchedulerHook.FUTURE_QUEUE)
+
+                    # Dynamic completion feedback: a round whose session
+                    # predecessor is still in flight is parked (not blocking
+                    # other sessions); a finished predecessor may shift the
+                    # release time by the accumulated virtual delay.
+                    sim_args = (
+                        req.sampling_params.custom_params.get("simulation")
+                        if req.sampling_params.custom_params is not None
+                        else None
+                    )
+                    session = sim_args.get("session") if sim_args else None
+                    if session is not None:
+                        st = C_SchedulerHook.SESSION_STATE.get(session)
+                        if st is not None and not st["finished"]:
+                            # Previous round of this session still in flight.
+                            C_SchedulerHook.PARKED.setdefault(
+                                session, []
+                            ).append((enqueue_time, salt, req))
+                            continue
+                        if st is not None and st["finished"]:
+                            # Shift by the virtual delay of the predecessor:
+                            # release = static + max(0, actual - recorded).
+                            shift = max(
+                                0.0,
+                                st["finish_vtime"] - st["recorded_finish"],
+                            )
+                            if shift > 0 and enqueue_time + shift > current_timestamp:
+                                heapq.heappush(
+                                    C_SchedulerHook.FUTURE_QUEUE,
+                                    (enqueue_time + shift, salt, req),
+                                )
+                                continue
+                        C_SchedulerHook.SESSION_STATE[session] = {
+                            "round_idx": sim_args.get("round_idx"),
+                            "recorded_finish": sim_args.get(
+                                "recorded_finish", enqueue_time
+                            ),
+                            "finished": False,
+                            "finish_vtime": 0.0,
+                        }
+                    recv_reqs.append(req)
 
             now = time.time()
             for req in recv_reqs:
@@ -1295,6 +1347,12 @@ class C_SchedulerHook(BaseHook):
                         if queue_start is not None:
                             StateManager.set_global_clock(queue_start)
                         req_stats.queue_start = StateManager.get_global_clock()
+                        # Register the session for the completion-event hook
+                        # (dynamic completion feedback).
+                        if simulation_args.get("session") is not None:
+                            C_SchedulerHook.REQ_SESSION[req.rid] = (
+                                simulation_args["session"]
+                            )
 
             if recv_reqs and C_SchedulerHook.LAST_CPU_TS == 0:
                 C_SchedulerHook.LAST_CPU_TS = time.time()
@@ -1348,6 +1406,29 @@ class C_SchedulerHook(BaseHook):
                 ):
                     next_created_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
                     StateManager.set_global_clock(next_created_time + 1e-6)
+                elif (
+                    C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE
+                    and len(C_SchedulerHook.FUTURE_QUEUE) == 0
+                    and len(C_SchedulerHook.PARKED) != 0
+                    and len(self.running_batch.reqs) == 0
+                    and len(self.waiting_queue) == 0
+                ):
+                    # Defensive: everything left is parked but nothing is
+                    # running (e.g. a finish event was missed). Force-release
+                    # the earliest parked round to avoid a deadlock.
+                    session = min(
+                        C_SchedulerHook.PARKED,
+                        key=lambda s: C_SchedulerHook.PARKED[s][0][0],
+                    )
+                    enqueue_time, salt, req = C_SchedulerHook.PARKED.pop(session)[0]
+                    logger.warning(
+                        f"Dynamic feedback: force-releasing parked round of "
+                        f"session {session} (no running request)."
+                    )
+                    StateManager.set_global_clock(enqueue_time + 1e-6)
+                    heapq.heappush(
+                        C_SchedulerHook.FUTURE_QUEUE, (enqueue_time, salt, req)
+                    )
             logger.debug(
                 f"Get new batch prefill: global iteration={StateManager.get_iteration()}, "
                 f"new batch={new_batch.batch_size() if new_batch is not None else 0}, "
@@ -1479,6 +1560,35 @@ class C_SchedulerHook(BaseHook):
                     else:
                         # Chunked request: nothing to do
                         pass
+                # Dynamic completion feedback: when a session round finishes,
+                # release its parked successor rounds with the accumulated
+                # virtual delay (actual finish - recorded finish) applied.
+                if C_SchedulerHook.SESSION_STATE:
+                    for req in batch.reqs:
+                        finished = getattr(req, "finished", False) or getattr(
+                            req, "finished_status", None
+                        )
+                        if not finished:
+                            continue
+                        session = C_SchedulerHook.REQ_SESSION.get(req.rid)
+                        if session is None:
+                            continue
+                        st = C_SchedulerHook.SESSION_STATE.get(session)
+                        if st is None or st["finished"]:
+                            continue
+                        st["finished"] = True
+                        st["finish_vtime"] = request_response_time
+                        parked = C_SchedulerHook.PARKED.pop(session, [])
+                        if parked:
+                            shift = max(
+                                0.0,
+                                st["finish_vtime"] - st["recorded_finish"],
+                            )
+                            for enqueue_time, salt, preq in parked:
+                                heapq.heappush(
+                                    C_SchedulerHook.FUTURE_QUEUE,
+                                    (enqueue_time + shift, salt, preq),
+                                )
                 # Iteration statistics
                 C_SchedulerHook.ITERATION_STATS.append(
                     {
@@ -1584,6 +1694,9 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook._L3_PREFETCHED_TOKENS = 0
             C_SchedulerHook._L2_HIT_TOKENS = 0
             C_SchedulerHook._L2_HIT_COUNT = 0
+            C_SchedulerHook.SESSION_STATE.clear()
+            C_SchedulerHook.PARKED.clear()
+            C_SchedulerHook.REQ_SESSION.clear()
 
             ProfileReqOutput = getattr(
                 importlib.import_module("sglang.srt.managers.io_struct"),

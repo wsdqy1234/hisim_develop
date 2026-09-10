@@ -33,6 +33,7 @@ class WekaTraceDataset(BaseDataset):
             trace_start_interval=args.trace_start_interval,
             max_rounds_per_trace=args.max_rounds_per_trace,
             max_round_tokens=args.max_round_tokens,
+            include_subagents=args.include_subagents,
         )
         logger.info(
             f"WekaTraceDataset: {self.plan.num_traces} traces, "
@@ -60,6 +61,12 @@ class WekaTraceDataset(BaseDataset):
             output_length=rd.output_length,
             custom_params={
                 "created_time": rd.timestamp,
-                "rid": f"weka-{rd.trace_idx}-{rd.round_idx}",
+                "rid": f"weka-{rd.trace_idx}-{rd.stream_id}-{rd.round_idx}",
+                # Session metadata for the dynamic-completion-feedback
+                # scheduler (sglang_hook): rounds of the same session must
+                # wait for max(static time, previous round's actual finish).
+                "session": f"{rd.trace_idx}:{rd.stream_id}",
+                "round_idx": rd.round_idx,
+                "recorded_finish": rd.recorded_finish,
             },
         )
