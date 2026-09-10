@@ -1214,3 +1214,36 @@ analyzer 不受影响（逐请求顺序处理，隐含"等完成"语义）；his
 - pytest：17 passed / 1 skipped；`test_dataset`（需 HF 网络）、`test_aic_xgb_predictor`（Abort，aiconfigurator 环境问题）为本机网络/环境限制，非代码回归
 
 **已知说明**：bench_serving HTTP CLI 未接 weka 数据集（用 Python API 或 analyzer CLI）；`num_traces` 取文件前 N 个会话。
+## 2026-09-10 — 分析：hisim 仿真 vs V2 复用率差异根因 + V3 修正验证
+
+**问题**：同为"sglang KV 复用"模型，同负载同容量（L1=65536/L2=131072，24 轮 808,960 tokens）下 hisim 仿真（0519）L1/L2/L3/New = 44.07/30.52/0.02/25.40%，V2 = 43.43/12.53/6.37/37.67%——L2 差 18pp、New 差 12pp。逐请求 diff + 代码对照 + 仿真内窥（临时日志）定位根因。
+
+### 一、V2 偏离真实 sglang 的实现缺陷（主因，工具测得）
+
+1. **split 锁泄漏**：`_split` 把 `lock_ref` 复制到两个节点，pending-ACK/匹配路径锁被滞留 → `_evict_l1` 收集到 0 个可驱逐叶子（实测 evictable_leaves=0）→ **L1 静默溢出**（最高 126435/65536）→ 破坏"非驱逐节点构成根前缀"不变量：出现 [被驱逐祖先][L1 叶子] 状态（tr1 的 chunk1-3 被驱逐、带泄漏锁的 out_r2 叶子留在 L1）。
+2. **插入不再物化**：sglang 0.5.6 `_insert_helper` 对匹配到的已驱逐节点恢复 device 值（churn cycle）；V2 只按键穿越 → 新节点挂在已驱逐父下，加剧 1。
+3. **host 命中只算匹配路径"连续被驱逐后缀"**（此逻辑与 sglang 一致：`while last_node.evicted: host_hit_length += len(host_value)`），但 1+2 的不变量破坏使大段 host 命中落入 New（#11 丢失 46144）→ V2 New=37.67%。
+4. **备份时机**：sglang chunked 插入（`cache_unfinished_req(chunked=True)`）跳过 `_inc_hit_count`，备份只在 `cache_finished_req`（write_through 阈值 1）；V2 在插入期就备份 → L2 提前填满，驱逐拿了链头节点（tr1.r0 于 #12 被逐）→ 后续轮总匹配崩溃（#11: 391 vs 仿真 46144；#14: 4864 vs 50880）。
+5. **output 处理**：V2 插 weka 真实 output_ids（能多匹配每轮十几~几百 token 的 output 段）；hisim 仿真的 mock 采样输出全 1 → 下一轮在 output 段断链。这是 V2 唯一高于仿真的点。
+
+### 二、hisim 仿真侧机制（决定 L2/L3 形态，实测确认）
+
+- **host 驱逐仅由 prefetch buffer 分配失败触发**（`write_backup` 从未失败：buffer 在请求调度时已释放，先于自身备份）；驱逐从叶子端剥离（全程仅 5 次失败事件、~89K tokens），链主体存活 → L2 命中高。
+- **L3 命中在 weka 负载下结构性趋零**：prefetch 目标 = `input[L1命中+host命中:]` = 上轮 output+工具结果——从未以匹配哈希链写入存储（存储里是全 1 output 链，第一个 token 即分叉）；只有 host 驱逐造成的树断点才可能命中。
+- **0.5.19 时序门控再压一层**（Step 2 chunked prefetch gate）：mock 计算瞬时 → 每轮推理预算内 SSD 读进度≈0 → 存储命中也读不回（#24 仅 128 tokens）。
+- 版本差异：sim056（HIRadixCache）L2=36.18%/L3=1.61%（0.5.6 预分配 buffer + #24 有 L2/L3 重叠计数伪影 new=-7104）；sim0519（UnifiedRadixCache，惰性分配）30.52%/0.02%。
+
+### 三、V3 修正与验证（本次改动，V2 按约定不动）
+
+V3 原把 prefetch buffer 记为跨请求占用的 L2（下一请求才释放），使其与本请求 Phase 3 备份叠加、过度驱逐 host（#11 错把 tr1 chunk2/3 计为 L3）。修正为与仿真一致：**接收时按需驱逐分配、L3 查询后立即释放（先于备份）**：
+
+| 层级 | V3(修正后) | sim0519 | 逐请求 L1/L2 |
+|---|---|---|---|
+| L1 | 356,480 (44.07%) | 356,479 (44.07%) | **全部 24 请求一致** |
+| L2 | 246,912 (30.52%) | 246,912 (30.52%) | **全部 24 请求完全相等** |
+| L3 | 18,240 (2.25%) | 128 (0.02%) | 差值=时序门控压制的结构潜力 |
+| New | 187,328 (23.16%) | 205,441 (25.40%) | 差值=L3 差 |
+
+结论：V3（HiSim 感知模型）修正后与 hisim 仿真的缓存结构行为**逐 token 对齐**；剩余 L3 差异是仿真的时序效应（瞬时计算下 SSD 读不完），属结构模型不覆盖的时间维度，非缓存语义差异。V2 保持原样作为"理论 sglang"参考，其与真实 sglang 的偏差（锁泄漏/无再物化/插入期备份）已记录在案。
+
+**调试方法备注**：venv sglang hiradix_cache.py 加 HISIM_DEBUG_HOST_EVICT 临时日志（已还原）；V2 侧用 /tmp 副本插桩（仓库 V2 未动）。

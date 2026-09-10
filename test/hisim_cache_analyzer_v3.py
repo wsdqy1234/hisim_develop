@@ -11,7 +11,11 @@ V3 extends v2 (sglang radix tree) with HiSim-specific KV reuse logic:
 - Output leaf flow: insert output tokens (all 1s, like HiSim mock)
 - L3 conditional on backup success (hashes written during ACK)
 - L3 only queried through prefetch_from_storage (not direct hash lookup)
-- Prefetch buffer: allocates L2 for full remaining input (not tree node)
+- Prefetch buffer: L2 allocated for the full remaining input at receipt
+  (evicting host LRU leaves if short — the evictions stick), but released
+  when the request is scheduled — BEFORE its own cache_finished_req backups,
+  so it never overlaps Phase 3 backup pressure (verified against the hisim
+  sglang simulation: per-request L1/L2 match exactly)
 - Delayed L3 hash write: written during ACK (write_backup_storage)
 """
 
@@ -59,7 +63,6 @@ class RadixTreeCache:
         self._tc = 0
         self.pending_acks = []   # nodes backed up, waiting ACK (write_through lock)
         self.pending_l3 = {}    # node_id → (prev_hash, hash_vals) for delayed L3 write
-        self.prefetch_occupied = 0  # in-flight prefetch L2 (freed when prefetch completes)
     def _t(self):
         self._tc += 1; return float(self._tc)
     def _hashes(self, tokens, start=None):
@@ -288,9 +291,6 @@ class RadixTreeCache:
         4. cache_unfinished_req (insert remaining tokens, chunked=True, no backup)
         5. cache_finished_req (insert output, backup path nodes, unlock)
         """
-        # Free prefetch buffer from previous request (prefetch completed, L2 freed)
-        self.l2_used -= self.prefetch_occupied
-        self.prefetch_occupied = 0
         # Process ACKs from previous request
         self._process_acks()
 
@@ -310,8 +310,7 @@ class RadixTreeCache:
         l3 = 0
         pf_cap = int(0.8 * max(0, self.l2_cap - self.l1_cap))
         pf_len = len(rem) if rem else 0
-        prefetch_enabled = (rem and len(rem) >= 256 and
-                           self.prefetch_occupied + pf_len <= pf_cap)
+        prefetch_enabled = (rem and len(rem) >= 256 and pf_len <= pf_cap)
         if prefetch_enabled:
             # L3 query (only when prefetch would run)
             start_node = last
@@ -327,11 +326,14 @@ class RadixTreeCache:
                     edge_prev = h
                 else:
                     break
-            # Prefetch buffer: allocate L2 for full remaining input length.
-            # NOT a tree node — evict_host can't reclaim. Freed next request.
-            if self._evict_l2(pf_len):
-                self.l2_used += pf_len
-                self.prefetch_occupied += pf_len
+            # Prefetch buffer: sglang allocates L2 for the full remaining
+            # input at request receipt, EVICTING host LRU leaves if the pool
+            # is short (evictions are permanent), but the buffer itself is
+            # released when the request is scheduled/finishes — BEFORE the
+            # request's own cache_finished_req backups. Model exactly that:
+            # evict-if-needed for the buffer now, then free it immediately so
+            # it never overlaps with Phase 3's backup pressure.
+            self._evict_l2(pf_len)
         # Phase 1: Prefill — insert remaining input tokens (cache_unfinished_req)
         parent = last
         if rem:
