@@ -1354,3 +1354,17 @@ analyzer 不受影响（逐请求顺序处理，隐含"等完成"语义）；his
 - `src/hisim/simulation/manager/env.py` + `sglang_mock_class.py` — 持久化选开、kvcm 后端
 - `3rdparty/kvcm_l3/.../py_optimizer_binding.cc` — GIL 段错误修复
 - 测试配置：`/tmp/opencode/config_slowdisk.json`（慢盘 chunked）、`config_tiers_ssd.json`（多 tier+SSD）、`config_direct.json`（direct-to-L1）、`/tmp/opencode/l2load_dataset.jsonl`（12-token 共享前缀，构造 L2 命中；注意 token id 必须在 mock tokenizer 词表内 ~207，否则 bench 侧截断）
+
+## 2026-09-10 — develop_lfz rebase 到 develop_lfz_0.5.19 + weka_trace 在 0.5.19 联调
+
+将 develop_lfz 的 weka_trace loader/动态反馈/联调修复（d34f6fa..a55f2d1，4 个 commit）rebase 到 develop_lfz_0.5.19（原 7 个 0.5.19 适配 commit 重放其上），冲突解决：
+
+1. **sglang_hook.py `wrapped_profile`**：0.5.19 分支已把 dump 主体抽为 `C_SchedulerHook.dump_profile_results()`（legacy 路径与 SchedulerProfilerManager 共用），采用该重构，并把 weka 的 SESSION_STATE/PARKED/REQ_SESSION 清理补进该方法（原重构基于 weka 改动之前）
+2. **Cache state 日志**：采用 develop_lfz 的 getattr 全防护版本（`n_host_leaves` 默认 0）
+3. **history.md**：两侧条目均保留
+
+**0.5.19 新发现问题与修复**：`start_profile(profile_prefix="reset")` 在 0.5.19 报 TypeError（>=0.5.10 的 start_profile 收 ProfileReq 对象而非 kwargs）→ `sglang_bench.py` 以 `inspect.signature` 判别，旧版走 kwargs、新版走 `start_profile()`（`profile_prefix` 本就只影响 sglang profiler 命名，hisim hook 不消费，可安全省略）
+
+**验证**（system python + sglang 0.5.19，与 0.5.6 同一 weka 数据集/配置对照）：
+- 12/12 轮完成，L1 复用 79.1%（与 0.5.6 完全一致），L2 命中 23.1%（0.5.6 为 30.7%，host_hit_length 统计口径差异），动态反馈开/关一致，全程 0 异常
+- 0.5.19 时序管线（storage/L3/L2 stats）在 rebase 后完整保留

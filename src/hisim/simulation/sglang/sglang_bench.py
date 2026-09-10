@@ -1,5 +1,6 @@
 from dataclasses import asdict
 import asyncio
+import inspect
 import json
 import os
 from typing import Iterator, Optional
@@ -74,6 +75,15 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
         self.engine = Engine(**asdict(server_args))
 
         self._tokenizer: AutoTokenizer = None
+
+    async def _start_reset_profile(self):
+        # sglang <= 0.5.9 accepts `profile_prefix`; >= 0.5.10 takes a
+        # ProfileReq object instead of kwargs.
+        tm = self.engine.tokenizer_manager
+        if "profile_prefix" in inspect.signature(tm.start_profile).parameters:
+            await tm.start_profile(profile_prefix="reset")
+        else:
+            await tm.start_profile()
 
     def _ensure_handle_loop(self):
         # TokenizerManager.handle_loop is created lazily by the first generate
@@ -157,7 +167,7 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
                 tokenizer=self._tokenizer,
             )
 
-        await self.engine.tokenizer_manager.start_profile(profile_prefix="reset")
+        await self._start_reset_profile()
 
         if os.path.exists(HISIM_METRICS_PATH):
             with open(HISIM_METRICS_PATH, "w") as f:
