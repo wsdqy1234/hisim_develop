@@ -1315,3 +1315,42 @@ analyzer 不受影响（逐请求顺序处理，隐含"等完成"语义）；his
 - `src/hisim/simulation/sglang/sglang_hook.py` — CPU alloc 补丁、start_writing/start_loading mock、线程 no-op 版本分叉、HostPoolGroup 解包
 - `src/hisim/simulation/sglang/sglang_mock_class.py` — v_head_dim、MockHiCacheStorage v2 接口、debug 计数
 - 对照参考：`unified_radix_cache.py`（init_hicache/prefetch_from_storage/check_hicache_events）、`hybrid_cache/hybrid_cache_controller.py`、`pool_host/{group.py,mha.py,common.py}`
+
+---
+
+## 2026-09-09 ~ 09-10 — 0.5.19 时序仿真全面恢复（Step 0-6）
+
+**背景**：上一轮 0.5.19 适配只做到 L2/L3 "功能正确、时序旁路"。本条记录按计划恢复完整时序仿真（时序生产端接回 StateManager/全局时钟），并完成 kvcm/simpyssd 环境与全场景回归。分支 `develop_lfz_0.5.19`，每步独立 commit。
+
+**分步内容与 commit**：
+
+1. **Step 0（fe7d8f6）L3 持久化改选开**：set() 后端默认内存态（跨 bench/重启隔离、可复现），`HISIM_PERSIST_L3_STORAGE=1` 开启温存储模拟，`HISIM_L3_STORAGE_PATH` 可覆盖路径；保留 `HISIM_RESET_HICACHE_STORAGE`。改动 `env.py`（两个类方法）+ `sglang_mock_class.py`（构造/set/clear 三处门控）。单元测试验证默认/开启/重载/清除四态。
+
+2. **Step 1（7d57a04）时序驱动接回**：新增 `C_UnifiedRadixCacheHook`（wrap `check_hicache_events`/`reset`，复刻 0.5.6 四段式驱动：handle_backup_operation → handle_prefetch_operation → submit_l3_write_timing → original；逻辑抽为模块级 `_drive_hicache_timing_phases` 与 HiRadixCache 路径共享）+ `C_HybridCacheControllerHook`（no-op 子类 override 的 `backup_thread_func`，避免与数据相双消费 backup_queue）+ 基类 prefetch/backup 线程 no-op 恢复无条件。保留 `prefetch_io_aux_thread`（host 分配后的 ack/插树载体）。验证：iteration.jsonl 出现非零 l3_backup_latency（~63-token 节点 129-262us，与 8GB/s 写带宽手算吻合）。
+
+3. **Step 2（64245f2）prefetch 读时序门控**：0.5.19 分支重构——查 `batch_exists` 后不再立即放行，按 `calc_prefetch_pages`（带宽/SSD/多 tier）+ 本轮推理预算做 **chunked 跨轮推进**（进度存 chunked stash 的 `progress` 字段；`operation.completed_tokens` 留给 stock io_aux ack 路径——drain 处有 `completed_tokens <= acked` 断言，占用会崩）；全量"读完"才放行 `prefetch_hit_queue`（host 分配/插树交 stock drain）；同时修复 direct 模式在 0.5.19 误入 legacy 分支的 bug（`operation.host_indices` 未分配时解引用）。慢盘（0.001GB/s）+ 持久化 keys 冷启动验证：13 hit tokens 跨多轮推进，TTFT 0.45ms → 321ms 真实体现读时延，下轮 L2 命中 4/14、TTFT 回落 0.45ms。
+
+4. **Step 3（c7dfa62）L2 传输时序注入**：0.5.19 下真实 host pool 顶替了 MockTokenToKVPoolHost（其 load/backup 时序记账失效），改为在 `mock_start_writing`（D2H：t0=4us + bytes/(mem_write_bw×0.85) → inc_l2_backup_dur）和 `mock_start_loading`（H2D：t0=6.67us + bytes/(mem_read_bw×0.85) → inc_l2_load_dur；**direct 拆分**：L3 直读 token 按 l3_to_l1_bandwidth 计 → inc_l3_direct_load_dur，消费端 max() 并发语义已就位）记账，带宽模型照搬 `est_bandwidth_batch`（0.85 有效系数 + 固定延迟），抽为模块级 `_l2_transfer_duration`/`_record_l2_backup_timing`/`_record_l2_load_timing`。单元断言全部通过（D2H/H2D 数学、direct 拆分与 StateManager 记账）。
+
+5. **Step 4（随 Step 1 验证）L3 写时序**：`submit_l3_write_timing` 由驱动点按轮调用，非零时延进 iteration.jsonl ✓。
+
+6. **Step 5 环境补齐 + kvcm GIL 段错误修复**：
+   - `pip install -e 3rdparty/simpyssd` ✓。
+   - kvcm wheel 构建安装后 **GetCacheLocation 必崩（SIGSEGV）**（空树单 key 最小复现；WriteCache 偶发崩）。gdb 栈显示 `_native.so` 内在无 GIL 状态调 `PyErr_Occurred`——pybind `py::call_guard<py::gil_scoped_release>()` 与 C++ 异常翻译（LogAndThrowReplayError 路径）冲突。**修复**：`py_optimizer_binding.cc` 去掉全部 8 处 call_guard（模拟器单线程串行调用，释放 GIL 无收益），重编 wheel 后 20/20 write+get 命中、空树查询/清除后查询均正常。**binding 文件在 git 跟踪内，本次 commit；重装环境务必用修复后的源码构建**。
+   - ⚠️ 注意：venv（0.5.6）`--system-site-packages` 会继承系统的 kvcm/simpyssd——0.5.6 回归现在也默认走 kvcm 后端（本次顺带验证 0.5.6+kvcm 组合正常：batch_set=3/exists=5、L2 hit 4/14、请求级 L1/L2 拆分）。要回退 set() 后端需卸载系统 kvcm。
+
+7. **Step 6 回归矩阵**（全部通过，无异常无段错误）：
+   - 0.5.19：L1 基线（4/4，TTFT 0.44ms）｜L2+L3-kvcm（2 轮 4/4，batch_set=8/exists=4，L2 hit 4/14）｜多 tier+SSD sim（2 个 SSDTimingSimulator 启用、kvcm storages 按 HiSim tiers 覆盖，4/4×2）｜direct-to-L1 config（4/4×2，时序拆分单测验证）｜慢盘 chunked（TTFT 321ms 体现）｜持久化开（跨重启 hits=13）/关（默认内存态）。
+   - 0.5.6 venv：L2+L3（kvcm 后端，2 轮 4/4、L3 写/查、L2 hit 4/14、请求级 L2 拆分）；无 hook 失败告警。
+
+**遗留与注意事项**：
+- ⚠️ **L2 load 时序的端到端 iteration.jsonl 记录**需要 host hit ≥ load_back_threshold（10 tokens，0.5.6/0.5.19 同值）的 load_back——小测试集只产生 1-token 碎片命中；真实大前缀 trace（0.5.6 L2 测试同条件）才能触发。函数挂点与数学已验证（`ready_to_load_host_cache → start_loading` 必经、单元断言通过）。
+- ⚠️ iteration.jsonl 的 dump 发生在**下一轮 bench 开始**（start_profile 触发 dump+clear），看第 N 轮数据要跑第 N+1 轮；bench 结束后空闲轮的时序 inc 会被 profile 边界的 StateManager.reset 清掉（小数据集边界效应）。
+- ⚠️ kvcm 后端内存态，跨重启 L3 命中需 set() 后端 + 持久化开关。
+- 时序管线（含 SSD submit_read/write、多 tier 串并行）在 0.5.19 的驱动结构与 0.5.6 完全一致（同一组 handle_* 函数），差异仅在挂载类（UnifiedRadixCache vs HiRadixCache）与 chunked stash 的 progress 字段。
+
+**关键文件**：
+- `src/hisim/simulation/sglang/sglang_hook.py` — 共享驱动、chunked 门控、L2 时序注入、mock start_writing/loading
+- `src/hisim/simulation/manager/env.py` + `sglang_mock_class.py` — 持久化选开、kvcm 后端
+- `3rdparty/kvcm_l3/.../py_optimizer_binding.cc` — GIL 段错误修复
+- 测试配置：`/tmp/opencode/config_slowdisk.json`（慢盘 chunked）、`config_tiers_ssd.json`（多 tier+SSD）、`config_direct.json`（direct-to-L1）、`/tmp/opencode/l2load_dataset.jsonl`（12-token 共享前缀，构造 L2 命中；注意 token id 必须在 mock tokenizer 词表内 ~207，否则 bench 侧截断）

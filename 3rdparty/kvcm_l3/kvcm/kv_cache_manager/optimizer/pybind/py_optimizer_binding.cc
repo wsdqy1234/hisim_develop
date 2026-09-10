@@ -122,16 +122,14 @@ PYBIND11_MODULE(_native, module) {
              py::arg("enable_template_analysis") = false,
              "Initialize OptimizerManager. Set enable_lifecycle_tracking=True to track block lifecycle (uses ~10GB "
              "more memory). Set enable_template_analysis=True to enable template prefix analysis (slower replay)")
-        .def("Init", &kvcm::OptimizerManager::Init, py::call_guard<py::gil_scoped_release>())
-        .def("DirectRun", &kvcm::OptimizerManager::DirectRun, py::call_guard<py::gil_scoped_release>())
+        .def("Init", &kvcm::OptimizerManager::Init)
+        .def("DirectRun", &kvcm::OptimizerManager::DirectRun)
         .def("AnalyzeResults",
              &kvcm::OptimizerManager::AnalyzeResults,
-             py::call_guard<py::gil_scoped_release>(),
              "Finalize, export and reset all registered trackers")
-        .def("ExportRadixTrees", &kvcm::OptimizerManager::ExportRadixTrees, py::call_guard<py::gil_scoped_release>())
+        .def("ExportRadixTrees", &kvcm::OptimizerManager::ExportRadixTrees)
         .def("WriteCache",
              &kvcm::OptimizerManager::WriteCache,
-             py::call_guard<py::gil_scoped_release>(),
              py::arg("instance_id"),
              py::arg("trace_id"),
              py::arg("timestamp"),
@@ -156,7 +154,6 @@ PYBIND11_MODULE(_native, module) {
                 }
                 return self.GetCacheLocation(instance_id, trace_id, timestamp, block_ids, block_mask, input_len);
             },
-            py::call_guard<py::gil_scoped_release>(),
             py::arg("instance_id"),
             py::arg("trace_id"),
             py::arg("timestamp"),
@@ -165,21 +162,17 @@ PYBIND11_MODULE(_native, module) {
             py::arg("input_len"))
         .def("ClearCache",
              &kvcm::OptimizerManager::ClearCache,
-             py::call_guard<py::gil_scoped_release>(),
              py::arg("instance_id"),
              "Clear cache for a specific instance without resetting statistics")
         .def("ClearAllCaches",
              &kvcm::OptimizerManager::ClearAllCaches,
-             py::call_guard<py::gil_scoped_release>(),
              "Clear caches for all instances without resetting statistics")
         .def("ClearCacheAndResetStats",
              &kvcm::OptimizerManager::ClearCacheAndResetStats,
-             py::call_guard<py::gil_scoped_release>(),
              py::arg("instance_id"),
              "Clear cache and reset statistics for a specific instance")
         .def("ClearAllCachesAndResetStats",
              &kvcm::OptimizerManager::ClearAllCachesAndResetStats,
-             py::call_guard<py::gil_scoped_release>(),
              "Clear caches and reset statistics for all instances");
 
 } // namespace kv_cache_manager
