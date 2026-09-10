@@ -23,6 +23,7 @@ dataset_registry: dict[str, BaseDataset] = {
     "sample_sharegpt": ShareGPTDataset,
     "identical_ids": IdenticalIDsDataset,
     "hisim_collection": HisimCollectionDataset,
+    "weka_trace": WekaTraceDataset,
 }
 
 

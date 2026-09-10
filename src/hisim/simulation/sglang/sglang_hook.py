@@ -101,8 +101,11 @@ class C_ModelRunnerHook(BaseHook):
 
             # Attributes that may not be set by the hook but are expected by sglang
             self.use_ngram_embedding = False
-            self.is_hybrid_swa = False
+            # None matches the non-SWA semantics of sglang 0.5.6-0.5.9, where
+            # `is_hybrid_swa is not None` is used as the hybrid-SWA check.
+            self.is_hybrid_swa = None
             self.is_draft_worker = False
+            self.sliding_window_size = None
 
             self.dtype = self.model_config.dtype
             self.kv_cache_dtype = (
@@ -1383,6 +1386,8 @@ class C_SchedulerHook(BaseHook):
                         C_SchedulerHook._L2_HIT_COUNT += 1
                     # Log cache state per prefill batch (L1/L2 pool sizes)
                     tc = getattr(self, 'tree_cache', None)
+                    l1_evict = l1_total = l2_avail = owt = olb = -1
+                    n_host_leaves = 0
                     if tc is not None and hasattr(tc, 'evictable_size_'):
                         cc = getattr(tc, 'cache_controller', None)
                         l2_avail = cc.mem_pool_host.available_size() if cc and hasattr(cc, 'mem_pool_host') else -1
@@ -1390,9 +1395,11 @@ class C_SchedulerHook(BaseHook):
                         l1_total = tc.token_to_kv_pool_allocator.available_size() + l1_evict if hasattr(tc, 'token_to_kv_pool_allocator') else -1
                         owt = len(getattr(tc, 'ongoing_write_through', {}))
                         olb = len(getattr(tc, 'ongoing_load_back', {}))
+                        # HIRadixCache only (absent on a plain RadixCache)
+                        n_host_leaves = len(getattr(tc, 'evictable_host_leaves', {}))
                     logger.info(
                         f"Cache state: L1_evict={l1_evict} L1_total={l1_total} "
-                        f"L2_avail={l2_avail} L2_host_leaves={len(tc.evictable_host_leaves)} "
+                        f"L2_avail={l2_avail} L2_host_leaves={n_host_leaves} "
                         f"owt={owt} olb={olb}"
                     )
             elif len(self.running_batch.reqs) == 0 and len(self.waiting_queue) > 0:

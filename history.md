@@ -1197,3 +1197,20 @@ analyzer 不受影响（逐请求顺序处理，隐含"等完成"语义）；his
 - `test/test_weka_trace_loader.py`：14/14 通过（新增 4 个 subagent 用例 + 会话元数据断言）
 - `README.md`/`README_zh.md`：补 `include_subagents`、动态完成时间反馈说明、`--include-subagents` 示例及实测数据
 
+
+## 2026-09-10 — weka_trace 仿真联调修复（develop_lfz，sglang 0.5.6.post2）
+
+用 cc-traces-weka-062126 真实 trace（/home/lfz/data/cc-traces-weka-062126/traces.jsonl，393 会话）端到端验证 weka_trace 数据集 + SGLangBenchmarkRunner 仿真链路，发现并修复 5 个问题：
+
+1. **WekaTraceDataset 未注册**：`dataset/__init__.py` 只 import 未加进 `dataset_registry`，`get_dataset("weka_trace")` 报 unknown dataset name → 补注册
+2. **transformers 5.x 兼容**：`base_dataset.py` 从 `transformers.tokenization_utils` import `PreTrainedTokenizerBase`（5.x 已移除该导出）→ 改从顶层 `transformers` import（4.x/5.x 均稳定）
+3. **is_hybrid_swa=False 破坏 0.5.6**：`override_initialize` 里 `is_hybrid_swa=False` 使 `tp_worker.is_hybrid_swa`（`is not None` 语义）恒为 True，调度器读 `sliding_window_size` 直接 AttributeError → 与 develop_lfz_0.5.19 对齐：`is_hybrid_swa=None` + 防御性 `sliding_window_size=None`
+4. **flush_cache 死锁**：进程内 Engine 的 `flush_cache()`/`clear_hicache_storage()` 依赖 TokenizerManager.handle_loop 分发应答，而 handle_loop 由第一个 generate_request 惰性创建；首次 benchmark 前调用直接死锁 → `sglang_bench.py` 增加 `_ensure_handle_loop()`（在 engine loop 上先建 handle_loop）；`reset_storage_cache` 改走 `tokenizer_manager.clear_hicache_storage()`（`Engine.clear_hicache_storage` 为新版 API）
+5. **非层级缓存崩溃**：`wrapped_get_new_batch_prefill` 的 Cache state 日志直接访问 `tc.evictable_host_leaves`（仅 HIRadixCache 有），关闭 --enable-hierarchical-cache 时 AttributeError（1d9eedb 引入，getattr 防护遗漏）→ 全部字段加默认值与 getattr 防护
+
+**验证**（venv 0.5.6.post2 + mock model，max_position_embeddings 调至 262144 匹配 256k 数据集）：
+- loader 单测 14/14；真实 trace 加载正常（4 traces/40 rounds）
+- weka 端到端仿真（2 traces×6 rounds，并发 2，round ≤64K tokens，L1=64K L2=2x + L3 file 后端）：12 轮全部完成，L1 复用 79.1%，L2 命中 30.7%（L1 驱逐后回灌），动态完成反馈开/关结果一致（mock 即时计算下预期相同），无死锁无崩溃
+- pytest：17 passed / 1 skipped；`test_dataset`（需 HF 网络）、`test_aic_xgb_predictor`（Abort，aiconfigurator 环境问题）为本机网络/环境限制，非代码回归
+
+**已知说明**：bench_serving HTTP CLI 未接 weka 数据集（用 Python API 或 analyzer CLI）；`num_traces` 取文件前 N 个会话。

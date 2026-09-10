@@ -72,11 +72,32 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
 
         self._tokenizer: AutoTokenizer = None
 
+    def _ensure_handle_loop(self):
+        # TokenizerManager.handle_loop is created lazily by the first generate
+        # request. Direct communicator calls below (flush_cache,
+        # clear_hicache_storage) wait for the scheduler response to be
+        # dispatched by that loop, so create it on the engine loop first or
+        # they deadlock when called before the first benchmark.
+        tm = self.engine.tokenizer_manager
+        if getattr(tm, "_chosen_loop", None) is not None:
+            return
+
+        async def _create():
+            tm.auto_create_handle_loop()
+
+        self.engine.loop.run_until_complete(_create())
+
     def flush_cache(self):
+        self._ensure_handle_loop()
         self.engine.flush_cache()
 
     def reset_storage_cache(self):
-        self.engine.clear_hicache_storage()
+        # `Engine.clear_hicache_storage` only exists on newer sglang; the
+        # tokenizer-manager communicator is available on all versions.
+        self._ensure_handle_loop()
+        self.engine.loop.run_until_complete(
+            self.engine.tokenizer_manager.clear_hicache_storage()
+        )
 
     def get_request(
         self,
