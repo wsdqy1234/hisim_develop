@@ -218,6 +218,10 @@ class ModelInfo:
     def from_dict(cls, config: Dict, save_to_registry=False):
         if config.get("model_type") == "kimi_k3":
             text_config = config.get("text_config", {})
+            # text_config may be a config object (e.g. KimiLinearConfig), convert to dict
+            if not isinstance(text_config, dict):
+                text_config = vars(text_config) if hasattr(text_config, "__dict__") else {}
+                config["text_config"] = text_config
             for k, v in text_config.items():
                 if k not in config:
                     config[k] = v
@@ -256,7 +260,13 @@ class ModelInfo:
                 model_config["n_shared_experts"] = 1
         elif config.get("model_type") == "kimi_k3":
             text_config = config.get("text_config", {})
+            # text_config may be a config object (e.g. KimiLinearConfig), convert to dict
+            if not isinstance(text_config, dict):
+                text_config = vars(text_config) if hasattr(text_config, "__dict__") else {}
             linear_config = text_config.get("linear_attn_config", {})
+            # linear_attn_config may also be a config object
+            if not isinstance(linear_config, dict):
+                linear_config = vars(linear_config) if hasattr(linear_config, "__dict__") else {}
             full_attn_layers = linear_config.get("full_attn_layers", [])
             kda_layers = linear_config.get("kda_layers", [])
             model_config["num_full_attention"] = len(full_attn_layers)

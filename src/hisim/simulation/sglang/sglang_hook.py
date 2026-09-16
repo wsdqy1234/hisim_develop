@@ -1,5 +1,6 @@
 import torch
 import time
+import math
 from dataclasses import asdict
 from collections import defaultdict
 import json
@@ -30,6 +31,7 @@ from hisim.simulation.sglang.sglang_mock_class import (
     MockTokenToKVPoolAllocator,
     MockPagedTokenToKVPoolAllocator,
     MockTokenToKVPoolHost,
+    MockMambaStatePoolHost,
     MockHiCacheStorage,
 )
 from hisim.simulation.utils import (
@@ -103,6 +105,22 @@ class C_ModelRunnerHook(BaseHook):
             self.use_ngram_embedding = False
             self.is_hybrid_swa = False
             self.is_draft_worker = False
+
+            # K3 is a hybrid MLA+Mamba model. Set mamba2_config to non-None
+            # so sglang's scheduler sets is_hybrid_ssm=True during init,
+            # causing UnifiedRadixCache to include ComponentType.MAMBA in
+            # tree_components (two-pool hierarchical cache: separate L2 host
+            # pools for MLA KV and Mamba/KDA state).
+            self.mamba2_config = True
+            self.hybrid_gdn_config = None
+
+            # ModelRunner-level ngram_embedding_manager. ForwardBatch.init_new
+            # reads model_runner.ngram_embedding_manager.enabled; a None here
+            # raises AttributeError once run_batch actually executes.
+            class _NoopNgramEmbeddingManager:
+                enabled = False
+            self.ngram_embedding_manager = _NoopNgramEmbeddingManager()
+
 
             self.dtype = self.model_config.dtype
             self.kv_cache_dtype = (
@@ -203,6 +221,49 @@ class C_ModelRunnerHook(BaseHook):
             self.graph_mem_usage = 0
             self.weight_load_mem_usage = 10
 
+            # Attributes expected by sglang 0.5.18's post-init code paths
+            # (cuda graph setup, canary, etc.) — HiSim skips real init so these
+            # need to be set to safe defaults
+            self.canary_manager = None
+            self.decode_cuda_graph_runner = None
+            self.prefill_cuda_graph_runner = None
+            self.torch_compile_runner = None
+            self.enable_torch_compile = False
+            self.is_embedding = False
+            self.enable_two_batch_overlap = False
+            self.mtp_layer_sync_manager = None
+            self.remote_instance_transfer_engine = None
+            self.ngram_embedding_manager = None
+            self.encoder_decoder_manager = None
+            self.prefill_aware_swa = False
+            self.mtp_layer_ids = []
+            self.enable_prefill_cp = False
+            self.attn_cp_size = 1
+
+            # Attributes expected by sglang 0.5.18's init_kv_cache_configurator
+            # and other post-init methods (HiSim skips original_initialize, so
+            # we must set these attributes manually)
+            self.kv_cache_dtype_str = (
+                getattr(self.server_args, "kv_cache_data_type", None) or "auto"
+            )
+            self.spec_algorithm = None
+            try:
+                from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+                self.spec_algorithm = SpeculativeAlgorithm.from_string(
+                    getattr(self.server_args, "spec_algorithm", None) or "none"
+                )
+            except Exception:
+                self.spec_algorithm = None
+            self.sliding_window_size = getattr(
+                self.model_config, "sliding_window", None
+            )
+            self.pp_group = None  # no distributed for CPU simulation
+            self.layer_info = type("LayerInfo", (), {
+                "start_layer": self.start_layer,
+                "end_layer": self.end_layer,
+                "num_effective_layers": self.num_effective_layers,
+            })()
+
             self.max_running_requests = min(
                 (
                     self.max_total_num_tokens // 2
@@ -264,6 +325,28 @@ class C_ModelRunnerHook(BaseHook):
 
         target.initialize = override_initialize
         target.forward = _version_dispatcher.get_compat_method("forward")
+
+        # Mock alloc_memory_pool: HiSim already set up mock pools in override_initialize.
+        # The real alloc_memory_pool triggers kv_cache_configurator which needs real GPU/NPU.
+        # Just return the already-set pools as the "result".
+        def override_alloc_memory_pool(self, memory_pool_config=None):
+            from collections import namedtuple
+            PoolResult = namedtuple("PoolResult", [
+                "max_total_num_tokens", "max_running_requests",
+                "req_to_token_pool", "token_to_kv_pool",
+                "token_to_kv_pool_allocator",
+            ])
+            return PoolResult(
+                max_total_num_tokens=self.max_total_num_tokens,
+                max_running_requests=getattr(self, "max_running_requests", 2048),
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool=self.token_to_kv_pool,
+                token_to_kv_pool_allocator=getattr(self, "token_to_kv_pool_allocator", None),
+            )
+        target.alloc_memory_pool = override_alloc_memory_pool
+
+        # Mock init_cuda_graphs: not needed for CPU simulation (forward is mocked)
+        target.init_cuda_graphs = lambda self, *args, **kwargs: None
         target.sample = wrapped_sample
         target.compute_logprobs_only = wrapped_compute_logprobs_only
 
@@ -280,11 +363,13 @@ class C_HiCacheController(BaseHook):
     # KDA/Mamba state pool parameters (lazily initialized)
     MAMBA_SLOT_BYTES: int = None          # per-slot bytes (14.45MB for K3-23L)
     MAMBA_POOL_SIZE: int = None           # max slots in L1 (70 or 165)
-    MAMBA_SLOTS_PER_REQ: int = 5          # slots consumed per request
+    MAMBA_SLOTS_PER_REQ: int = 5          # active slots per request (ping-pong + spec)
+    MAMBA_TRACK_INTERVAL: int = 256      # sglang mamba_track_interval (track every N tokens)
     _kda_pool = None                      # MockMambaStatePool instance
     _kda_host_pool = None                 # MockMambaStatePoolHost instance
     _kda_slots_in_use: int = 0            # track total slots in use
     _kda_l3_pending_writes: list = None   # slot hashes pending L3 write
+    _kda_l3_write_count: int = 0          # snapshot of pending count for L3 timing
     _kda_stats = None
 
     _ssd_simulator = None
@@ -523,6 +608,14 @@ class C_HiCacheController(BaseHook):
             )
             cls.MAMBA_POOL_SIZE = sched.max_mamba_cache_size or 70
             cls.MAMBA_SLOTS_PER_REQ = sched.mamba_slots_per_request
+            # Read mamba_track_interval from sglang server args (default 256)
+            # Used to calculate checkpoint slot count: ceil(seq_len / track_interval)
+            import os as _os
+            _track_interval = _os.environ.get("SGLANG_MAMBA_TRACK_INTERVAL", "256")
+            try:
+                cls.MAMBA_TRACK_INTERVAL = int(_track_interval)
+            except ValueError:
+                cls.MAMBA_TRACK_INTERVAL = 256
 
             # L1 pool (HBM slots)
             cls._kda_pool = MockMambaStatePool(
@@ -551,27 +644,46 @@ class C_HiCacheController(BaseHook):
     @classmethod
     def handle_kda_backup_operation(cls, self):
         """KDA state backup: when L1 MambaPool is full, evict LRU slots to L2.
-        Called from wrapped_check_hicache_events after MLA backup."""
+        Called from wrapped_check_hicache_events after MLA backup.
+
+        Slot count per request = active_slots + ceil(max_seq_len / track_interval).
+        Uses content-addressed hash: hash(req_id + token_offset) for L3 dedup.
+        """
         if cls._kda_pool is None:
             cls._init_kda_pools()
         if not cls._kda_pool:
             return
 
-        # Track slot usage: each active request uses MAMBA_SLOTS_PER_REQ slots
-        # When slots_in_use > pool_size, evict excess
-        active_reqs = getattr(self, "num_running_reqs", 0)
-        cls._kda_slots_in_use = active_reqs * cls.MAMBA_SLOTS_PER_REQ
+        # Calculate actual slot usage from running batch (not fixed estimate)
+        running_batch = getattr(self, "running_batch", None)
+        if running_batch is not None and hasattr(running_batch, "reqs"):
+            slots_in_use = 0
+            for req in running_batch.reqs:
+                # Active slots (ping-pong + speculative) + checkpoint slots
+                seq_len = getattr(req, "seq_len", 0) or getattr(req, "input_length", 0)
+                num_checkpoints = max(1, seq_len // cls.MAMBA_TRACK_INTERVAL)
+                slots_in_use += cls.MAMBA_SLOTS_PER_REQ + num_checkpoints
+        else:
+            # Fallback: use num_running_reqs * estimated slots
+            active_reqs = getattr(self, "num_running_reqs", 0)
+            slots_in_use = active_reqs * (cls.MAMBA_SLOTS_PER_REQ + 2)
 
-        excess = cls._kda_slots_in_use - cls.MAMBA_POOL_SIZE
+        cls._kda_slots_in_use = slots_in_use
+        excess = slots_in_use - cls.MAMBA_POOL_SIZE
         if excess <= 0:
             return
 
-        # Backup excess slots to L2 (each slot = 14.45MB D2H)
-        import hashlib, time as _time
-        for _ in range(excess):
+        # Backup excess slots to L2 (each slot = MAMBA_SLOT_BYTES D2H)
+        import hashlib
+        running_reqs = getattr(running_batch, "reqs", []) if running_batch else []
+        for i in range(excess):
             slot_idx = cls._kda_pool.alloc_slot()  # triggers LRU evict if full
+            # Content-addressed hash: deterministic based on slot_idx + iteration
+            # so same logical checkpoint gets same hash → L3 dedup works
+            req_id = running_reqs[i % len(running_reqs)].rid if running_reqs else f"req_{i}"
+            token_offset = (slot_idx * cls.MAMBA_TRACK_INTERVAL) if running_reqs else slot_idx
             slot_hash = hashlib.md5(
-                f"kda_slot_{slot_idx}_{_time.time()}".encode()
+                f"kda_{req_id}_{token_offset}".encode()
             ).hexdigest()
             cls._kda_host_pool.backup_from_device(slot_idx, slot_hash)
             cls._kda_l3_pending_writes.append(slot_hash)
@@ -586,17 +698,28 @@ class C_HiCacheController(BaseHook):
     @classmethod
     def handle_kda_prefetch_operation(cls, self):
         """KDA state load_back: when a prefix match finds evicted checkpoint in L2/L3.
-        Called from wrapped_check_hicache_events after MLA prefetch."""
+        Called from wrapped_check_hicache_events after MLA prefetch.
+
+        B2 fix: snapshot pending count BEFORE clearing, pass to L3 write timing.
+        B3 fix: for L3 hits, do SSD→DRAM (D2H) then DRAM→HBM (H2D) with timing.
+        """
         if not cls._kda_pool:
             return
-
-        # Query L3 for pending KDA checkpoint lookups
-        # In simulation, we model this as: if L2 has backed-up slots and
-        # new requests need them, load_back from L2 (or L3 if not in L2)
         if not cls._kda_l3_pending_writes:
             return
 
-        # Query L3 (kvcm) for KDA slot hashes
+        # B2: snapshot count for L3 write timing (before prefetch clears list)
+        cls._kda_l3_write_count = len(cls._kda_l3_pending_writes)
+
+        # Write to L3 (kvcm) first — these slots are being backed up
+        try:
+            slot_hashes = list(cls._kda_l3_pending_writes)
+            if hasattr(self, 'storage_backend') and self.storage_backend:
+                self.storage_backend.batch_set_mamba(slot_hashes)
+        except Exception as e:
+            logger.debug(f"KDA L3 write skipped: {e}")
+
+        # Query L3 for KDA checkpoint lookups
         try:
             slot_hashes = list(cls._kda_l3_pending_writes)
             l3_hits = self.storage_backend.batch_exists_mamba(slot_hashes)
@@ -605,8 +728,10 @@ class C_HiCacheController(BaseHook):
 
             for slot_hash, hit in l3_hits.items():
                 if hit:
-                    # Found in L3: prefetch SSD→DRAM (timed in submit_kda_l3_write_timing)
-                    # Then L2 load_back H2D
+                    # B3: L3 hit → SSD→DRAM (D2H) then DRAM→HBM (H2D)
+                    # First: SSD read → DRAM (timed as kda_l3_load_dur)
+                    cls._kda_host_pool.backup_from_device(-1, slot_hash, from_l3=True)
+                    # Then: DRAM → HBM (H2D, COW)
                     cls._kda_host_pool.load_to_device(slot_hash)
                     cls._kda_stats["load_back_l3"] += 1
                 elif cls._kda_host_pool.has(slot_hash):
@@ -620,13 +745,17 @@ class C_HiCacheController(BaseHook):
 
     @classmethod
     def submit_kda_l3_write_timing(cls):
-        """KDA L3 write timing: SSD write for KDA slots (14.45MB/slot).
-        Called after MLA submit_l3_write_timing."""
-        if not cls._kda_pool or not cls._kda_l3_pending_writes:
+        """KDA L3 write timing: SSD write for KDA slots (MAMBA_SLOT_BYTES/slot).
+        Called after MLA submit_l3_write_timing.
+
+        B2 fix: use _kda_l3_write_count (snapshot taken before prefetch clear)
+        instead of reading len(_kda_l3_pending_writes) which may already be 0.
+        """
+        if not cls._kda_pool or cls._kda_l3_write_count == 0:
             return
 
         write_arrival = StateManager.get_global_clock()
-        total_write_bytes = len(cls._kda_l3_pending_writes) * cls.MAMBA_SLOT_BYTES
+        total_write_bytes = cls._kda_l3_write_count * cls.MAMBA_SLOT_BYTES
 
         sim = cls._get_ssd_simulator()
         if sim is not None and hasattr(sim, 'submit_write'):
@@ -649,6 +778,8 @@ class C_HiCacheController(BaseHook):
             write_time = total_write_bytes / bw
 
         StateManager.inc_hicache_kda_l3_backup_dur(write_time)
+        # Reset snapshot
+        cls._kda_l3_write_count = 0
 
     @staticmethod
     def get_kda_stats() -> dict:
@@ -1037,231 +1168,470 @@ class C_HiCacheController(BaseHook):
 
 
 class C_HiRadixCacheHook(BaseHook):
-    HOOK_CLASS_NAME = "HiRadixCache"
-    HOOK_MODULE_NAME = "sglang.srt.mem_cache.hiradix_cache"
+    HOOK_CLASS_NAME = "UnifiedRadixCache"
+    HOOK_MODULE_NAME = "sglang.srt.mem_cache.unified_radix_cache"
 
     @classmethod
     def hook(cls, target):
+        original_init_hicache = target.init_hicache
         original_check_hicache_events = target.check_hicache_events
         original_reset = target.reset
+        original_count_ready_acks = target._count_ready_acks
 
         def wrapped_reset(self):
-            if hasattr(self, "cache_controller"):
+            if hasattr(self, "cache_controller") and self.cache_controller is not None:
                 self.cache_controller.handle_backup_operation()
                 self.cache_controller.submit_l3_write_timing()
             original_reset(self)
 
-        def override_init(self, params, server_args):
-            if server_args.hicache_io_backend == "direct":
-                # FIXME: move this logic into server_args parsing
-                if server_args.hicache_mem_layout == "page_first":
-                    server_args.hicache_mem_layout = "page_first_direct"
-                    logger.warning(
-                        "Page first layout is not supported with direct IO backend, switching to page first direct layout"
-                    )
+        def wrapped_init_hicache(self, server_args, params):
+            # Try the real init_hicache first. If it fails (because mocks
+            # don't have all the real mamba internals like mamba_cache.conv),
+            # fall back to manual setup of mock host pools + cache_controller.
+            from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _HA_CT
+            from sglang.srt.managers.cache_controller import HiCacheAck as _HA_CKACK
 
-            self.page_size = params.page_size
-            self.kv_cache = params.token_to_kv_pool_allocator.get_kvcache()
-            # Replace the host pool
-            self.token_to_kv_pool_host = MockTokenToKVPoolHost(
-                self.kv_cache,
-                server_args.hicache_ratio,
-                server_args.hicache_size,
-                self.page_size,
-                server_args.hicache_mem_layout,
-                pin_memory=False,
-                device="cpu",
-            )
+            def _apply_mock_start_overrides(cache, full_host, mamba_host=None):
+                # Override start_writing (D2H backup) & start_loading (H2D
+                # load_back) to bypass CUDA l2_transfer_engine, record timing
+                # via MockTokenToKVPoolHost / MockMambaStatePoolHost, set
+                # host_value on BOTH FULL (MLA) and MAMBA (KDA) components,
+                # and create fake acks (torch.Event so query/synchronize work).
+                # Also directly trigger L3 (SSD) writes/reads to bypass the
+                # broken ack processing chain (write_backup_storage never called).
+                _diag_w = {"calls": 0, "mamba_pt": 0, "full_only": 0, "l3_writes": 0}
+                _diag_l = {"calls": 0, "mamba_pt": 0, "full_only": 0, "l3_hits": 0}
 
-            self.tp_group = params.tp_cache_group
-            self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-            self.enable_storage = server_args.hicache_storage_backend is not None
-            self.enable_storage_metrics = self.enable_storage and params.enable_metrics
+                # Get storage backend for L3 writes/reads
+                # Always use MockHiCacheStorage — the real storage_backend may be
+                # HiCacheFile (if C_StorageBackendFactory hook didn't fire) which
+                # lacks batch_set/batch_exists.
+                _storage = getattr(cache.cache_controller, 'storage_backend', None)
+                if not isinstance(_storage, MockHiCacheStorage):
+                    _storage = MockHiCacheStorage()
 
-            (
-                extra_config,
-                prefetch_threshold,
-                prefetch_timeout_base,
-                prefetch_timeout_per_ki_token,
-                hicache_storage_pass_prefix_keys,
-            ) = self._parse_storage_backend_extra_config(
-                server_args.hicache_storage_backend_extra_config
-            )
-            self.prefetch_threshold = prefetch_threshold
-            self.prefetch_timeout_base = prefetch_timeout_base
-            self.prefetch_timeout_per_page = (
-                self.page_size / 1024 * prefetch_timeout_per_ki_token
-            )
-            self.hicache_storage_pass_prefix_keys = hicache_storage_pass_prefix_keys
-            # TODO: support more timeout check functions
-            self.is_prefetch_timeout = self._prefetch_timeout_check_linear_func
-            self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
+                # L3 timing helpers
+                _disk_write_bw = 8e9  # 8 GB/s default
+                _disk_read_bw = 14.6e9  # 14.6 GB/s default
+                try:
+                    from hisim.simulation.manager import ConfigManager as _CM
+                    _pcfg = _CM.get_platform_config()
+                    _disk_write_bw = getattr(_pcfg, 'disk_write_bandwidth', 8e9) or 8e9
+                    _disk_read_bw = getattr(_pcfg, 'disk_read_bandwidth', 14.6e9) or 14.6e9
+                except Exception:
+                    pass
 
-            HiCacheController = getattr(
-                importlib.import_module("sglang.srt.managers.cache_controller"),
-                "HiCacheController",
-            )
+                def _mock_start_writing(cc=cache.cache_controller, host=full_host, c=cache, mh=mamba_host, st=_storage):
+                    if len(cc.write_queue) == 0:
+                        return
+                    try:
+                        op = cc.write_queue[0]
+                        if hasattr(type(op), 'merge_ops'):
+                            op = type(op).merge_ops(cc.write_queue)
+                        cc.write_queue.clear()
+                        _hi = getattr(op, 'host_indices', None)
+                        _di = getattr(op, 'device_indices', None)
+                        _ni = getattr(op, 'node_ids', [])
+                        _pt = getattr(op, 'pool_transfers', None) or []
+                    except Exception:
+                        cc.write_queue.clear()
+                        return
+                    _diag_w["calls"] += 1
+                    _tc = getattr(c, 'tree_core', None)
+                    # FULL pool backup (D2H)
+                    if _di is not None and _hi is not None:
+                        try:
+                            host.backup_from_device_all_layer(host.device_pool, _hi, _di, "kernel")
+                        except Exception as e:
+                            logger.debug(f"backup_from_device_all_layer failed: {e}")
+                    # Process sidecar pool transfers (MAMBA/KDA)
+                    _mamba_xfers = []
+                    for _xfer in _pt:
+                        _xn = getattr(_xfer, 'name', None)
+                        _xv = getattr(_xn, 'value', str(_xn))
+                        if _xv == 'mamba':
+                            _mamba_xfers.append(_xfer)
+                    if _mamba_xfers and mh is not None:
+                        _diag_w["mamba_pt"] += 1
+                        for _xfer in _mamba_xfers:
+                            _mhi = getattr(_xfer, 'host_indices', None)
+                            _mdi = getattr(_xfer, 'device_indices', None)
+                            try:
+                                _n = len(_mhi) if hasattr(_mhi, '__len__') else 1
+                                _nid = _ni[0] if _ni else 0
+                                for _i in range(_n):
+                                    mh.backup_from_device(0, f"mamba_{_nid}_{_i}")
+                            except Exception as e:
+                                logger.debug(f"mamba backup_from_device failed: {e}")
+                    elif _pt:
+                        _diag_w["full_only"] += 1
+                    # L3 (SSD) backup — mirror real sglang's write_backup_storage
+                    # which is called from _finish_write_through_ack
+                    if st is not None and _ni:
+                        _kv_bytes = float(getattr(MockTokenToKVPoolHost, 'KV_CACHE_BYTES', 0) or 0)
+                        if _kv_bytes == 0:
+                            try:
+                                from hisim.simulation.manager import ConfigManager
+                                _kv_bytes = float(ConfigManager.get_kv_cache_bytes())
+                            except Exception:
+                                _kv_bytes = 1e5
+                        for nid in _ni:
+                            try:
+                                _hash = None
+                                if _tc is not None and hasattr(_tc, 'node_by_id'):
+                                    _node = _tc.node_by_id(nid)
+                                    if _node is not None:
+                                        _hash = getattr(_node, 'hash_value', None)
+                                        if _hash:
+                                            _hash = _hash[-1] if isinstance(_hash, list) else str(_hash)
+                                if not _hash:
+                                    _hash = f"node_{nid}"
+                                st.set(str(_hash))
+                                _diag_w["l3_writes"] += 1
+                                _l3_dur = _kv_bytes / _disk_write_bw if _di is not None else 0
+                                StateManager.inc_hicache_l3_backup_dur(_l3_dur)
+                                # KDA L3 backup
+                                if _mamba_xfers and mh is not None:
+                                    _slot_bytes = getattr(mh, 'slot_bytes', 15151104)
+                                    st.batch_set_mamba([f"mamba_{nid}"])
+                                    _kda_l3_dur = _slot_bytes / _disk_write_bw
+                                    StateManager.inc_hicache_kda_l3_backup_dur(_kda_l3_dur)
+                            except Exception as e:
+                                logger.debug(f"L3 write failed node {nid}: {e}")
+                    # Set host_value on components (FULL + MAMBA)
+                    if _tc is not None and hasattr(_tc, 'node_by_id') and _ni:
+                        for nid in _ni:
+                            try:
+                                node = _tc.node_by_id(nid)
+                                if node is not None and hasattr(node, 'component_data'):
+                                    if _HA_CT.FULL in node.component_data and _hi is not None and len(_hi) > 0:
+                                        node.component_data[_HA_CT.FULL].host_value = _hi
+                                    if _mamba_xfers and _HA_CT.MAMBA in node.component_data:
+                                        _mhi = getattr(_mamba_xfers[0], 'host_indices', None)
+                                        if _mhi is not None:
+                                            node.component_data[_HA_CT.MAMBA].host_value = _mhi.clone() if hasattr(_mhi, 'clone') else _mhi
+                            except Exception as e:
+                                logger.debug(f"set host_value failed node {nid}: {e}")
+                    try:
+                        _evt = torch.Event(); _evt.record()
+                        cc.ack_write_queue.append(_HA_CKACK(
+                            start_event=_evt, finish_event=_evt, node_ids=_ni,
+                            num_tokens=len(_di) if _di is not None else 0,
+                            timing_enabled=False, num_bytes=0,
+                        ))
+                    except Exception as e:
+                        logger.warning(f"fake write ack failed: {e}")
+                cache.cache_controller.start_writing = _mock_start_writing
+
+                def _mock_start_loading(cc=cache.cache_controller, host=full_host, c=cache, mh=mamba_host, st=_storage):
+                    if len(cc.load_queue) == 0:
+                        return -1
+                    try:
+                        op = cc.load_queue[0]
+                        if hasattr(type(op), 'merge_ops'):
+                            op = type(op).merge_ops(cc.load_queue)
+                        cc.load_queue.clear()
+                        _hi = getattr(op, 'host_indices', None)
+                        _di = getattr(op, 'device_indices', None)
+                        _ni = getattr(op, 'node_ids', [])
+                        _pt = getattr(op, 'pool_transfers', None) or []
+                    except Exception:
+                        cc.load_queue.clear()
+                        return -1
+                    _diag_l["calls"] += 1
+                    _tc = getattr(c, 'tree_core', None)
+                    # L3 (SSD) read — check if data is in L3
+                    if st is not None and _ni:
+                        _kv_bytes = float(getattr(MockTokenToKVPoolHost, 'KV_CACHE_BYTES', 0) or 0)
+                        if _kv_bytes == 0:
+                            try:
+                                from hisim.simulation.manager import ConfigManager
+                                _kv_bytes = float(ConfigManager.get_kv_cache_bytes())
+                            except Exception:
+                                _kv_bytes = 1e5
+                        for nid in _ni:
+                            try:
+                                _hash = None
+                                if _tc is not None and hasattr(_tc, 'node_by_id'):
+                                    _node = _tc.node_by_id(nid)
+                                    if _node is not None:
+                                        _hash = getattr(_node, 'hash_value', None)
+                                        if _hash:
+                                            _hash = _hash[-1] if isinstance(_hash, list) else str(_hash)
+                                if not _hash:
+                                    _hash = f"node_{nid}"
+                                _hit_count = 1 if st.exists(str(_hash)) else 0
+                                if _hit_count > 0:
+                                    _diag_l["l3_hits"] += 1
+                                    _l3_dur = _kv_bytes / _disk_read_bw if _di is not None else 0
+                                    StateManager.inc_hicache_kda_l3_load_dur(_l3_dur)
+                                    # Set L3 direct load count so load_to_device_per_layer
+                                    # splits the H2D timing between L2 and L3 direct path
+                                    _ntok = len(_di) if _di is not None else 0
+                                    if _ntok > 0:
+                                        StateManager.inc_l3_direct_load_count(_ntok)
+                                # KDA L3 read
+                                if mh is not None:
+                                    _m_hits = st.batch_exists_mamba([f"mamba_{nid}"])
+                                    if any(_m_hits.values()):
+                                        _slot_bytes = getattr(mh, 'slot_bytes', 15151104)
+                                        _kda_l3_dur = _slot_bytes / _disk_read_bw
+                                        StateManager.inc_hicache_kda_l3_load_dur(_kda_l3_dur)
+                            except Exception as e:
+                                logger.debug(f"L3 read failed node {nid}: {e}")
+                    # FULL pool load (H2D)
+                    if _hi is not None and _di is not None:
+                        try:
+                            host.load_to_device_per_layer(host.device_pool, _hi, _di, 0, "kernel")
+                        except Exception as e:
+                            logger.debug(f"load_to_device_per_layer failed: {e}")
+                    # Process sidecar pool transfers (MAMBA/KDA)
+                    _mamba_loads = []
+                    for _xfer in _pt:
+                        _xn = getattr(_xfer, 'name', None)
+                        _xv = getattr(_xn, 'value', str(_xn))
+                        if _xv == 'mamba':
+                            _mamba_loads.append(_xfer)
+                    if _mamba_loads and mh is not None:
+                        _diag_l["mamba_pt"] += 1
+                        for _xfer in _mamba_loads:
+                            _mhi = getattr(_xfer, 'host_indices', None)
+                            _mdi = getattr(_xfer, 'device_indices', None)
+                            try:
+                                _n = len(_mhi) if hasattr(_mhi, '__len__') else 1
+                                _nid = _ni[0] if _ni else 0
+                                for _i in range(_n):
+                                    mh.load_to_device(f"mamba_{_nid}_{_i}")
+                            except Exception as e:
+                                logger.debug(f"mamba load_to_device failed: {e}")
+                    elif _pt:
+                        _diag_l["full_only"] += 1
+                    # Set value on MAMBA component (restore from L2)
+                    if _tc is not None and hasattr(_tc, 'node_by_id') and _ni:
+                        for nid in _ni:
+                            try:
+                                node = _tc.node_by_id(nid)
+                                if node is not None and hasattr(node, 'component_data'):
+                                    if _mamba_loads and _HA_CT.MAMBA in node.component_data:
+                                        _mdi = getattr(_mamba_loads[0], 'device_indices', None)
+                                        if _mdi is not None:
+                                            node.component_data[_HA_CT.MAMBA].value = _mdi.clone() if hasattr(_mdi, 'clone') else _mdi
+                            except Exception as e:
+                                logger.debug(f"set mamba value failed node {nid}: {e}")
+                    try:
+                        _evt = torch.Event(); _evt.record()
+                        cc.ack_load_queue.append(_HA_CKACK(
+                            start_event=_evt, finish_event=_evt, node_ids=_ni,
+                            num_tokens=len(_di) if _di is not None else 0,
+                            timing_enabled=False, num_bytes=0,
+                        ))
+                    except Exception as e:
+                        logger.warning(f"fake load ack failed: {e}")
+                    return 0
+                cache.cache_controller.start_loading = _mock_start_loading
+
+                # Expose diagnostic counters for verification
+                cache._hismim_diag_w = _diag_w
+                cache._hismim_diag_l = _diag_l
+
+                # Tracking dicts required by _finish_write_through_ack /
+                # _finish_load_back_ack (called from writing_check/loading_check).
+                if not hasattr(cache, 'ongoing_write_through'):
+                    cache.ongoing_write_through = {}
+                if not hasattr(cache, 'ongoing_load_back'):
+                    cache.ongoing_load_back = {}
+                if not hasattr(cache, 'ongoing_prefetch'):
+                    cache.ongoing_prefetch = {}
+                if not hasattr(cache, 'ongoing_backup'):
+                    cache.ongoing_backup = {}
+                if not hasattr(cache, 'buffer_pipeline'):
+                    cache.buffer_pipeline = None
+                logger.debug("Applied mock start_writing/start_loading overrides")
+
             try:
-                StorageMetricsCollector = getattr(
-                    importlib.import_module("sglang.srt.metrics.collector"),
-                    "StorageMetricsCollector",
+                original_init_hicache(self, server_args, params)
+            except Exception as e:
+                logger.warning(f"original init_hicache failed ({e}), using manual setup")
+
+                # Manually create cache_controller and host pools
+                from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                    HostPoolGroup, PoolEntry, PoolName,
                 )
-            except (ImportError, ModuleNotFoundError):
-                StorageMetricsCollector = None
+                from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+                    HybridCacheController,
+                )
+                _kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+                _page_size = params.page_size
 
-            self.load_cache_event = threading.Event()
-            self.cache_controller = HiCacheController(
-                params.token_to_kv_pool_allocator,
-                self.token_to_kv_pool_host,
-                self.page_size,
-                self.tp_group,
-                load_cache_event=self.load_cache_event,
-                write_policy=server_args.hicache_write_policy,
-                io_backend=server_args.hicache_io_backend,
-                storage_backend=server_args.hicache_storage_backend,
-                prefetch_threshold=self.prefetch_threshold,
-                model_name=server_args.served_model_name,
-                storage_backend_extra_config=extra_config,
-            )
-            if self.enable_storage_metrics and StorageMetricsCollector is not None:
-                # TODO: support pp
-                labels = {
-                    "storage_backend": server_args.hicache_storage_backend,
-                    "tp_rank": self.cache_controller.tp_rank,
-                    "dp_rank": self.cache_controller.dp_rank,
-                }
-                self.storage_metrics_collector = StorageMetricsCollector(labels=labels)
+                # Create mock host pools
+                _full_host = MockTokenToKVPoolHost(
+                    _kvcache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    _page_size,
+                    server_args.hicache_mem_layout,
+                    pin_memory=False,
+                    device="cpu",
+                )
+                _mamba_host = MockMambaStatePoolHost(
+                    size=330,  # MAMBA_POOL_SIZE * 2 (L2 = 2x L1)
+                    slot_bytes=15151104,  # MAMBA_SLOT_BYTES for K3
+                )
 
-            # Record the nodes with ongoing write-through
-            self.ongoing_write_through = {}
-            # Record the node segments with ongoing load-back
-            self.ongoing_load_back = {}
-            # Record the ongoing prefetch requests
-            self.ongoing_prefetch = {}
-            self.ongoing_backup = {}
-            # TODO: Dynamically adjust the threshold
-            self.write_through_threshold = (
-                1 if server_args.hicache_write_policy == "write_through" else 2
+                # Create host_pool_group with PoolEntry objects
+                self.host_pool_group = HostPoolGroup(entries=[
+                    PoolEntry(
+                        name=PoolName.KV,
+                        host_pool=_full_host,
+                        device_pool=_kvcache,
+                        layer_mapper=lambda i: i if i < 5 else None,
+                    ),
+                    PoolEntry(
+                        name=PoolName.MAMBA,
+                        host_pool=_mamba_host,
+                        device_pool=params.req_to_token_pool.mamba_pool,
+                        layer_mapper=lambda i: i - 5 if 5 <= i < 23 else None,
+                    ),
+                ])
+
+                # Create HybridCacheController (uses mem_pool_host, not host_pool_group)
+                self.load_cache_event = threading.Event()
+                self.cache_controller = HybridCacheController(
+                    token_to_kv_pool_allocator=params.token_to_kv_pool_allocator,
+                    mem_pool_host=_full_host,
+                    page_size=_page_size,
+                    tp_group=params.tp_cache_group,
+                    load_cache_event=self.load_cache_event,
+                    write_policy=server_args.hicache_write_policy,
+                    io_backend=server_args.hicache_io_backend,
+                    storage_backend=server_args.hicache_storage_backend,
+                    prefetch_threshold=256,
+                    model_name=server_args.served_model_name,
+                    storage_backend_extra_config=None,
+                    transfer_layer_num=23,
+                    host_memory_mode=server_args.hicache_host_memory_mode,
+                 )
+
+                # Apply mock start_writing/start_loading overrides (defined above)
+                _apply_mock_start_overrides(self, _full_host, _mamba_host)
+
+                # Set host pool attributes on cache and components
+                from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _CT
+                self.full_kv_pool_host = _full_host
+                self.mamba_pool_host = _mamba_host
+                if _CT.FULL in self.components:
+                    self.components[_CT.FULL]._full_kv_pool_host = _full_host
+                if _CT.MAMBA in self.components:
+                    self.components[_CT.MAMBA]._mamba_pool_host = _mamba_host
+
+                self.enable_storage = server_args.hicache_storage_backend is not None
+                self.is_write_back = server_args.hicache_write_policy == "write_back"
+                self.write_through_threshold = (
+                    1 if server_args.hicache_write_policy == "write_through" else 2
+                )
+                self.load_back_threshold = 10
+                self.prefetch_loaded_tokens_by_reqid = {}
+                # Tracking dicts required by _finish_write_through_ack and
+                # _finish_load_back_ack (called from writing_check/loading_check).
+                self.ongoing_write_through = {}
+                self.ongoing_load_back = {}
+                self.ongoing_prefetch = {}
+                self.ongoing_backup = {}
+                self.buffer_pipeline = None
+
+                # Tag tree_core
+                if hasattr(self, 'tree_core'):
+                    self.tree_core.set_hicache_enabled()
+
+                logger.info("Manual hicache setup completed (fallback mode)")
+
+            # If original succeeded, swap host pools to mock versions
+            if not hasattr(self, 'full_kv_pool_host') or self.full_kv_pool_host is None:
+                # Original succeeded but didn't set full_kv_pool_host (shouldn't happen)
+                pass
+            elif not isinstance(self.full_kv_pool_host, MockTokenToKVPoolHost):
+                # Original succeeded — swap real host pools to mock
+                from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _CT
+                _kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+                self.full_kv_pool_host = MockTokenToKVPoolHost(
+                    _kvcache,
+                    server_args.hicache_ratio,
+                    server_args.hicache_size,
+                    self.page_size,
+                    server_args.hicache_mem_layout,
+                    pin_memory=False,
+                    device="cpu",
+                )
+                if _CT.FULL in self.components:
+                    self.components[_CT.FULL]._full_kv_pool_host = self.full_kv_pool_host
+
+                if hasattr(self, 'mamba_pool_host') and self.mamba_pool_host is not None and not isinstance(self.mamba_pool_host, MockMambaStatePoolHost):
+                    self.mamba_pool_host = MockMambaStatePoolHost(
+                        size=330,
+                        slot_bytes=15151104,
+                    )
+                    if _CT.MAMBA in self.components:
+                        self.components[_CT.MAMBA]._mamba_pool_host = self.mamba_pool_host
+
+                logger.info("Swapped real host pools to mock versions")
+                _apply_mock_start_overrides(self, self.full_kv_pool_host, getattr(self, 'mamba_pool_host', None))
+
+            logger.info(
+                f"HiSim hicache attached: components={set(self.components.keys())}, "
+                f"write_through_threshold={getattr(self, 'write_through_threshold', 'N/A')}"
             )
-            self.load_back_threshold = 10
-            # Version: 0.5.9
-            self.prefetch_loaded_tokens_by_reqid: dict[str, int] = {}
-            self.evictable_host_leaves = set()
-            # super().__init__(params=params)
-            target.__mro__[1].__init__(self, params=params)
+
+        def wrapped_count_ready_acks(self, ack_queue):
+            try:
+                return len(ack_queue)
+            except TypeError:
+                return 0
 
         def wrapped_check_hicache_events(self, *args, **kwargs):
-            # 1. Data phase: batch_set writes previous round's KV to kvcm
-            self.cache_controller.handle_backup_operation()
-            # 1b. KDA backup: if MambaPool full, evict slots to L2
-            C_HiCacheController.handle_kda_backup_operation(self)
-            # 2. Data + read timing: batch_exists queries kvcm + submit_read
-            #    (sees previous round's write avail_time)
-            self.cache_controller.handle_prefetch_operation()
-            # 2b. KDA prefetch: load_back evicted KDA checkpoints from L2/L3
-            C_HiCacheController.handle_kda_prefetch_operation(self)
-            # 3. Write timing: submit_write advances avail_time for next round
-            self.cache_controller.submit_l3_write_timing()
-            # 3b. KDA L3 write timing
-            C_HiCacheController.submit_kda_l3_write_timing()
-            result = original_check_hicache_events(self, *args, **kwargs)
-            # 4. Fix: In CPU simulation, CUDA events in ack_write_queue and
-            # ack_load_queue never complete, so writing_check() and
-            # loading_check() never process their queues. We process them
-            # here as a fallback, skipping the CUDA event check.
-            if hasattr(self, 'cache_controller') and self.enable_storage:
-                cc = self.cache_controller
-                # ack_write_queue fallback: mirrors sglang's writing_check()
-                # normal path (hiradix_cache.py:698-706). Must call
-                # dec_lock_ref to unlock the node so it can be evicted later.
-                # Without dec_lock_ref, backed-up nodes stay locked in L1
-                # forever, host_hit_length is always 0, and L2 load_back is
-                # never triggered.
-                n_write_acks = 0
-                for ack in cc.ack_write_queue:
-                    for ack_id in ack.node_ids:
-                        node = self.ongoing_write_through.pop(ack_id, None)
-                        if node is not None:
-                            n_write_acks += 1
-                            self.dec_lock_ref(node)
-                            self.write_backup_storage(node)
-                cc.ack_write_queue.clear()
-                # ack_load_queue fallback: mirrors sglang's loading_check()
-                # (hiradix_cache.py:708-721). Without this, nodes in
-                # ongoing_load_back stay locked forever, eventually
-                # exhausting evictable L1 space and breaking L2 load_back.
-                n_load_acks = 0
-                for ack in cc.ack_load_queue:
-                    for ack_id in ack.node_ids:
-                        end_node = self.ongoing_load_back.pop(ack_id, None)
-                        if end_node is not None:
-                            n_load_acks += 1
-                            self.dec_lock_ref(end_node)
-                cc.ack_load_queue.clear()
-                if n_write_acks or n_load_acks:
-                    logger.debug(
-                        f"check_hicache_events fallback: write_acks={n_write_acks}, "
-                        f"load_acks={n_load_acks}, "
-                        f"ongoing_write_through={len(self.ongoing_write_through)}, "
-                        f"ongoing_load_back={len(self.ongoing_load_back)}, "
-                        f"backup_queue={cc.backup_queue.qsize() if hasattr(cc.backup_queue, 'qsize') else 'N/A'}, "
-                        f"prefetch_queue={cc.prefetch_queue.qsize() if hasattr(cc.prefetch_queue, 'qsize') else 'N/A'}"
-                    )
-            return result
+            _cn = getattr(self, '_hicache_cn', 0) + 1
+            self._hicache_cn = _cn
+            if _cn % 10 != 0:
+                return
+            try:
+                original_check_hicache_events(self, *args, **kwargs)
+            except Exception as e:
+                logger.debug(f"check_hicache_events partial failure: {e}")
 
-        target.__init__ = override_init
+        target.init_hicache = wrapped_init_hicache
         target.check_hicache_events = wrapped_check_hicache_events
+        target._count_ready_acks = wrapped_count_ready_acks
         target.reset = wrapped_reset
 
-        # Node lifecycle tracking (enabled via HISIM_NODE_TRACK env var)
-        if os.environ.get("HISIM_NODE_TRACK", ""):
-            _orig_write_backup = target.write_backup
-            _orig_evict_backuped = target._evict_backuped
-            _orig_evict_regular = target._evict_regular
-            _orig_evict_host = target.evict_host
-            _orig_load_back = target.load_back
+        # Fix 0.5.18 host_hit_length: UnifiedTreeCore.match_prefix always sets
+        # host_hit_length=0. The correct value is full_kv_hit_length minus the
+        # number of device-resident matched tokens (len(device_indices)) — i.e.
+        # tokens that matched but are evicted to L2, needing load_back.
+        # Without this, req.host_hit_length stays 0 and HiSim cannot observe
+        # any L2 load_back (l2_hit_tokens==0).
+        original_match_prefix = target.match_prefix
+        def wrapped_match_prefix(self, params, orig=original_match_prefix):
+            result = orig(self, params)
+            try:
+                di = result.device_indices
+                dev_hit = len(di) if di is not None else 0
+                full_hit = result.full_kv_hit_length or 0
+                host_hit = max(0, full_hit - dev_hit)
+                if host_hit > 0:
+                    result = result._replace(host_hit_length=host_hit)
+            except Exception:
+                pass
+            return result
+        target.match_prefix = wrapped_match_prefix
+        logger.debug("Wrapped match_prefix to compute host_hit_length")
 
-            def _tracked_write_backup(self, node, write_back=False):
-                r = _orig_write_backup(self, node, write_back)
-                if r > 0:
-                    logger.info(f"NODE_BACKUP id={node.id} key_len={len(node.key)} backuped={node.backuped}")
-                return r
+        # HiSim runs as a single CPU process (TP=1): no cross-rank distributed
+        # all_reduce is needed. The real _all_reduce can hang inside
+        # transfer_to_npu/torch.distributed in CPU simulation during
+        # check_hicache_events -> _sync_hicache_ready_counts. Override to no-op.
+        target._all_reduce = lambda self, data, tp_reduce_op: data
+        logger.debug("Overrode UnifiedRadixCache._all_reduce to no-op (single-proc CPU)")
 
-            def _tracked_evict_backuped(self, node):
-                r = _orig_evict_backuped(self, node)
-                logger.info(f"NODE_EVICT_L1 id={node.id} key_len={len(node.key)} backuped={node.backuped} evicted={node.evicted}")
-                return r
-
-            def _tracked_evict_regular(self, node):
-                logger.info(f"NODE_DELETE id={node.id} key_len={len(node.key)} backuped={node.backuped}")
-                return _orig_evict_regular(self, node)
-
-            def _tracked_evict_host(self, num_tokens):
-                # Log before eviction (nodes still in tree)
-                leaves = list(self.evictable_host_leaves)
-                r = _orig_evict_host(self, num_tokens)
-                # Log what changed
-                after = list(self.evictable_host_leaves)
-                removed = [n for n in leaves if n not in after]
-                for n in removed:
-                    logger.info(f"NODE_EVICT_L2 id={n.id} key_len={len(n.key)} backuped={n.backuped} evicted={n.evicted}")
-                return r
-
-            def _tracked_load_back(self, node, mem_quota=None):
-                logger.info(f"NODE_LOAD_BACK_START id={node.id} key_len={len(node.key)} evicted={node.evicted} backuped={node.backuped}")
-                r = _orig_load_back(self, node, mem_quota)
-                if r is not None:
-                    logger.info(f"NODE_LOAD_BACK_OK id={node.id} tokens={len(r)}")
-                else:
-                    logger.info(f"NODE_LOAD_BACK_FAIL id={node.id}")
-                return r
-
-            target.write_backup = _tracked_write_backup
-            target._evict_backuped = _tracked_evict_backuped
-            target._evict_regular = _tracked_evict_regular
-            target.evict_host = _tracked_evict_host
-            target.load_back = _tracked_load_back
-            logger.info("Node lifecycle tracking enabled (HISIM_NODE_TRACK)")
+        logger.debug("C_HiRadixCacheHook applied to UnifiedRadixCache")
 
 
 class C_StorageBackendFactory(BaseHook):
@@ -1328,12 +1698,162 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.OVERLAP_SCHEDULE = not getattr(
                 server_args, "disable_overlap_schedule", False
             )
-            setattr(server_args, "disable_overlap_schedule", True)
+            try:
+                setattr(server_args, "disable_overlap_schedule", True)
+            except AttributeError:
+                # sglang 0.5.18+ makes server_args read-only after resolution
+                pass
             logger.debug(
                 f"Overlap schedule simulation mode: {C_SchedulerHook.OVERLAP_SCHEDULE}."
             )
 
             original_init(self, *args, **kwargs)
+
+            # sglang 0.5.18 CPU simulation: force prefetch-progress to succeed.
+            # In CPU sim the L2/L3 hierarchical cache is mocked; requests get stuck
+            # in `ongoing_prefetch` and are skipped by check_prefetch_progress (False),
+            # keeping can_run_list==0 forever. Patch directly on the instance so the
+            # forked scheduler subprocess definitely inherits it.
+            try:
+                import zmq as _dummy  # noqa
+                _tc = getattr(self, 'tree_cache', None)
+                if _tc is not None and hasattr(_tc, 'check_prefetch_progress'):
+                    _tc.check_prefetch_progress = lambda req_id: True
+                    _tc.pop_prefetch_loaded_tokens = lambda req_id: 0
+                    logger.info("Patched tree_cache.check_prefetch_progress in scheduler")
+            except Exception:
+                pass
+
+            # sglang 0.5.18 compat: force disable overlap schedule
+            # (setattr on server_args fails because 0.5.18 is read-only)
+            self.enable_overlap = False
+            import queue as _queue
+            if not hasattr(self, "result_queue"):
+                self.result_queue = _queue.Queue()
+
+            # sglang 0.5.18 compat: ensure ngram_embedding_manager is not None.
+            # CRITICAL: prepare_for_forward must return the passed-in batch, NOT
+            # None. scheduler.get_next_batch_to_run does
+            #   ret = ngram_embedding_manager.prepare_for_forward(ret, ...)
+            # which overwrites the batch with the return value; returning None
+            # nulls the batch -> event_loop takes on_idle() -> scheduler hang.
+            if getattr(self, "ngram_embedding_manager", None) is None:
+                class _MockNgramManager:
+                    def prepare_for_forward(self, *a, **kw):
+                        return a[0] if a else None
+                self.ngram_embedding_manager = _MockNgramManager()
+
+            # sglang 0.5.18 compat: disable invariant checker (mock pools
+            # don't track token accounting precisely enough)
+            class _NoopInvariantChecker:
+                def self_check_during_busy(self, *a, **kw): pass
+                def _check_all_pools(self, *a, **kw): return False, []
+                def _check_req_pool(self, *a, **kw): pass
+                def _check_tree_cache(self, *a, **kw): pass
+                def _report_leak(self, *a, **kw): pass
+            self.invariant_checker = _NoopInvariantChecker()
+
+            # sglang 0.5.18: Rebuild PULL socket to fix fork+IPC connection issue.
+            # After fork, the inherited PUSH bind fd may cause libzmq IPC state
+            # corruption, preventing PULL from connecting. Rebuild with a fresh
+            # zmq.Context and reconnect to the same endpoint.
+            # Note: SchedulerRequestReceiver is frozen=True dataclass, so we
+            # bypass __setattr__ via object.__setattr__.
+            if hasattr(self, "request_receiver"):
+                try:
+                    import zmq as _zmq
+                    _rr = self.request_receiver
+                    _old_sock = getattr(_rr, "recv_from_tokenizer", None)
+                    if _old_sock is not None:
+                        _endpoint = _old_sock.getsockopt(_zmq.LAST_ENDPOINT)
+                        if isinstance(_endpoint, bytes):
+                            _endpoint = _endpoint.decode()
+                        logger.info(f"Rebuilding PULL socket: old endpoint={_endpoint}")
+                        try:
+                            _old_sock.close()
+                        except Exception:
+                            pass
+                        _new_ctx = _zmq.Context(2)
+                        _new_sock = _new_ctx.socket(_zmq.PULL)
+                        _new_sock.connect(_endpoint)
+                        # frozen=True dataclass: use object.__setattr__ to bypass
+                        object.__setattr__(_rr, "recv_from_tokenizer", _new_sock)
+                        logger.info(f"PULL socket rebuilt and reconnected to {_endpoint}")
+                except Exception as e:
+                    logger.warning(f"PULL socket rebuild failed: {e}")
+
+            # sglang 0.5.18: request fetching moved from process_input_requests
+            # to request_receiver.recv_requests(). Hook the receiver for OFFLINE
+            # FUTURE_QUEUE logic.
+            if hasattr(self, "request_receiver"):
+                from sglang.srt.managers.scheduler_components.request_receiver import SchedulerRequestReceiver
+                _orig_recv = SchedulerRequestReceiver.recv_requests
+
+                def _wrapped_recv_requests(self_rr, *args, **kwargs):
+                    raw_reqs = _orig_recv(self_rr, *args, **kwargs)
+                    if raw_reqs is None:
+                        raw_reqs = []
+
+                    if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
+                        return raw_reqs
+
+                    # OFFLINE mode: collect into FUTURE_QUEUE, then release
+                    if not C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST:
+                        gen_requests = []
+                        extra_requests = []
+                        for req in raw_reqs:
+                            if req.__class__.__name__ == "TokenizedGenerateReqInput":
+                                sim_params = None
+                                if req.sampling_params.custom_params is not None:
+                                    sim_params = req.sampling_params.custom_params.get("simulation")
+                                if sim_params is None:
+                                    extra_requests.append(req)
+                                    continue
+                                gen_requests.append(req)
+                                C_SchedulerHook.FUTURE_QUEUE.append(
+                                    (
+                                        sim_params.get("queue_start") or sim_params["created_time"],
+                                        time.time_ns(),
+                                        req,
+                                    )
+                                )
+                            else:
+                                extra_requests.append(req)
+
+                        if len(C_SchedulerHook.FUTURE_QUEUE) != 0:
+                            _, _, gen_req = C_SchedulerHook.FUTURE_QUEUE[-1] if len(C_SchedulerHook.FUTURE_QUEUE) > 0 else (None, None, None)
+                            if gen_req is not None:
+                                total_request = gen_req.sampling_params.custom_params[
+                                    "simulation"
+                                ]["total_request"]
+                                if len(C_SchedulerHook.FUTURE_QUEUE) == total_request:
+                                    C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = True
+                                    heapq.heapify(C_SchedulerHook.FUTURE_QUEUE)
+                                    logger.info("All requests received. Starting simulation now.")
+                                else:
+                                    logger.info(
+                                        f"Offline simulation mode enabled. {total_request} requests expected. "
+                                        f"Received {len(C_SchedulerHook.FUTURE_QUEUE)} so far."
+                                    )
+                        return extra_requests
+                    else:
+                        # Release requests from FUTURE_QUEUE based on virtual clock
+                        current_timestamp = StateManager.get_global_clock()
+                        released = []
+                        while len(C_SchedulerHook.FUTURE_QUEUE) > 0:
+                            enqueue_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
+                            if enqueue_time > current_timestamp:
+                                break
+                            released.append(req)
+                            heapq.heappop(C_SchedulerHook.FUTURE_QUEUE)
+                        if released:
+                            pass
+                        return released
+
+                # Patch at class level (not instance level, since msgspec.Struct
+                # doesn't allow instance setattr)
+                SchedulerRequestReceiver.recv_requests = _wrapped_recv_requests
+                logger.info("Hooked SchedulerRequestReceiver.recv_requests for OFFLINE mode")
 
             try:
                 model = ConfigManager.get_model_info(
@@ -1358,133 +1878,84 @@ class C_SchedulerHook(BaseHook):
                 raise e
 
         def wrapped_recv_requests(self, *args, **kwargs) -> list:
-            recv_reqs = []
+            recv_reqs = args[0] if args else kwargs.get("recv_reqs", [])
+            if recv_reqs is None:
+                recv_reqs = []
+            if recv_reqs:
+                pass
 
-            if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
-                recv_reqs.extend(original_recv_requests(self, *args, **kwargs))
-            elif C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE:
-                # Initializing
-                if not C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST:
-                    gen_requests = []
-                    extra_requests = []
-                    time.sleep(0.05)  # waiting requests
+            # Note: K3 Mamba track attributes are set on Req objects (not
+            # TokenizedGenerateReqInput) in wrapped_get_new_batch_prefill,
+            # because TokenizedGenerateReqInput is msgspec.Struct (frozen,
+            # cannot setattr). Req is a regular Python class (can setattr).
 
-                    reqs = original_recv_requests(self, *args, **kwargs)
-
-                    for req in reqs:
-                        if req.__class__.__name__ == "TokenizedGenerateReqInput":
-                            gen_requests.append(req)
-                        else:
-                            # Such as: /profile_start, /flush_cache, etc.
-                            extra_requests.append(req)
-
-                    # Add requests to future queue
-                    for req in gen_requests:
-                        sim_params = None
-                        if req.sampling_params.custom_params is not None:
-                            sim_params = req.sampling_params.custom_params.get(
-                                "simulation"
-                            )
-                        if sim_params is None:
-                            # There are some warm-up requests when starting the server without --skip-server-warmup.
-                            extra_requests.append(req)
-                            logger.warning(
-                                "Failed to extract the simulation parameters required for simulation from the request. Ignore this warning if the request is a warm-up request."
-                            )
-                            continue
-                        if sim_params.get("queue_start"):
-                            logger.debug(
-                                "Add request to waiting queue with custom queue start timestamp."
-                            )
-
-                        C_SchedulerHook.FUTURE_QUEUE.append(
-                            (
-                                sim_params.get("queue_start")
-                                or sim_params["created_time"],
-                                time.time_ns(),  # The request is not comparable, so add the salt to avoid comparison.
-                                req,
-                            )
-                        )
-
-                    if len(C_SchedulerHook.FUTURE_QUEUE) != 0:
-                        _, _, gen_req = C_SchedulerHook.FUTURE_QUEUE[-1]
-                        total_request = gen_req.sampling_params.custom_params[
-                            "simulation"
-                        ]["total_request"]
-
-                        if len(C_SchedulerHook.FUTURE_QUEUE) == total_request:
-                            C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = True
-                            heapq.heapify(C_SchedulerHook.FUTURE_QUEUE)
-                            logger.info(
-                                "All requests received. Starting simulation now."
-                            )
-                        else:
-                            logger.info(
-                                f"Offline simulation mode enabled. {total_request} requests expected in total. Received {len(C_SchedulerHook.FUTURE_QUEUE)} requests so far."
-                            )
-
-                    if len(extra_requests) != 0:
-                        # Schedule the extra requests immediately.
-                        return extra_requests
-                else:
-                    # Extra requests include: flush request, abort request, etc.
-                    recv_reqs.extend(original_recv_requests(self, *args, **kwargs))
-
-                # Process the arrived requests only after all requests have been added to the future queue
-                current_timestamp = StateManager.get_global_clock()
-                while (
-                    C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST
-                    and len(C_SchedulerHook.FUTURE_QUEUE) > 0
-                ):
-                    enqueue_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
-                    if enqueue_time > current_timestamp:
-                        break
-                    recv_reqs.append(req)
-                    heapq.heappop(C_SchedulerHook.FUTURE_QUEUE)
-
+            # Initialize REQUEST_STATS
             now = time.time()
             for req in recv_reqs:
                 if req.__class__.__name__ in [
                     "BatchTokenizedGenerateReqInput",
                     "TokenizedGenerateReqInput",
                 ]:
+                    if req.rid not in C_SchedulerHook.REQUEST_STATS:
+                        C_SchedulerHook.REQUEST_STATS[req.rid] = RequestStats()
                     req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
                     req_stats.rid = req.rid
                     req_stats.input_length = len(req.input_ids)
                     req_stats.output_length = req.sampling_params.max_new_tokens
-                    simulation_args = req.sampling_params.custom_params["simulation"]
+                    simulation_args = req.sampling_params.custom_params.get("simulation", {})
                     if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
-                        if "server_created_time" not in simulation_args:
-                            logger.warning(
-                                "The request's creation time is missing, which may cause the TTFT to be inaccurate."
-                            )
-                        req_stats.created_time = simulation_args.get(
-                            "server_created_time", now
-                        )
+                        req_stats.created_time = simulation_args.get("server_created_time", now)
                         req_stats.last_event_time = req_stats.created_time
                         req_stats.queue_start = now
                     elif C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE:
-                        req_stats.created_time = simulation_args["created_time"]
+                        req_stats.created_time = simulation_args.get("created_time", 0)
                         req_stats.last_event_time = req_stats.created_time
-                        # Align with the real queue start timestamp if queue_start is not None. For debugging only.
                         queue_start = simulation_args.get("queue_start")
                         if queue_start is not None:
                             StateManager.set_global_clock(queue_start)
                         req_stats.queue_start = StateManager.get_global_clock()
+                        if C_SchedulerHook.LAST_CPU_TS == 0:
+                            C_SchedulerHook.LAST_CPU_TS = time.time()
+                            StateManager.set_global_clock(0)
 
             if recv_reqs and C_SchedulerHook.LAST_CPU_TS == 0:
                 C_SchedulerHook.LAST_CPU_TS = time.time()
                 StateManager.set_global_clock(0)
 
+            # Call original process_input_requests to process the requests
+            try:
+                original_recv_requests(self, *args, **kwargs)
+            except Exception as e:
+                logger.error(f"process_input_requests error: {e}", exc_info=True)
+
             return recv_reqs
 
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
+            # sglang 0.5.18 K3 compat: initialize Mamba/KDA track attributes
+            # on Req objects in waiting_queue before prepare_for_extend
+            for req in getattr(self, "waiting_queue", []):
+                if not hasattr(req, "mamba_ping_pong_track_buffer") or \
+                   getattr(req, "mamba_ping_pong_track_buffer", None) is None:
+                    req.mamba_ping_pong_track_buffer = torch.tensor(
+                        [-1, -1], dtype=torch.int32
+                    )
+                if not hasattr(req, "mamba_next_track_idx") or \
+                   getattr(req, "mamba_next_track_idx", None) is None:
+                    req.mamba_next_track_idx = 0
+
             new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
             now = time.time()
-            if new_batch is not None:
-                for req in new_batch.reqs:
+            # sglang 0.5.18: returns NextBatchPlan with .batch_to_run
+            # older sglang: returns ScheduleBatch directly
+            actual_batch = getattr(new_batch, "batch_to_run", new_batch)
+            if actual_batch is not None:
+                for req in actual_batch.reqs:
                     req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
-                    req_stats.final_reused_tokens = req.cached_tokens
+                    req_stats.final_reused_tokens = (
+                        req.cached_tokens
+                        if getattr(req, 'cached_tokens', 0) > 0
+                        else len(req.prefix_indices)
+                    )
                     if req_stats.queue_end == -1:
                         if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
                             req_stats.queue_end = now
@@ -1499,19 +1970,39 @@ class C_SchedulerHook(BaseHook):
                         req_stats.l2_hit_tokens = host_hit
                         C_SchedulerHook._L2_HIT_TOKENS += host_hit
                         C_SchedulerHook._L2_HIT_COUNT += 1
+                        # Manually record L2 load_back (H2D) timing, since the
+                        # real load() may fail when device pool is full (alloc
+                        # returns None). This ensures l2_load_latency is recorded
+                        # whenever host_hit is detected.
+                        tc = getattr(self, 'tree_cache', None)
+                        if tc is not None and hasattr(tc, 'full_kv_pool_host'):
+                            try:
+                                import numpy as np
+                                tc.full_kv_pool_host.load_to_device_per_layer(
+                                    tc.full_kv_pool_host.device_pool,
+                                    torch.arange(host_hit, dtype=torch.int64),
+                                    torch.arange(host_hit, dtype=torch.int64),
+                                    0, "kernel",
+                                )
+                            except Exception:
+                                pass
                     # Log cache state per prefill batch (L1/L2 pool sizes)
                     tc = getattr(self, 'tree_cache', None)
-                    if tc is not None and hasattr(tc, 'evictable_size_'):
+                    l1_evict = l1_total = l2_avail = 0
+                    if tc is not None:
+                        try:
+                            l1_evict = tc.evictable_size() if hasattr(tc, 'evictable_size') else 0
+                        except Exception:
+                            l1_evict = 0
                         cc = getattr(tc, 'cache_controller', None)
-                        l2_avail = cc.mem_pool_host.available_size() if cc and hasattr(cc, 'mem_pool_host') else -1
-                        l1_evict = tc.evictable_size_
-                        l1_total = tc.token_to_kv_pool_allocator.available_size() + l1_evict if hasattr(tc, 'token_to_kv_pool_allocator') else -1
-                        owt = len(getattr(tc, 'ongoing_write_through', {}))
-                        olb = len(getattr(tc, 'ongoing_load_back', {}))
+                        if cc is not None and hasattr(cc, 'mem_pool_host'):
+                            l2_avail = cc.mem_pool_host.available_size()
+                        elif hasattr(tc, 'full_kv_pool_host') and tc.full_kv_pool_host is not None:
+                            l2_avail = tc.full_kv_pool_host.available_size()
+                        l1_total = (tc.token_to_kv_pool_allocator.available_size() + l1_evict) if hasattr(tc, 'token_to_kv_pool_allocator') else -1
                     logger.info(
                         f"Cache state: L1_evict={l1_evict} L1_total={l1_total} "
-                        f"L2_avail={l2_avail} L2_host_leaves={len(tc.evictable_host_leaves)} "
-                        f"owt={owt} olb={olb}"
+                        f"L2_avail={l2_avail}"
                     )
             elif len(self.running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
                 # Prefetching
@@ -1524,20 +2015,89 @@ class C_SchedulerHook(BaseHook):
                 ):
                     next_created_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
                     StateManager.set_global_clock(next_created_time + 1e-6)
+
+            # Proactive eviction: simulate real-world memory pressure.
+            # In real hardware, L1 fills up because requests run for seconds.
+            # In HiSim's virtual clock, requests finish instantly so L1 never
+            # fills. We proactively evict idle (lock_ref==0) nodes to trigger
+            # the L1→L2 demote chain. This is only effective for nodes already
+            # backuped (write_through on insert sets backuped=True). Evicting a
+            # backuped node sets evicted=True, which makes future match_prefix
+            # calls see host_hit_length > 0 → triggers L2 load_back (H2D).
+            _tc = getattr(self, 'tree_cache', None)
+            if _tc is not None and (getattr(_tc, '_hicache_cn', 0) % 10 == 0):
+                try:
+                    _es = _tc.evictable_size() if hasattr(_tc, 'evictable_size') else 0
+                except Exception:
+                    _es = 0
+                if _es > 0:
+                    try:
+                        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+                        _tc.evict(EvictParams(num_tokens=_es))
+                        logger.info(
+                            f"Proactive evict: {_es} tokens demoted to L2, "
+                            f"L1_avail={_tc.token_to_kv_pool_allocator.available_size() if hasattr(_tc, 'token_to_kv_pool_allocator') else -1}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Proactive evict failed: {e}")
+
             logger.debug(
                 f"Get new batch prefill: global iteration={StateManager.get_iteration()}, "
-                f"new batch={new_batch.batch_size() if new_batch is not None else 0}, "
+                f"new batch={actual_batch.batch_size() if actual_batch is not None else 0}, "
                 f"waiting queue={len(self.waiting_queue)}"
             )
+
+            # OFFLINE mode: trigger metrics collection when all requests have
+            # finished (running_batch empty = all decode done, waiting_queue
+            # empty, FUTURE_QUEUE empty). This is checked here because
+            # wrapped_get_new_batch_prefill is called every event_loop
+            # iteration, including when the scheduler goes idle (batch=None).
+            # wrapped_process_batch_result is NOT called when batch is None.
+            # NOTE: `actual_batch is None` is essential: a freshly-built prefill
+            # batch has already drained waiting_queue but is not merged into
+            # running_batch yet, so the queues transiently look empty. Without
+            # this guard the dump fires mid-simulation, clears REQUEST_STATS,
+            # and all subsequent request latencies are silently lost (seen with
+            # output_len=1 traces where the last prefill batch is the final work).
+            if (
+                C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE
+                and C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST
+                and len(C_SchedulerHook.FUTURE_QUEUE) == 0
+                and len(self.waiting_queue) == 0
+                and (self.running_batch is None or len(self.running_batch.reqs) == 0)
+                and getattr(self, "chunked_req", None) is None
+                and actual_batch is None
+                and len(C_SchedulerHook.REQUEST_STATS) > 0
+                and not getattr(C_SchedulerHook, "_metrics_written", False)
+            ):
+                C_SchedulerHook._metrics_written = True
+                logger.info(
+                    "[HiSim] OFFLINE simulation complete: dumping metrics "
+                    f"(completed={len(C_SchedulerHook.REQUEST_STATS)})"
+                )
+                wrapped_profile(self, None)
 
             return new_batch
 
         def wrapped_run_batch(self, *args, **kwargs):
-            ret = original_run_batch(self, *args, **kwargs)
-
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            # Defensive fallback: ensure model_runner.ngram_embedding_manager is a
+            # disabled mock. ForwardBatch.init_new reads
+            # model_runner.ngram_embedding_manager.enabled; in the forked
+            # scheduler the model_runner may be re-instantiated and left None,
+            # raising "AttributeError: 'NoneType' object has no attribute
+            # 'enabled'" before any forward runs.
+            _mr = getattr(getattr(self, "tp_worker", None), "model_runner", None)
+            if _mr is not None and getattr(_mr, "ngram_embedding_manager", None) is None:
+                class _NoopNgram:
+                    enabled = False
+                try:
+                    _mr.ngram_embedding_manager = _NoopNgram()
+                except Exception:
+                    object.__setattr__(_mr, "ngram_embedding_manager", _NoopNgram())
+            ret = original_run_batch(self, *args, **kwargs)
 
             if ret.__class__.__name__ == "GenerationBatchResult":
                 hisim_batch = HisimScheduleBatch(reqs=[])
@@ -1545,7 +2105,11 @@ class C_SchedulerHook(BaseHook):
                     for req in batch.reqs:
                         hisim_batch.reqs.append(
                             FakeRequest(
-                                input_length=req.extend_input_len,
+                                input_length=getattr(
+                                    getattr(req, "extend_range", None),
+                                    "length",
+                                    len(req.origin_input_ids),
+                                ),
                                 past_kv_length=len(req.prefix_indices)
                                 + len(req.output_ids),
                             )
@@ -1587,11 +2151,16 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_process_batch_result(self, *args, **kwargs):
-            ret = original_process_batch_result(self, *args, **kwargs)
-
+            # CPU simulation: original_process_batch_result may fail because
+            # the detokenizer subprocess is not running (ZMQ send fails).
+            # We don't need detokenizer output in simulation — catch and continue.
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            try:
+                ret = original_process_batch_result(self, *args, **kwargs)
+            except Exception:
+                ret = None
             if batch is not None:
                 if len(batch.reqs) == 0:
                     return ret
@@ -1603,11 +2172,13 @@ class C_SchedulerHook(BaseHook):
                 kda_l2_load_dur = StateManager.pop_hicache_kda_l2_load_dur()
                 kda_l2_backup_dur = StateManager.pop_hicache_kda_l2_backup_dur()
                 kda_l3_backup_dur = StateManager.pop_hicache_kda_l3_backup_dur()
+                kda_l3_load_dur = StateManager.pop_hicache_kda_l3_load_dur()
                 # MLA and KDA D2H/H2D run in parallel — take max
-                l2_load_dur = max(hicache_l2_load_dur, kda_l2_load_dur)
+                l2_load_dur = max(hicache_l2_load_dur, kda_l2_load_dur, kda_l3_load_dur)
                 l2_backup_dur = max(hicache_l2_backup_dur, kda_l2_backup_dur)
                 l3_backup_dur = max(hicache_l3_backup_dur, kda_l3_backup_dur)
                 current_inference_dur = StateManager.get_current_inference_dur()
+                l3_direct_dur = 0.0
 
                 try:
                     if ConfigManager.get_platform_config().enable_l3_direct_to_l1:
@@ -1655,34 +2226,44 @@ class C_SchedulerHook(BaseHook):
                     request_response_time = StateManager.get_global_clock()
                 # Request statistics
                 for req in batch.reqs:
-                    if req.is_chunked == 0:
-                        req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
-                        req_stats.gen_token_latencies.append(
-                            request_response_time
-                            - req_stats.last_event_time  # queue duration
-                        )
+                    if getattr(req, "is_chunked", 0) == 0:
+                        req_stats = C_SchedulerHook.REQUEST_STATS.get(req.rid)
+                        if req_stats is None:
+                            continue
+                        _lat = request_response_time - req_stats.last_event_time
+                        if not math.isfinite(_lat) or _lat < 0:
+                            # Guard against NaN/negative from virtual-clock
+                            # anomalies (e.g. eviction timing); skip bad samples.
+                            continue
+                        req_stats.gen_token_latencies.append(_lat)
                         req_stats.last_event_time = request_response_time
                     else:
                         # Chunked request: nothing to do
                         pass
                 # Iteration statistics
-                C_SchedulerHook.ITERATION_STATS.append(
-                    {
-                        "requests": C_SchedulerHook.HISIM_BATCH.request_info(),
-                        "forward_latency": current_inference_dur,
-                        "l2_load_latency": hicache_l2_load_dur,
-                        "l2_backup_latency": hicache_l2_backup_dur,
-                        "l3_backup_latency": hicache_l3_backup_dur,
-                    }
-                )
+                _iter_stat = {
+                    "requests": C_SchedulerHook.HISIM_BATCH.request_info(),
+                    "forward_latency": current_inference_dur,
+                    "l2_load_latency": l2_load_dur,
+                    "l2_backup_latency": l2_backup_dur,
+                    "l3_backup_latency": l3_backup_dur,
+                }
+                if l3_direct_dur > 0:
+                    _iter_stat["l3_direct_load_latency"] = l3_direct_dur
+                C_SchedulerHook.ITERATION_STATS.append(_iter_stat)
+
             C_SchedulerHook.LAST_CPU_TS = time.time()
             return ret
 
         def wrapped_profile(self, req, *args, **kwargs):
+            C_SchedulerHook._profile_call_count = getattr(C_SchedulerHook, "_profile_call_count", 0) + 1
             stats: list[RequestStats] = []
+            _rs_total = len(C_SchedulerHook.REQUEST_STATS)
             for item in C_SchedulerHook.REQUEST_STATS.values():
-                if item.rid is not None and item.input_length > 0:
+                if item.rid is not None and item.input_length > 0 and len(item.gen_token_latencies) > 0:
                     stats.append(item)
+            if _rs_total > 0 and len(stats) == 0:
+                pass
 
             stats = sorted(stats, key=lambda req: req.created_time)
 
@@ -1739,6 +2320,22 @@ class C_SchedulerHook(BaseHook):
                         f"L2 cache stats: hit_requests={C_SchedulerHook._L2_HIT_COUNT}, "
                         f"hit_tokens={C_SchedulerHook._L2_HIT_TOKENS}"
                     )
+                    # Log KDA/MAMBA pool transfer diagnostics
+                    _tc = getattr(self, 'tree_cache', None)
+                    if _tc is not None:
+                        _dw = getattr(_tc, '_hismim_diag_w', {})
+                        _dl = getattr(_tc, '_hismim_diag_l', {})
+                        if _dw or _dl:
+                            logger.info(
+                                f"KDA diag: write_calls={_dw.get('calls',0)} "
+                                f"mamba_write_xfers={_dw.get('mamba_pt',0)} "
+                                f"full_only_writes={_dw.get('full_only',0)} "
+                                f"l3_writes={_dw.get('l3_writes',0)} | "
+                                f"load_calls={_dl.get('calls',0)} "
+                                f"mamba_load_xfers={_dl.get('mamba_pt',0)} "
+                                f"full_only_loads={_dl.get('full_only',0)} "
+                                f"l3_hits={_dl.get('l3_hits',0)}"
+                            )
                     # Log per-request L1/L2/L3 hit breakdown
                     for item in metrics_stats:
                         # final_reused_tokens (cached_tokens) includes both L1 prefix match
@@ -1780,7 +2377,7 @@ class C_SchedulerHook(BaseHook):
                 "output_directory": output_dir,
             }
 
-            return ProfileReqOutput(True, json.dumps(result))
+            return ProfileReqOutput(success=True, message=json.dumps(result))
 
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
@@ -1793,3 +2390,42 @@ class C_SchedulerHook(BaseHook):
         target.process_batch_result = wrapped_process_batch_result
         if hasattr(target, "profile"):
             target.profile = wrapped_profile
+
+        # Always wrap Scheduler.__init__ to patch profiler_manager._profile
+        # sglang 0.5.18 replaced Scheduler.profile with SchedulerProfilerManager._profile
+        # (dispatched via ZMQ), so we hook the profiler_manager after it's created.
+        _orig_scheduler_init = target.__init__
+
+        def patched_scheduler_init(self, *args, **kwargs):
+            _orig_scheduler_init(self, *args, **kwargs)
+            logger.debug("patched_scheduler_init post-init starting")
+            try:
+                if hasattr(self, "profiler_manager"):
+                    _orig_pm_profile = self.profiler_manager._profile
+
+                    def wrapped_pm_profile(recv_req, *a, **kw):
+                        result = _orig_pm_profile(recv_req, *a, **kw)
+                        # In OFFLINE mode the metrics dump is owned by the
+                        # auto-trigger in wrapped_get_new_batch_prefill (fires
+                        # only when the simulation is truly complete). An
+                        # early /start_profile here would dump partial stats
+                        # and clear REQUEST_STATS mid-simulation, losing all
+                        # subsequent request latencies.
+                        if C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE:
+                            logger.debug(
+                                "OFFLINE mode: skipping profile-request dump"
+                            )
+                            return result
+                        try:
+                            wrapped_profile(self, recv_req, *a, **kw)
+                        except Exception as e:
+                            logger.debug(f"HiSim profile dump failed: {e}")
+                        return result
+                    self.profiler_manager._profile = wrapped_pm_profile
+                    logger.debug("patched profiler_manager._profile for 0.5.18")
+                else:
+                    logger.warning("Scheduler has no profiler_manager")
+            except Exception as e:
+                logger.error(f"HiSim profiler patch error: {e}")
+
+        target.__init__ = patched_scheduler_init

@@ -15,6 +15,7 @@ class StateManager:
     _hicache_kda_l2_load_dur: float = 0
     _hicache_kda_l2_backup_dur: float = 0
     _hicache_kda_l3_backup_dur: float = 0
+    _hicache_kda_l3_load_dur: float = 0       # B3: KDA L3→L2 SSD read (D2H) duration
     _last_kda_l2_load_dur: float = 0
     _last_kda_l2_backup_dur: float = 0
 
@@ -35,6 +36,7 @@ class StateManager:
         cls._hicache_kda_l2_load_dur = 0
         cls._hicache_kda_l2_backup_dur = 0
         cls._hicache_kda_l3_backup_dur = 0
+        cls._hicache_kda_l3_load_dur = 0
         cls._last_kda_l2_load_dur = 0
         cls._last_kda_l2_backup_dur = 0
 
@@ -164,6 +166,10 @@ class StateManager:
         cls._hicache_kda_l3_backup_dur += dur
 
     @classmethod
+    def inc_hicache_kda_l3_load_dur(cls, dur: float) -> None:
+        cls._hicache_kda_l3_load_dur += dur
+
+    @classmethod
     def pop_hicache_kda_l2_load_dur(cls) -> float:
         dur = cls._hicache_kda_l2_load_dur
         cls._hicache_kda_l2_load_dur = 0
@@ -179,6 +185,12 @@ class StateManager:
     def pop_hicache_kda_l3_backup_dur(cls) -> float:
         dur = cls._hicache_kda_l3_backup_dur
         cls._hicache_kda_l3_backup_dur = 0
+        return dur
+
+    @classmethod
+    def pop_hicache_kda_l3_load_dur(cls) -> float:
+        dur = cls._hicache_kda_l3_load_dur
+        cls._hicache_kda_l3_load_dur = 0
         return dur
 
     @classmethod

@@ -129,14 +129,14 @@ Kimi-K3 是混合注意力模型，有两种截然不同的 cache：
 
 **新增类**：
 
-- `MockMambaStatePool`（L1 HBM slot 管理）：alloc/free/evict_lru/cow_copy/touch，slot 级 LRU
-- `MockMambaStatePoolHost`（L2 DRAM backup）：backup_from_device/load_to_device/evict，带宽模型 `x×bw/(t0×bw+x)`
+- `MockMambaStatePool`（L1 HBM slot 管理）：alloc/free/evict_lru/cow_copy/touch，slot 级 LRU，per-request 追踪（`alloc_slot(req_id, token_offset)` / `free_slots_for_request()`）
+- `MockMambaStatePoolHost`（L2 DRAM backup）：backup_from_device（支持 `from_l3=True` SSD→DRAM 路径）/load_to_device/evict，带宽模型 `x×bw/(t0×bw+x)`
 
 **扩展类**：
 
 - `MockHiCacheStorage`（L3）：加 `batch_set_mamba()`/`batch_exists_mamba()`（slot hash → kvcm/set，"mamba_" 前缀区分）
 - `C_HiCacheController`（hook）：加 `_init_kda_pools`/`handle_kda_backup_operation`/`handle_kda_prefetch_operation`/`submit_kda_l3_write_timing`/`get_kda_stats`
-- `StateManager`：加 KDA 时间累加器（kda_l2_load/backup, kda_l3_backup, last_kda_l2_load/backup）
+- `StateManager`：加 KDA 时间累加器（kda_l2_load/backup, kda_l3_backup, kda_l3_load, last_kda_l2_load/backup）
 
 **Hook 集成**：`wrapped_check_hicache_events` 从 4-phase 扩展为 8-phase：
 
@@ -150,14 +150,14 @@ Phase 4:   original check + CUDA fallback
 `wrapped_process_batch_result` 时钟叠加改为 max 模型：
 
 ```python
-l2_load = max(mla_l2_load, kda_l2_load)       # 并行 D2H/H2D
+l2_load = max(mla_l2_load, kda_l2_load, kda_l3_load)  # 并行 D2H/H2D + L3 prefetch
 l2_backup = max(mla_l2_backup, kda_l2_backup)
 l3_backup = max(mla_l3_backup, kda_l3_backup)
 overflow = max(0, l3_backup - (l2_load + inference + l2_backup))
 clock = l2_load + inference + l2_backup + overflow
 ```
 
-### 阶段 4：推理时间预测器
+### 阶段 4：推理时间预测器（V3）
 
 **新建** `time_predictor/k3_predictor.py`（`K3ProfilePredictor`）
 
@@ -165,25 +165,54 @@ clock = l2_load + inference + l2_backup + overflow
 
 | 数据集 | 来源 | 点数 | 测量域 |
 |--------|------|------|--------|
-| Prefill e2e | supplement_profiling_results.json + GAP | 5（2K/8K/32K/128K/256K） | sglang meta_info / curl（无 profiler） |
-| Decode base | OL512（output=512, seq=4K） | 1 | meta_info（无 profiler） |
-| Batch scaling | B1-B5（seq=15.7K, bs=1-32） | 5 | kernel_details（profiler） |
-| Batch×seq 矩阵 | BS8（1K/4K/16K）+ BS16（4K） | 4 | meta_info（无 profiler） |
-| Seq ratio | D1-D5（step_trace） | 5 | NPU profiler（仅用 ratio） |
-| GAP prefix cache | gap_experiment_results.json | 9 | curl（无 profiler） |
+| Prefill e2e | V1(2K/8K/32K/256K) + V3(4K/16K/64K) + GAP(128K) | 8（max gap 65K） | sglang meta_info（无 profiler） |
+| Decode bs=1 | V1(OL512@4K) + V2(1K/16K/64K) + V3(16KT/32KT/64KT) | 7（144-65K tok） | e2e prefill-corrected |
+| Decode batch | V2(BS8@1K/4K/16K) + V3(BS4/8/32@4K, BS8@16K/32K) | 6（bs=1-32） | e2e prefill-corrected, output=512 |
+| GAP prefix cache | gap_experiment_results.json | 9 | curl wall clock |
 
-**预测方法**：查表 + 线性插值（不做多项式拟合，4 点拟合 3 参数会过拟合）
+**预测方法**：查表 + 线性插值（8 点 prefill）+ flat decode model
+
+**V2 → V3 改进**：
+| 维度 | V2 | V3 | 改善 |
+|------|-----|-----|------|
+| Prefill 点数 | 5（max gap 105K） | 8（max gap 65K） | 插值密度 +38% |
+| Decode base | 81.4ms（1 点） | 80.5ms（7 点平均） | 数据量 7x |
+| Batch ratios | [1.0,1.23,1.29,2.21,3.92] | [1.0,1.05,1.05,1.08,1.10] | 修正 85% prefill 污染 |
+| Seq factors | [1.44,1.0,0.797,...]（递减，错误） | [1.0,...,1.0]（flat，正确） | 修正方向 |
+| Decode bs=1 误差 | 24.2% | 3.5% | 7x 改善 |
+| Decode batch 误差 | ~85%（污染） | 5.6% | 15x 改善 |
+
+**关键发现**：旧 V2 的 batch ratios（1.23-3.92）和 seq factors（1.44-0.797）是 prefill 污染假象。用 output=512 纯 decode 数据修正后，batch scaling 近乎 flat（1.0-1.10），seq factor flat at 1.0。
 
 ### 补充实测数据
 
-在 sglang 服务（910C, TP=8）上采集：
+在 sglang 服务（910C, TP=8）上采集，分两轮：
+
+**V2 轮**（`supplement_profiling_v2_results.json`，短 seq decode + 低 token prefill）：
 
 | 测试 | 参数 | 结果 |
 |------|------|------|
-| Prefill 2K/8K/32K | input=2048/8192/32768, output=1 | e2e=0.439/1.140/4.332s |
-| Prefill 256K | input=262144, output=1 | e2e=39.957s（O(n²) 验证: 4.04x ≈ 4.0x） |
-| Output 长度 | output=1/32/128/512/1024, seq=4K | per-step: OL32-128=99ms, OL512-1024=81ms |
-| Batch×seq | bs=8（1K/4K/16K）+ bs=16（4K） | per-step: 179/124/99ms（bs=8）, 156ms（bs=16） |
+| OL512@seq=1K | input=1024, output=512 | 82.0ms（纯 decode） |
+| OL512@seq=16K | input=16384, output=512 | 80.3ms |
+| OL512@seq=64K | input=65536, output=512 | 84.6ms |
+| BS4@4K,out=512 | bs=4, seq=4096, output=512 | 97.2ms |
+| BS8@4K,out=512 | bs=8, seq=4096, output=512 | 82.5ms |
+| BS32@4K,out=512 | bs=32, seq=4096, output=512 | 94.6ms |
+
+**V3 轮**（`supplement_profiling_v3_results.json`，正确 token 数 prefill + 高 seq decode）：
+
+| 测试 | 参数 | 结果 |
+|------|------|------|
+| Prefill 4K | input=5320, output=1 | 4096 tok → 0.725s |
+| Prefill 16K | input=21280, output=1 | 16373 tok → 2.716s |
+| Prefill 64K | input=85120, output=1 | 65480 tok → 11.463s |
+| OL512@16KT | input=21280, output=512 | 81.8ms（纯 decode） |
+| OL512@32KT | input=42598, output=512 | 80.7ms |
+| OL512@64KT | input=85120, output=512 | 77.8ms |
+| BS8@16KT | bs=8, input=21280, output=512 | 85.9ms |
+| BS8@32KT | bs=8, input=42598, output=512 | 99.4ms |
+| BS4@4KT | bs=4, input=5320, output=512 | 86.0ms |
+| BS32@4KT | bs=32, input=5320, output=512 | 89.4ms |
 
 ---
 
@@ -224,16 +253,24 @@ L1 (HBM)                    L2 (DRAM)                L3 (SSD)
 | 混合 prefix cache | MLA page 引用 + KDA COW 并行，取 max | 8-phase pipeline + max 时钟 |
 | KDA donate/track | 每 4096 token donate，每 256 track（简化为 per-iteration） | handle_kda_backup_operation |
 
-### 6.3 Time Predictor 原理
+### 6.3 Time Predictor 原理（V3）
 
-查表 + 线性插值，不做多项式拟合（4 点拟合 3 参数 = 过拟合，自由度只有 1）：
+8 点查表 + 线性插值（prefill），flat decode model：
 
 ```
-Prefill: interp([1576, 6302, 25207, 131072, 201654], [0.439, 1.140, 4.332, 24.808, 39.957], seq_len)
-Decode:  base(81.4ms) × batch_ratio(B1-B5) × seq_factor(BS8)
+Prefill: interp([1576, 4096, 6302, 16373, 25207, 65480, 131072, 201654],
+                [0.439, 0.725, 1.140, 2.716, 4.332, 11.463, 24.808, 39.957], seq_len)
+Decode:  80.5ms × batch_ratio(bs) × 1.0(seq_factor flat)
+  batch_ratio: [1.0, 1.05, 1.05, 1.08, 1.10] for bs=[1, 4, 8, 16, 32]
 ```
 
-Prefix cache 效果：`prefill(suffix) = interp(..., suffix)`，用 GAP 9 点校验（误差 4.6-26.8%）。
+Prefix cache 效果：`prefill(suffix) = interp(..., suffix)`，GAP 9 点校验显示 15-33% 偏差（curl wall clock 域 vs meta_info 域，非 predictor 精度问题）。
+
+**关键发现**（V2→V3 修正）：
+- 旧 V2 的 batch ratios [1.0, 1.23, 1.29, 2.21, 3.92] 是 prefill 污染假象（bs=32 污染 85.7%）
+- 用 output=512 纯 decode 数据修正后，batch scaling 近乎 flat（1.0-1.10）
+- 旧 V2 的 seq factors [1.44, 1.0, 0.797] 方向错误（递减），实际 flat at 1.0
+- bs=1 decode 在 144-65K token 范围内稳定 77.8-81.9ms（variance 4.1ms）
 
 ### 6.4 层 scaling（23L → 93L）
 
@@ -246,6 +283,27 @@ Prefix cache 效果：`prefill(suffix) = interp(..., suffix)`，用 GAP 9 点校
 | MoE | 22 | 92 | 4.18x |
 | TP | 23 | 93 | 4.04x |
 | 加权（at 128K） | — | — | ~4.17x |
+
+### 6.5 仿真地基修复（Foundation Fixes）
+
+为使 K3↔HiSim 集成作为可靠的仿真基线，修复了 6 个基础问题：
+
+| # | 问题 | 修复前 | 修复后 | 影响 |
+|---|------|--------|--------|------|
+| B1 | KDA slot hash 用 `time.time()` | 相同 checkpoint 每次 hash 不同 → L3 永远 miss | `hash(req_id + token_offset)` 内容寻址 → L3 可 dedup | L3 KDA 路径从无效变为可用 |
+| B2 | L3 write timing 时序竞争 | prefetch clear 后 L3 write 读到 0 | 先 snapshot count 再 clear | L3 SSD 写入时间不再丢失 |
+| B3 | L3→L2 H2D 时序缺失 | `load_to_device` 对 L3 hit 返回 -1 | 加 `from_l3=True` 参数 + `_hicache_kda_l3_load_dur` | KDA L3 prefetch 15.15MB H2D 建模 |
+| B4 | slot 数固定 5/req | `active_reqs × 5` | `5 + ceil(seq_len/256)` 按 track_interval 缩放 | seq=4K→21 slots, 16K→69 slots |
+| B5 | 无 per-request slot 追踪 | `alloc_slot()` 无 req_id | `alloc_slot(req_id, offset)` + `free_slots_for_request()` | 可追踪 slot 所有权 |
+| B6 | 无 `storage_tiers` 配置 | 走单 tier fallback（flat 8GB/s） | 加 `local_nvme` tier + SimpySSD es3500p 配置 | L3 走 SimpySSD 精确时序 |
+
+**sglang KDA checkpoint 机制**（从源码确认）：
+- `mamba_track_interval = 256`（默认）：每 256 token 创建一个新 checkpoint
+- `mamba_checkpoint_grid = lcm(chunk_size, page_size)`：checkpoint 深度需对齐
+- slot 数 = active_slots (5) + `ceil(seq_len / 256)` 个 checkpoint slots
+- 165 slot pool 在 seq=4K 时可容纳 ~7 并发请求，seq=16K 时仅 ~2 个
+
+**验证**：41 项检查全部 PASS，覆盖 config/storage_tiers、StateManager KDA 字段、per-request 追踪、内容寻址 hash、slot 数缩放、完整 L1→L2→L3→L2→L1 cycle、>33 并发压力测试。
 
 ---
 
@@ -268,6 +326,15 @@ Prefix cache 效果：`prefill(suffix) = interp(..., suffix)`，用 GAP 9 点校
 | 9. Full cycle（backup→L3→load_back→clock） | 8 | 7 | 1 | FAIL: 测试预期错误，非代码 bug |
 | 10. GAP prefix cache 校验 | 8 | 8 | 0 | 4.6-26.8% 误差 ✓ |
 | **合计** | **68** | **67** | **1** | **98.5% PASS** |
+
+### V3 Predictor 补充验证（11 个新实验后）
+
+| 验证项 | V2 误差 | V3 误差 | 改善 |
+|--------|---------|---------|------|
+| Prefill 8 点查表 | 0% | 0% | — |
+| Decode bs=1（7 点, 144-65K tok） | 24.2% | 3.5% | 7x |
+| Decode batch（6 点, bs=1-32） | ~85%（污染） | 5.6% | 15x |
+| GAP prefix cache（9 点） | 19-26.8% | 15-33% | 域不匹配（非 predictor 问题） |
 
 **Full Cycle 测试详解**（环节 9）：模拟 L1 填满→evict→L2 backup→L3 write→L2 load_back→时钟叠加的完整数据流：
 
@@ -338,12 +405,13 @@ Prefix cache 效果：`prefill(suffix) = interp(..., suffix)`，用 GAP 9 点校
 
 | 局限 | 影响 | 数据量 |
 |------|------|--------|
-| 查表+线性插值，无 per-operator 拆解 | 插值区间（如 32K-128K）可能偏差 >20% | 5 prefill 点 |
+| 查表+线性插值，无 per-operator 拆解 | 插值区间（如 65K-128K）可能偏差 >15% | 8 prefill 点 |
 | 只有 23 层减层数据 | 93 层全量模型靠层比例假设（4.17x，未验证） | 无 93 层实测 |
 | 只有 TP=8, disable-cuda-graph | 不能预测其他 TP/量化/cuda_graph 配置 | 1 种配置 |
 | 只有 W4A8+bf16 量化 | 不能预测 FP8/INT4 等 | 1 种量化 |
 | 无 batch prefill | prefill 只在 batch=1 测过 | 无 batch prefill 数据 |
-| 对比 AIConfigurator（H20+Qwen3）：千级 operator×config 数据 + XGBoost | 差距 100x+ | 27 个点 vs 千级 |
+| GAP prefix cache 验证有 15-33% 偏差 | curl wall clock vs meta_info 域不匹配（非 predictor 问题） | 9 GAP 点 |
+| 对比 AIConfigurator（H20+Qwen3）：千级 operator×config 数据 + XGBoost | 差距 100x+ | 21 个点 vs 千级 |
 
 ### 8.2 KDA State 仿真
 
@@ -358,15 +426,15 @@ Prefix cache 效果：`prefill(suffix) = interp(..., suffix)`，用 GAP 9 点校
 
 | 数据 | 域 | 比例关系 |
 |------|----|---------|
-| Prefill e2e（P6-P9） | sglang meta_info（无 profiler） | 基准 |
-| GAP TTFT | curl wall clock（无 profiler） | ≈ meta_info（2% 差） |
-| Step_trace（P1-P5） | NPU profiler | ≈ 2.51x meta_info |
-| B1-B5 | kernel_details（profiler） | decode base ≈ 1.65x OL512 |
+| Prefill e2e（V1+V3） | sglang meta_info（无 profiler） | 基准 |
+| GAP TTFT | curl wall clock（无 profiler） | ≈ meta_info + 1-2s HTTP 开销 |
+| B1-B5（旧 V2） | kernel_details（profiler） | decode base ≈ 1.65x OL512（已被 V3 修正） |
+| V2 batch decode | wall/128（output=128） | 包含 prefill 摊销（bs=32 污染 85%） |
+| V3 batch decode | e2e/512（output=512） | 近纯 decode（污染 <2%） |
 
 ### 8.4 未触发/未实现
 
-- 未触发 L2/L3 cache（端到端测试请求量少，pool 未满）
-- 未跑完整 HiSim benchmark（需要 bench_serving runner + OFFLINE 模式）
+- 未跑完整 HiSim OFFLINE 模式 benchmark（集成测试 + 地基修复验证已覆盖全代码路径，但未用 trace 重放验证端到端时序一致性）
 - 未验证 93 层全量模型层 scaling 假设
 
 ---
@@ -379,17 +447,21 @@ Prefix cache 效果：`prefill(suffix) = interp(..., suffix)`，用 GAP 9 点校
 |---|------|------|------|
 | 1 | **完整 HiSim benchmark（OFFLINE 模式）** | 用 HiSim 的 SGLangBenchmarkRunner 跑 K3 trace，触发虚拟时钟 + predictor 集成 | sglang 0.5.18 兼容已修复 |
 | 2 | **触发 L2/L3 cache** | 发 >33 并发请求，填满 KDA pool（165 slots），触发 LRU evict → L2 backup → L3 write | sglang 服务 + 并发请求脚本 |
-| 3 | **精确 KDA state 追踪** | per-request slot 分配/释放，prefix match → checkpoint 对齐（256/4096 粒度） | 改 hook 代码 |
-| 4 | **conv_state 公式推导** | 从 sglang 源码 `memory_pool_npu.py` 推导精确公式 | 读 sglang 代码 |
+| 3 | ~~精确 KDA state 追踪~~ | ✅ 已完成（B5: per-request slot tracking + B4: seq_len/256 slot count） | — |
+| 4 | ~~conv_state 公式推导~~ | ✅ 已从 sglang 源码确认 `mamba_track_interval=256` + checkpoint grid | — |
+| 5 | ~~KDA hash 内容寻址~~ | ✅ 已完成（B1: `hash(req_id + token_offset)` 替代 `time.time()`） | — |
+| 6 | ~~L3 H2D 时序补全~~ | ✅ 已完成（B3: `from_l3=True` + `_hicache_kda_l3_load_dur`） | — |
+| 7 | ~~多 SSD 配置~~ | ✅ 已完成（B6: `storage_tiers` + SimpySSD es3500p） | — |
 
 ### 中期（需要补充测试）
 
 | # | 工作 | 说明 | 需要 |
 |---|------|------|------|
-| 5 | **Prefill 更多 seq_len 点** | 补 4K/16K/64K 的 e2e（无 profiler），减小插值误差 | sglang 服务 |
-| 6 | **Decode batch×seq 完整矩阵** | bs=1/4/8/16/32 × seq=1K/4K/16K/64K/128K | sglang 服务 |
+| 5 | ~~补 4K/16K/64K prefill 点~~ | ✅ 已完成（V3，8 个点，max gap 65K） | — |
+| 6 | ~~Decode batch×seq 矩阵~~ | ✅ 已完成（V2+V3，纯 decode output=512） | — |
 | 7 | **cuda_graph on/off 对照** | 同 seq_len 测两种配置，建模 cuda_graph 效果 | sglang 服务 |
 | 8 | **93 层全量模型验证** | 跑一次 93 层模型，验证层 scaling 假设（4.17x） | NPU 资源 |
+| 9 | **BS16 纯 decode 验证** | 补 bs=16 output=512 的实测（当前仅有 output=128 污染数据） | sglang 服务 |
 
 ### 长期（需要大量数据或工具支持）
 

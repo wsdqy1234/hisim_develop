@@ -28,6 +28,20 @@ _CURRENT_DIR = Path(__file__).parent.resolve()
 _KVCM_BLOCK_SIZE = 16
 
 
+def _mock_mamba_pool_size() -> int:
+    """Mamba slot capacity for the mock allocator/pool.
+
+    Default is ample so KDA requests are never rejected for insufficient
+    mamba slots (which would spin the scheduler on NO_TOKEN). Set
+    HISIM_MAMBA_POOL_SIZE=165 (config max_mamba_cache_size) to reproduce
+    mamba pool overflow scenarios.
+    """
+    try:
+        return max(1, int(os.environ.get("HISIM_MAMBA_POOL_SIZE", "2000")))
+    except ValueError:
+        return 2000
+
+
 def alloc_extend_cpu(
     pre_lens_ptr: torch.Tensor,
     seq_lens_ptr: torch.Tensor,
@@ -193,6 +207,36 @@ def get_num_new_pages(
     return sum_num_new_pages.item()
 
 
+class _MockMambaPool:
+    """Mock Mamba (KDA) state pool for _MambaStrategy.build."""
+    def __init__(self):
+        self.size = _mock_mamba_pool_size()
+        self.num_mamba_layers = 18  # K3-23L has 18 KDA layers
+        self.layer_transfer_counter = None
+
+        # Mock mamba_cache with conv/temporal state buffers that
+        # MambaPoolHost.__init__ reads.
+        #   conv: list with ONE tensor of shape (num_layers, 1, conv_dim, 4);
+        #     iterating gives conv_state whose [i] indexes per-layer (line 123)
+        #     and .shape[2:] is the state dim (line 62), conv[0].dtype (line 67).
+        #   temporal: single tensor (num_layers, 1, temporal_dim, 4) so
+        #     temporal.shape[2:] (line 69) and temporal[i] (line 113) both work.
+        _n = self.num_mamba_layers
+        _conv_dim = 7168   # K3 hidden_size
+        _temporal_dim = 512  # K3 kv_lora_rank (state dim)
+        import torch as _torch
+        class _MockMambaCache:
+            conv = [_torch.zeros(_n, 1, _conv_dim, 4, dtype=_torch.float32)]
+            temporal = _torch.zeros(_n, 1, _temporal_dim, 4, dtype=_torch.float32)
+        self.mamba_cache = _MockMambaCache()
+
+    def get_kv_size_bytes(self):
+        return 15151104  # MAMBA_SLOT_BYTES for K3 TP=8
+
+    def __getattr__(self, name):
+        return None
+
+
 class MockReqToTokenPool:
     """A memory pool that maps a request to its token locations."""
 
@@ -213,6 +257,18 @@ class MockReqToTokenPool:
         )
 
         self.free_slots = list(range(size))
+
+        # K3 hybrid architecture: mamba_map maps KDA layer IDs to mamba pool indices.
+        # K3-23L has 5 MLA layers (0-4) + 18 KDA layers (5-22).
+        self.mamba_map = {5 + i: i for i in range(18)}
+        # mamba_pool: mock for _MambaStrategy.build. Has __getattr__ catch-all.
+        self.mamba_pool = _MockMambaPool()
+
+        # layer_transfer_counter for HybridCacheController
+        self.layer_transfer_counter = None
+
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        self.layer_transfer_counter = layer_transfer_counter
 
         _version_dispatcher = VersionDispatcher()
         _version_dispatcher.register_method(
@@ -238,6 +294,73 @@ class MockReqToTokenPool:
     def available_size(self):
         return len(self.free_slots)
 
+    # ---- sglang 0.5.18 K3 Mamba/KDA compatibility ----
+    # These methods are called by schedule_batch.py's Mamba track/prealloc code.
+    # HiSim simulates KDA state separately (MockMambaStatePool), so these are
+    # minimal stubs that let the scheduler's K3 code path execute without crash.
+
+    @property
+    def mamba_ping_pong_track_buffer_size(self):
+        return 2
+
+    def get_mamba_ping_pong_other_idx(self, mamba_next_track_idx: int) -> int:
+        return 1 - mamba_next_track_idx
+
+    def get_mamba_ping_pong_keep_idx(self, req) -> int:
+        return getattr(req, "mamba_last_track_idx", 0)
+
+    def set_mamba_ping_pong_slot(self, req, idx: int, value):
+        if hasattr(req, "mamba_ping_pong_track_buffer") and req.mamba_ping_pong_track_buffer is not None:
+            req.mamba_ping_pong_track_buffer[idx] = value
+
+    def donate_mamba_ping_pong_slot(self, src_req, dst_req):
+        # 0.5.18: donate ping-pong slot from finished/retracted req to new req.
+        # Real impl transfers src's ping-pong state into dst slot and returns
+        # the dst slot. There is no real state in simulation, but the return
+        # value flows into insert_params.mamba_value — returning dst keeps the
+        # radix-cache bookkeeping valid (chunked stash would otherwise hit
+        # `assert params.mamba_value is not None` in commit_insert_component_data).
+        return dst_req
+
+    def free_mamba_cache(self, *args, **kwargs):
+        # 0.5.18: free mamba state cache slots when a request finishes.
+        pass
+
+    @property
+    def mamba_allocator(self):
+        if not hasattr(self, "_mock_mamba_allocator"):
+            # In HiSim simulation we don't need real limited mamba slot
+            # allocation — just provide ample capacity so KDA requests are
+            # never rejected for insufficient mamba slots (which would spin
+            # the scheduler on NO_TOKEN for long-sequence requests).
+            # `free_slots` kept as a python list for cheap slicing; `alloc`
+            # returns a torch tensor (scheduler expects mamba_pool_idx tensor).
+            import torch as _torch
+            _pool_size = _mock_mamba_pool_size()
+            self._mock_mamba_allocator = type("MockMambaSlotAllocator", (), {
+                "device": self.device,
+                "_alloc_iter": None,
+                "free_slots": list(range(1, _pool_size + 1)),
+                "available_size": lambda self: len(self.free_slots),
+                "schedulable_available_size": lambda self: len(self.free_slots),
+                "alloc_group_begin": lambda self, n: setattr(self, "_alloc_iter", iter(self.free_slots[:min(n, len(self.free_slots))]) if n > 0 else None),
+                "alloc_group_end": lambda self: setattr(self, "_alloc_iter", None),
+                "alloc": lambda self, n: _torch.tensor(self.free_slots[:min(n, len(self.free_slots))], dtype=_torch.int64, device=self.device) if n > 0 else _torch.empty((0,), dtype=_torch.int64, device=self.device),
+                "free": lambda self, idx: None,
+                "clear": lambda self: setattr(self, "free_slots", list(range(1, _pool_size + 1))),
+            })()
+            self._mock_mamba_allocator._pool_size = _pool_size
+        return self._mock_mamba_allocator
+
+    @property
+    def req_index_to_mamba_ping_pong_track_buffer_mapping(self):
+        # Return a tensor that supports indexing by req_pool_indices
+        if not hasattr(self, "_mock_pp_mapping"):
+            self._mock_pp_mapping = torch.full(
+                (self.size, 2), -1, dtype=torch.int64, device=self.device
+            )
+        return self._mock_pp_mapping
+
     def alloc(self, *args, **kwargs):
         return self._alloc_func(*args, **kwargs)
 
@@ -257,7 +380,7 @@ class MockReqToTokenPool:
                 "only one chunked request may reuse req_pool_idx in a batch"
             )
         assert all(
-            reqs[i].is_chunked > 0 or reqs[i].kv_committed_len > 0 for i in chunked
+            getattr(reqs[i], "is_chunked", 0) > 0 or reqs[i].kv_committed_len > 0 for i in chunked
         ), "request has req_pool_idx but is not chunked"
 
         need_size = len(reqs) - len(chunked)
@@ -327,8 +450,20 @@ class MockTokenToKVPool:
         # used for chunked cpu-offloading
         self.cpu_offloading_chunk_size = 8192
 
+        # sglang 0.5.18 compatibility attributes
+        self.post_capture_active = False
+
         # default state for optional layer-wise transfer control
         self.layer_transfer_counter = None
+
+        # K3 hybrid architecture: FULL (MLA) + MAMBA (KDA) layers.
+        # _MambaStrategy.build accesses these to build the hybrid host pool stack.
+        self.use_mla = True
+        self.full_attention_layer_id_mapping = {i: i for i in range(5)}  # 5 MLA layers
+        self.full_kv_pool = self  # the FULL KV pool is this mock itself
+        self.kv_lora_rank = 512  # K3 MLA kv_lora_rank
+        self.qk_nope_head_dim = 128  # K3 MLA qk_nope_head_dim
+        self.qk_rope_head_dim = 64  # K3 MLA qk_rope_head_dim
 
         # self.head_num = head_num
         # self.head_dim = head_dim
@@ -338,6 +473,13 @@ class MockTokenToKVPool:
         # Overwrite to 1x1 to save memory (actual buffers stay tiny)
         self.head_num = 1
         self.head_dim = 1
+        # sglang 0.5.18 compatibility
+        self.v_head_dim = 1  # same as head_dim for MLA models
+        self.swa_head_num = 0
+        self.swa_head_dim = 0
+        self.swa_v_head_dim = 0
+        self.use_fia = False
+        self.layer_shard_enabled = False
 
         self.custom_mem_pool = None
 
@@ -347,6 +489,15 @@ class MockTokenToKVPool:
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
         # self._finalize_allocation_log(size)
+
+    def __getattr__(self, name):
+        # Catch-all for attributes accessed by sglang 0.5.18's
+        # build_hybrid_mamba_stack and HybridCacheController during
+        # two-pool hierarchical cache setup. Returns None for unknown
+        # attributes — safe for feature-detection checks (falsy/disabled).
+        # This is safe because _MambaStrategy.matches is patched to accept
+        # MockTokenToKVPool by class name, not by hasattr checks.
+        return None
 
     def _create_buffers(self):
         # [size, head_num, head_dim] for each layer
@@ -565,6 +716,12 @@ class MockBaseTokenToKVPoolAllocator:
             self.release_pages = torch.empty(
                 (0,), dtype=self.release_pages.dtype, device=self.device
             )
+
+    def free_segment(self, *args, **kwargs):
+        pass
+
+    def free_segments(self, *args, **kwargs):
+        pass
 
     def get_cpu_copy(self, *args, **kwargs):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
@@ -814,8 +971,11 @@ class MockTokenToKVPoolHost:
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
+        self.logical_size = self.size  # used by HybridCacheController
+        self.entry_map = {}  # used by append_host_mem_release
         self.start_layer = device_pool.start_layer
         self.end_layer = device_pool.end_layer
+        self.layer_transfer_counter = None
 
         if self.size <= device_pool.size:
             logger.warning(
@@ -857,6 +1017,11 @@ class MockTokenToKVPoolHost:
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+    def __getattr__(self, name):
+        # Catch-all for attributes accessed by HybridCacheController during
+        # two-pool hierarchical cache setup. Returns None for unknown attrs.
+        return None
 
     def get_size_per_token(self):
         self.layer_num = self.device_pool.layer_num
@@ -1097,13 +1262,16 @@ class MockMambaStatePool:
         # LRU: ordered dict {slot_idx: last_access_time}
         from collections import OrderedDict
         self._lru = OrderedDict()
+        # B5: Per-request slot tracking: {req_id: [(slot_idx, token_offset), ...]}
+        self._req_slots = {}  # req_id -> list of (slot_idx, token_offset)
         # Statistics
         self._alloc_count = 0
         self._evict_count = 0
         self._cow_count = 0
 
-    def alloc_slot(self) -> int:
-        """Allocate a slot. If pool full, LRU evict and return evicted slot."""
+    def alloc_slot(self, req_id: str = None, token_offset: int = 0) -> int:
+        """Allocate a slot. If pool full, LRU evict and return evicted slot.
+        If req_id is provided, tracks the slot ownership for per-request management."""
         if self._free_slots:
             slot = self._free_slots.pop()
         else:
@@ -1111,6 +1279,10 @@ class MockMambaStatePool:
         self._used_slots.add(slot)
         self._lru[slot] = self._alloc_count
         self._alloc_count += 1
+        if req_id is not None:
+            if req_id not in self._req_slots:
+                self._req_slots[req_id] = []
+            self._req_slots[req_id].append((slot, token_offset))
         return slot
 
     def free_slot(self, slot_idx: int):
@@ -1119,6 +1291,20 @@ class MockMambaStatePool:
             self._used_slots.discard(slot_idx)
             self._free_slots.append(slot_idx)
             self._lru.pop(slot_idx, None)
+
+    def free_slots_for_request(self, req_id: str) -> list:
+        """B5: Free all slots owned by a request. Returns list of freed slot indices."""
+        freed = []
+        if req_id in self._req_slots:
+            for slot_idx, _ in self._req_slots[req_id]:
+                self.free_slot(slot_idx)
+                freed.append(slot_idx)
+            del self._req_slots[req_id]
+        return freed
+
+    def get_slots_for_request(self, req_id: str) -> list:
+        """B5: Get list of (slot_idx, token_offset) for a request."""
+        return list(self._req_slots.get(req_id, []))
 
     def _evict_lru(self) -> int:
         """Evict the least recently used slot. Returns the evicted slot index.
@@ -1149,6 +1335,7 @@ class MockMambaStatePool:
             "cow": self._cow_count,
             "free": len(self._free_slots),
             "used": len(self._used_slots),
+            "tracked_reqs": len(self._req_slots),
         }
 
 
@@ -1164,9 +1351,34 @@ class MockMambaStatePoolHost:
     def __init__(self, size: int, slot_bytes: int):
         self.size = size  # number of slots L2 can hold
         self.slot_bytes = slot_bytes  # 14.45 MB per slot
+        self.page_size = 1
         self._slots = {}  # {slot_hash: placeholder}
+        self.free_slots = list(range(size))
+        self.release_slots = []
         from collections import OrderedDict
         self._lru = OrderedDict()  # {slot_hash: access_time}
+        self.layer_transfer_counter = None
+
+    def available_size(self):
+        return len(self.free_slots)
+
+    def alloc(self, need_size):
+        if need_size > len(self.free_slots):
+            return None
+        result = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        return torch.tensor(result, dtype=torch.int64)
+
+    def free(self, indices):
+        if hasattr(indices, 'tolist'):
+            indices = indices.tolist()
+        self.free_slots.extend(indices)
+        return len(indices)
+
+    def __getattr__(self, name):
+        # Catch-all for attributes accessed by HybridCacheController
+        # and MambaComponent during hierarchical cache operations.
+        return None
 
     def _est_bandwidth(self, size_bytes: float, cat: str) -> float:
         """Saturating bandwidth model: x*bw/(t0*bw + x), same as MockTokenToKVPoolHost."""
@@ -1190,15 +1402,25 @@ class MockMambaStatePoolHost:
             bw = self.MEMORY_WRITE_BANDWIDTH_BYTES * eff
         return size_bytes * bw / (t0 * bw + size_bytes)
 
-    def backup_from_device(self, slot_idx: int, slot_hash: str):
-        """D2H: Backup one slot (14.45MB) from HBM to DRAM. Accumulates timing."""
+    def backup_from_device(self, slot_idx: int, slot_hash: str, from_l3: bool = False):
+        """D2H: Backup one slot (MAMBA_SLOT_BYTES) from HBM to DRAM. Accumulates timing.
+
+        If from_l3=True, this is an SSD→DRAM read (L3 prefetch load_back).
+        The timing goes to kda_l3_load_dur instead of kda_l2_backup_dur.
+        """
         from hisim.simulation.manager.state import StateManager
 
         bw = self._est_bandwidth(self.slot_bytes, cat="D2H")
         dur = self.slot_bytes / bw
-        StateManager.inc_hicache_kda_l2_backup_dur(dur)
 
-        # Store in L2
+        if from_l3:
+            # L3 SSD read → DRAM (prefetch load_back path)
+            StateManager.inc_hicache_kda_l3_load_dur(dur)
+        else:
+            # Normal HBM → DRAM backup (eviction path)
+            StateManager.inc_hicache_kda_l2_backup_dur(dur)
+
+        # Store in L2 (even for L3 load_back: data now in DRAM)
         self._slots[slot_hash] = slot_idx
         self._lru[slot_hash] = len(self._lru)
 
@@ -1325,6 +1547,14 @@ class MockHiCacheStorage:
             shutil.rmtree(self.temp_dir)
 
     def register_mem_pool_host(self, mem_pool_host):
+        pass
+
+    # sglang 0.5.18 compatibility: new v2 registration method
+    def register_mem_host_pool_v2(self, *args, **kwargs):
+        pass
+
+    # sglang 0.5.18 compatibility: batch host pool registration
+    def register_mem_host_pool_batch(self, *args, **kwargs):
         pass
 
     def set(
