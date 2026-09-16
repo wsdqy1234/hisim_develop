@@ -137,6 +137,7 @@ class ModelInfo:
             "deepseek_v2",
             "deepseek_v3",
             "kimi_k2",
+            "kimi_k3",
             "gpt_oss",
             "gpt2",
             "qwen",
@@ -215,6 +216,12 @@ class ModelInfo:
 
     @classmethod
     def from_dict(cls, config: Dict, save_to_registry=False):
+        if config.get("model_type") == "kimi_k3":
+            text_config = config.get("text_config", {})
+            for k, v in text_config.items():
+                if k not in config:
+                    config[k] = v
+
         model_config = {}
         for k, v in model_config_mapping_dict.items():
             config_v = config.get(k, None)
@@ -247,6 +254,22 @@ class ModelInfo:
             )
             if config.get("shared_expert_intermediate_size"):
                 model_config["n_shared_experts"] = 1
+        elif config.get("model_type") == "kimi_k3":
+            text_config = config.get("text_config", {})
+            linear_config = text_config.get("linear_attn_config", {})
+            full_attn_layers = linear_config.get("full_attn_layers", [])
+            kda_layers = linear_config.get("kda_layers", [])
+            model_config["num_full_attention"] = len(full_attn_layers)
+            model_config["num_linear_attention"] = len(kda_layers)
+            model_config["attn_linear_conv_kernel_dim"] = linear_config.get("short_conv_kernel_size")
+            model_config["attn_linear_key_head_dim"] = linear_config.get("head_dim")
+            model_config["attn_linear_num_key_heads"] = linear_config.get("num_heads")
+            text_kv_lora_rank = text_config.get("kv_lora_rank", 0)
+            if text_kv_lora_rank:
+                model_config["kv_lora_rank"] = text_kv_lora_rank
+            text_qk_rope = text_config.get("qk_rope_head_dim", 0)
+            if text_qk_rope:
+                model_config["qk_rope_head_dim"] = text_qk_rope
         else:
             model_config["num_full_attention"] = model_config.get("num_hidden_layers")
 

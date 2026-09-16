@@ -11,6 +11,12 @@ class StateManager:
     _last_l3_write_overflow: float = 0
     _l3_direct_load_count: int = 0
     _hicache_l3_direct_load_dur: float = 0
+    # KDA/Mamba state timing (separate from MLA KV, take max in clock model)
+    _hicache_kda_l2_load_dur: float = 0
+    _hicache_kda_l2_backup_dur: float = 0
+    _hicache_kda_l3_backup_dur: float = 0
+    _last_kda_l2_load_dur: float = 0
+    _last_kda_l2_backup_dur: float = 0
 
     @classmethod
     def reset(cls):
@@ -26,6 +32,11 @@ class StateManager:
         cls._last_l3_write_overflow = 0
         cls._l3_direct_load_count = 0
         cls._hicache_l3_direct_load_dur = 0
+        cls._hicache_kda_l2_load_dur = 0
+        cls._hicache_kda_l2_backup_dur = 0
+        cls._hicache_kda_l3_backup_dur = 0
+        cls._last_kda_l2_load_dur = 0
+        cls._last_kda_l2_backup_dur = 0
 
     @classmethod
     def inc_iteration(cls) -> None:
@@ -137,3 +148,51 @@ class StateManager:
         dur = cls._hicache_l3_direct_load_dur
         cls._hicache_l3_direct_load_dur = 0
         return dur
+
+    # ---- KDA/Mamba state timing (parallel to MLA, take max in clock) ----
+
+    @classmethod
+    def inc_hicache_kda_l2_load_dur(cls, dur: float) -> None:
+        cls._hicache_kda_l2_load_dur += dur
+
+    @classmethod
+    def inc_hicache_kda_l2_backup_dur(cls, dur: float) -> None:
+        cls._hicache_kda_l2_backup_dur += dur
+
+    @classmethod
+    def inc_hicache_kda_l3_backup_dur(cls, dur: float) -> None:
+        cls._hicache_kda_l3_backup_dur += dur
+
+    @classmethod
+    def pop_hicache_kda_l2_load_dur(cls) -> float:
+        dur = cls._hicache_kda_l2_load_dur
+        cls._hicache_kda_l2_load_dur = 0
+        return dur
+
+    @classmethod
+    def pop_hicache_kda_l2_backup_dur(cls) -> float:
+        dur = cls._hicache_kda_l2_backup_dur
+        cls._hicache_kda_l2_backup_dur = 0
+        return dur
+
+    @classmethod
+    def pop_hicache_kda_l3_backup_dur(cls) -> float:
+        dur = cls._hicache_kda_l3_backup_dur
+        cls._hicache_kda_l3_backup_dur = 0
+        return dur
+
+    @classmethod
+    def set_last_kda_l2_load_dur(cls, dur: float) -> None:
+        cls._last_kda_l2_load_dur = dur
+
+    @classmethod
+    def get_last_kda_l2_load_dur(cls) -> float:
+        return cls._last_kda_l2_load_dur
+
+    @classmethod
+    def set_last_kda_l2_backup_dur(cls, dur: float) -> None:
+        cls._last_kda_l2_backup_dur = dur
+
+    @classmethod
+    def get_last_kda_l2_backup_dur(cls) -> float:
+        return cls._last_kda_l2_backup_dur

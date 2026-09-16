@@ -1,0 +1,34 @@
+{
+    "platform": {
+        "accelerator": {
+            "name": "Ascend 910C"
+        },
+        "disk_read_bandwidth_gb": 14.6,
+        "disk_write_bandwidth_gb": 8.0,
+        "memory_read_bandwidth_gb": 64,
+        "memory_write_bandwidth_gb": 64,
+        "num_device_per_node": 8
+    },
+    "predictor": {
+        "name": "k3_profile_based",
+        "prefill_profile": "/home/d00954154/sglang-k3_docker/prof_P1/op_statistic.csv",
+        "decode_profile": "/home/d00954154/sglang-k3_docker/prof_D1/kernel_details.csv",
+        "gap_results": "/home/d00954154/sglang-k3_docker/gap_experiment_results.json"
+    },
+    "scheduler": {
+        "tp_size": 8,
+        "ep_size": 1,
+        "dp_size": 1,
+        "data_type": "BF16",
+        "kv_cache_data_type": "BF16",
+        "backend_name": "sglang",
+        "backend_version": "0.5.18.dev922",
+        "mem_fraction_static": 0.82,
+        "max_mamba_cache_size": 165,
+        "mamba_slots_per_request": 5
+    },
+    "model": {
+        "name": "Kimi-K3-W4A8-23L",
+        "model_path": "/mnt/data/Kimi-K3-23L/config.json"
+    }
+}

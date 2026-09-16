@@ -21,7 +21,9 @@ from hisim.dataset import (
 )
 
 # hook the sglang implementation
-if not torch.cuda.is_available():
+_is_cuda = torch.cuda.is_available()
+_is_npu = hasattr(torch, "npu") and torch.npu.is_available()
+if not _is_cuda and not _is_npu:
     # CPU Platform
     hisim_hook.install_module_hooks([sgl_kernel_hook.M_SGLangKernelLoadUtilHook])
 hisim_hook.install_class_hooks(

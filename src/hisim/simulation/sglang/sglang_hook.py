@@ -277,6 +277,16 @@ class C_HiCacheController(BaseHook):
     DISK_READ_BANDWIDTH_BYTES: float = None
     DISK_WRITE_BANDWIDTH_BYTES: float = None
 
+    # KDA/Mamba state pool parameters (lazily initialized)
+    MAMBA_SLOT_BYTES: int = None          # per-slot bytes (14.45MB for K3-23L)
+    MAMBA_POOL_SIZE: int = None           # max slots in L1 (70 or 165)
+    MAMBA_SLOTS_PER_REQ: int = 5          # slots consumed per request
+    _kda_pool = None                      # MockMambaStatePool instance
+    _kda_host_pool = None                 # MockMambaStatePoolHost instance
+    _kda_slots_in_use: int = 0            # track total slots in use
+    _kda_l3_pending_writes: list = None   # slot hashes pending L3 write
+    _kda_stats = None
+
     _ssd_simulator = None
     _ssd_simulator_initialized = False
     _tier_sims = None
@@ -489,6 +499,166 @@ class C_HiCacheController(BaseHook):
                 elif exec_t > 0:
                     completed += max(1.0, hit_count * (remaining / exec_t))
             return completed, max_dur
+
+    # ==================== KDA/Mamba State Methods ====================
+
+    @classmethod
+    def _init_kda_pools(cls):
+        """Lazily initialize KDA state pool (L1) and host pool (L2)."""
+        if cls._kda_pool is not None:
+            return
+        try:
+            from hisim.simulation.manager import ConfigManager
+            from hisim.simulation.utils import calc_mamba_state_bytes
+            from hisim.simulation.sglang.sglang_mock_class import (
+                MockMambaStatePool, MockMambaStatePoolHost,
+            )
+
+            sched = ConfigManager.get_scheduler_config()
+            model = ConfigManager.get_model_info()
+            platform = ConfigManager.get_platform_config()
+
+            cls.MAMBA_SLOT_BYTES = calc_mamba_state_bytes(
+                model, sched.tp_size, sched.pp_size
+            )
+            cls.MAMBA_POOL_SIZE = sched.max_mamba_cache_size or 70
+            cls.MAMBA_SLOTS_PER_REQ = sched.mamba_slots_per_request
+
+            # L1 pool (HBM slots)
+            cls._kda_pool = MockMambaStatePool(
+                size=cls.MAMBA_POOL_SIZE,
+                dtype=torch.float32,
+                layer_num=model.num_linear_attention,
+                device="cpu",  # simulation, no real device
+                slot_bytes=cls.MAMBA_SLOT_BYTES,
+            )
+            # L2 pool (DRAM backup) — size = 2x L1 (can hold evicted + working set)
+            cls._kda_host_pool = MockMambaStatePoolHost(
+                size=cls.MAMBA_POOL_SIZE * 2,
+                slot_bytes=cls.MAMBA_SLOT_BYTES,
+            )
+            cls._kda_l3_pending_writes = []
+            cls._kda_stats = {"backup": 0, "load_back_l2": 0, "load_back_l3": 0, "l3_hit": 0}
+            logger.info(
+                f"KDA pools initialized: L1={cls.MAMBA_POOL_SIZE} slots "
+                f"({cls.MAMBA_SLOT_BYTES/1e6:.2f}MB/slot), "
+                f"L2={cls.MAMBA_POOL_SIZE*2} slots"
+            )
+        except Exception as e:
+            logger.warning(f"KDA pool init failed (non-hybrid model?): {e}")
+            cls._kda_pool = False  # mark as not-applicable
+
+    @classmethod
+    def handle_kda_backup_operation(cls, self):
+        """KDA state backup: when L1 MambaPool is full, evict LRU slots to L2.
+        Called from wrapped_check_hicache_events after MLA backup."""
+        if cls._kda_pool is None:
+            cls._init_kda_pools()
+        if not cls._kda_pool:
+            return
+
+        # Track slot usage: each active request uses MAMBA_SLOTS_PER_REQ slots
+        # When slots_in_use > pool_size, evict excess
+        active_reqs = getattr(self, "num_running_reqs", 0)
+        cls._kda_slots_in_use = active_reqs * cls.MAMBA_SLOTS_PER_REQ
+
+        excess = cls._kda_slots_in_use - cls.MAMBA_POOL_SIZE
+        if excess <= 0:
+            return
+
+        # Backup excess slots to L2 (each slot = 14.45MB D2H)
+        import hashlib, time as _time
+        for _ in range(excess):
+            slot_idx = cls._kda_pool.alloc_slot()  # triggers LRU evict if full
+            slot_hash = hashlib.md5(
+                f"kda_slot_{slot_idx}_{_time.time()}".encode()
+            ).hexdigest()
+            cls._kda_host_pool.backup_from_device(slot_idx, slot_hash)
+            cls._kda_l3_pending_writes.append(slot_hash)
+            cls._kda_stats["backup"] += 1
+
+        # If L2 is full, evict to L3
+        evicted = cls._kda_host_pool.evict()
+        while evicted is not None:
+            cls._kda_l3_pending_writes.append(evicted)
+            evicted = cls._kda_host_pool.evict()
+
+    @classmethod
+    def handle_kda_prefetch_operation(cls, self):
+        """KDA state load_back: when a prefix match finds evicted checkpoint in L2/L3.
+        Called from wrapped_check_hicache_events after MLA prefetch."""
+        if not cls._kda_pool:
+            return
+
+        # Query L3 for pending KDA checkpoint lookups
+        # In simulation, we model this as: if L2 has backed-up slots and
+        # new requests need them, load_back from L2 (or L3 if not in L2)
+        if not cls._kda_l3_pending_writes:
+            return
+
+        # Query L3 (kvcm) for KDA slot hashes
+        try:
+            slot_hashes = list(cls._kda_l3_pending_writes)
+            l3_hits = self.storage_backend.batch_exists_mamba(slot_hashes)
+            l3_hit_count = sum(l3_hits.values())
+            cls._kda_stats["l3_hit"] += l3_hit_count
+
+            for slot_hash, hit in l3_hits.items():
+                if hit:
+                    # Found in L3: prefetch SSD→DRAM (timed in submit_kda_l3_write_timing)
+                    # Then L2 load_back H2D
+                    cls._kda_host_pool.load_to_device(slot_hash)
+                    cls._kda_stats["load_back_l3"] += 1
+                elif cls._kda_host_pool.has(slot_hash):
+                    # Found in L2: load_back H2D
+                    cls._kda_host_pool.load_to_device(slot_hash)
+                    cls._kda_stats["load_back_l2"] += 1
+        except Exception as e:
+            logger.debug(f"KDA prefetch skipped: {e}")
+        finally:
+            cls._kda_l3_pending_writes.clear()
+
+    @classmethod
+    def submit_kda_l3_write_timing(cls):
+        """KDA L3 write timing: SSD write for KDA slots (14.45MB/slot).
+        Called after MLA submit_l3_write_timing."""
+        if not cls._kda_pool or not cls._kda_l3_pending_writes:
+            return
+
+        write_arrival = StateManager.get_global_clock()
+        total_write_bytes = len(cls._kda_l3_pending_writes) * cls.MAMBA_SLOT_BYTES
+
+        sim = cls._get_ssd_simulator()
+        if sim is not None and hasattr(sim, 'submit_write'):
+            _, lat, _, _ = sim.submit_write(
+                write_arrival, total_write_bytes,
+                cls.MAMBA_SLOT_BYTES,
+                is_sequential=True,
+            )
+            write_time = lat
+        elif sim is not None:
+            write_time = sim.predict_write_time(
+                total_write_bytes, cls.MAMBA_SLOT_BYTES, is_sequential=True,
+            )
+        else:
+            if cls.DISK_WRITE_BANDWIDTH_BYTES is None:
+                cls.DISK_WRITE_BANDWIDTH_BYTES = (
+                    ConfigManager.get_platform_config().disk_write_bandwidth
+                )
+            bw = cls.DISK_WRITE_BANDWIDTH_BYTES or 8e9
+            write_time = total_write_bytes / bw
+
+        StateManager.inc_hicache_kda_l3_backup_dur(write_time)
+
+    @staticmethod
+    def get_kda_stats() -> dict:
+        """Return KDA state simulation statistics."""
+        if C_HiCacheController._kda_stats is None:
+            return {}
+        stats = dict(C_HiCacheController._kda_stats)
+        if C_HiCacheController._kda_pool:
+            stats.update(C_HiCacheController._kda_pool.get_stats())
+        return stats
 
     @staticmethod
     def calc_prefetch_pages(
@@ -983,11 +1153,17 @@ class C_HiRadixCacheHook(BaseHook):
         def wrapped_check_hicache_events(self, *args, **kwargs):
             # 1. Data phase: batch_set writes previous round's KV to kvcm
             self.cache_controller.handle_backup_operation()
+            # 1b. KDA backup: if MambaPool full, evict slots to L2
+            C_HiCacheController.handle_kda_backup_operation(self)
             # 2. Data + read timing: batch_exists queries kvcm + submit_read
             #    (sees previous round's write avail_time)
             self.cache_controller.handle_prefetch_operation()
+            # 2b. KDA prefetch: load_back evicted KDA checkpoints from L2/L3
+            C_HiCacheController.handle_kda_prefetch_operation(self)
             # 3. Write timing: submit_write advances avail_time for next round
             self.cache_controller.submit_l3_write_timing()
+            # 3b. KDA L3 write timing
+            C_HiCacheController.submit_kda_l3_write_timing()
             result = original_check_hicache_events(self, *args, **kwargs)
             # 4. Fix: In CPU simulation, CUDA events in ack_write_queue and
             # ack_load_queue never complete, so writing_check() and
@@ -1134,7 +1310,7 @@ class C_SchedulerHook(BaseHook):
     @classmethod
     def hook(cls, target):
         original_init = target.__init__
-        original_recv_requests = target.recv_requests
+        original_recv_requests = getattr(target, "process_input_requests", None) or getattr(target, "recv_requests", None)
         original_get_new_batch_prefill = target.get_new_batch_prefill
         original_run_batch = target.run_batch
         original_process_batch_result = target.process_batch_result
@@ -1423,47 +1599,57 @@ class C_SchedulerHook(BaseHook):
                 hicache_l2_load_dur = StateManager.pop_hicache_l2_load_dur()
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
                 hicache_l3_backup_dur = StateManager.pop_hicache_l3_backup_dur()
+                # KDA state durations (parallel to MLA, take max)
+                kda_l2_load_dur = StateManager.pop_hicache_kda_l2_load_dur()
+                kda_l2_backup_dur = StateManager.pop_hicache_kda_l2_backup_dur()
+                kda_l3_backup_dur = StateManager.pop_hicache_kda_l3_backup_dur()
+                # MLA and KDA D2H/H2D run in parallel — take max
+                l2_load_dur = max(hicache_l2_load_dur, kda_l2_load_dur)
+                l2_backup_dur = max(hicache_l2_backup_dur, kda_l2_backup_dur)
+                l3_backup_dur = max(hicache_l3_backup_dur, kda_l3_backup_dur)
                 current_inference_dur = StateManager.get_current_inference_dur()
 
                 try:
                     if ConfigManager.get_platform_config().enable_l3_direct_to_l1:
                         l3_direct_dur = StateManager.pop_hicache_l3_direct_load_dur()
-                        hicache_l2_load_dur = max(hicache_l2_load_dur, l3_direct_dur)
+                        l2_load_dur = max(l2_load_dur, l3_direct_dur)
                 except Exception:
                     pass
                 StateManager.pop_l3_direct_load_count()
 
                 # Save last values for next iteration's timing-aware SSD simulation
-                StateManager.set_last_l2_load_dur(hicache_l2_load_dur)
-                StateManager.set_last_l2_backup_dur(hicache_l2_backup_dur)
+                StateManager.set_last_l2_load_dur(l2_load_dur)
+                StateManager.set_last_l2_backup_dur(l2_backup_dur)
+                StateManager.set_last_kda_l2_load_dur(kda_l2_load_dur)
+                StateManager.set_last_kda_l2_backup_dur(kda_l2_backup_dur)
 
                 # L3 write starts at T_N (round start), overlaps with entire round:
                 # l2_load + inference + l2_backup. Only overflow delays next round.
                 l3_write_overflow = max(
                     0,
-                    hicache_l3_backup_dur
-                    - (hicache_l2_load_dur + current_inference_dur + hicache_l2_backup_dur),
+                    l3_backup_dur
+                    - (l2_load_dur + current_inference_dur + l2_backup_dur),
                 )
                 StateManager.set_last_l3_write_overflow(l3_write_overflow)
 
                 if C_SchedulerHook.OVERLAP_SCHEDULE:
                     StateManager.step_global_clock(
                         max(
-                            hicache_l2_load_dur - StateManager.get_last_inference_dur(),
+                            l2_load_dur - StateManager.get_last_inference_dur(),
                             0,
                         )
                     )
                     StateManager.step_global_clock(current_inference_dur)
                     request_response_time = (
                         StateManager.get_global_clock()
-                        + hicache_l2_backup_dur
+                        + l2_backup_dur
                         + l3_write_overflow
                     )
                 else:
                     StateManager.step_global_clock(
-                        hicache_l2_load_dur
+                        l2_load_dur
                         + current_inference_dur
-                        + hicache_l2_backup_dur
+                        + l2_backup_dur
                         + l3_write_overflow
                     )
                     request_response_time = StateManager.get_global_clock()
@@ -1598,8 +1784,12 @@ class C_SchedulerHook(BaseHook):
 
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
-        target.recv_requests = wrapped_recv_requests
+        if hasattr(target, "process_input_requests"):
+            target.process_input_requests = wrapped_recv_requests
+        elif hasattr(target, "recv_requests"):
+            target.recv_requests = wrapped_recv_requests
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill
         target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result
-        target.profile = wrapped_profile
+        if hasattr(target, "profile"):
+            target.profile = wrapped_profile

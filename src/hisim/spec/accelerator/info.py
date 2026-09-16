@@ -22,3 +22,25 @@ class NVIDIA:
         },
         save_to_registry=True,
     )
+
+
+class ASCEND:
+    ASCEND_910C = AcceleratorInfo.from_dict(
+        config={
+            "name": "Ascend 910C",
+            "device_alias": ["910C", "910c", "ascend910c", "Ascend910C", "Ascend910"],
+            "tflops": {
+                "FP16_TENSOR": 320,
+                "BF16_TENSOR": 320,
+                "FP32": 80,
+                "INT8_TENSOR": 640,
+            },
+            "hbm_capacity_gb": 64,
+            "hbm_bandwidth_gb": 1600,
+            "inter_node_bandwidth_gb": 64,
+            "intra_node_bandwidth_gb": 300,
+            "vendor": "Ascend",
+            "ref": "Ascend 910C-A3, 16 die x 64GB HBM2e, 1600 MHz clock",
+        },
+        save_to_registry=True,
+    )

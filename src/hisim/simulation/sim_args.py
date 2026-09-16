@@ -42,6 +42,9 @@ class SchedulerConfig:
     kv_cache_data_type: str = "FP16"
     backend_name: str = "sglang"
     backend_version: Optional[str] = None
+    mem_fraction_static: Optional[float] = None
+    max_mamba_cache_size: Optional[int] = None
+    mamba_slots_per_request: int = 5
 
 
 @dataclasses.dataclass
@@ -195,6 +198,9 @@ class SimulationArgs:
                 kv_cache_data_type=scheduler.get("kv_cache_data_type", "FP16"),
                 backend_name=scheduler.get("backend_name", "sglang"),
                 backend_version=scheduler.get("backend_version"),
+                mem_fraction_static=scheduler.get("mem_fraction_static"),
+                max_mamba_cache_size=scheduler.get("max_mamba_cache_size"),
+                mamba_slots_per_request=scheduler.get("mamba_slots_per_request", 5),
             ),
         )
 

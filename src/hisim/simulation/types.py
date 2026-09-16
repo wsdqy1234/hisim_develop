@@ -37,6 +37,10 @@ class SchedulerConfig:
     max_running_requests: int = (1 << 31) - 1
     page_size: Optional[int] = None
 
+    # KDA/Mamba state pool (for hybrid MLA+KDA models)
+    max_mamba_cache_size: Optional[int] = None
+    mamba_slots_per_request: int = 5
+
     # framework backend
     backend_name: str = "sglang"
     backend_version: Optional[str] = None

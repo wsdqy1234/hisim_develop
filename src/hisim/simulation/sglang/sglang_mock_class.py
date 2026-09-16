@@ -342,7 +342,7 @@ class MockTokenToKVPool:
         self.custom_mem_pool = None
 
         self._create_buffers()
-        _is_cuda = True
+        _is_cuda = "cuda" in str(self.device)
 
         self.device_module = torch.get_device_module(self.device)
         self.alt_stream = self.device_module.Stream() if _is_cuda else None
@@ -437,7 +437,7 @@ class MockTokenToKVPool:
         return self.custom_mem_pool
 
     def get_cpu_copy(self, indices):
-        torch.cuda.synchronize()
+        torch.get_device_module(self.device).synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -451,11 +451,11 @@ class MockTokenToKVPool:
                     "cpu", non_blocking=True
                 )
                 kv_cache_cpu[-1].append([k_cpu, v_cpu])
-        torch.cuda.synchronize()
+        torch.get_device_module(self.device).synchronize()
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices):
-        torch.cuda.synchronize()
+        torch.get_device_module(self.device).synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
             for i in range(0, len(indices), chunk_size):
@@ -469,7 +469,7 @@ class MockTokenToKVPool:
                 v_chunk = v_cpu.to(self.v_buffer[0].device, non_blocking=True)
                 self.k_buffer[layer_id][chunk_indices] = k_chunk
                 self.v_buffer[layer_id][chunk_indices] = v_chunk
-        torch.cuda.synchronize()
+        torch.get_device_module(self.device).synchronize()
 
     def _get_key_buffer(self, layer_id: int):
         # for internal use of referencing
@@ -900,7 +900,7 @@ class MockTokenToKVPoolHost:
             dtype=self.dtype,
             device=self.device,
         )
-        if self.pin_memory:
+        if self.pin_memory and "cuda" in str(self.device):
             torch.cuda.cudart().cudaHostRegister(
                 buffer.data_ptr(), buffer.numel() * buffer.element_size(), 0
             )
@@ -1070,6 +1070,169 @@ def _pass_str_to_block_ids(hash_key):
     int_hash = int(hash_key, 16)
     MAX_18_DIGITS = 10**18
     return int_hash % MAX_18_DIGITS
+
+
+class MockMambaStatePool:
+    """Simulates sglang MambaPool: slot-level KDA state (conv+ssm) management in HBM.
+    Unlike MockTokenToKVPool (page/token-level MLA KV), this pool manages fixed-size
+    recurrent state slots (14.45 MB each for K3-23L TP=8).
+    """
+
+    def __init__(
+        self,
+        size: int,
+        dtype: torch.dtype,
+        layer_num: int,
+        device: str,
+        slot_bytes: int,
+    ):
+        self.size = size  # number of slots (e.g. 70 or 165)
+        self.dtype = dtype
+        self.layer_num = layer_num  # num_linear_attention (18 for K3-23L)
+        self.device = device
+        self.slot_bytes = slot_bytes  # bytes per slot (14.45MB for K3-23L)
+        # Slot allocator: track which slots are in use
+        self._free_slots = list(range(size))
+        self._used_slots = set()
+        # LRU: ordered dict {slot_idx: last_access_time}
+        from collections import OrderedDict
+        self._lru = OrderedDict()
+        # Statistics
+        self._alloc_count = 0
+        self._evict_count = 0
+        self._cow_count = 0
+
+    def alloc_slot(self) -> int:
+        """Allocate a slot. If pool full, LRU evict and return evicted slot."""
+        if self._free_slots:
+            slot = self._free_slots.pop()
+        else:
+            slot = self._evict_lru()
+        self._used_slots.add(slot)
+        self._lru[slot] = self._alloc_count
+        self._alloc_count += 1
+        return slot
+
+    def free_slot(self, slot_idx: int):
+        """Free a slot (return to pool)."""
+        if slot_idx in self._used_slots:
+            self._used_slots.discard(slot_idx)
+            self._free_slots.append(slot_idx)
+            self._lru.pop(slot_idx, None)
+
+    def _evict_lru(self) -> int:
+        """Evict the least recently used slot. Returns the evicted slot index.
+        The caller (hook) is responsible for backing up the evicted slot to L2."""
+        if not self._lru:
+            raise RuntimeError("MambaStatePool: no slots to evict")
+        slot, _ = self._lru.popitem(last=False)
+        self._used_slots.discard(slot)
+        self._evict_count += 1
+        return slot
+
+    def touch(self, slot_idx: int):
+        """Update LRU order (mark slot as recently used)."""
+        if slot_idx in self._lru:
+            self._lru.move_to_end(slot_idx)
+
+    def cow_copy(self, src_slot: int) -> int:
+        """COW: allocate a new slot, mark as copy of src. Returns new slot idx.
+        In simulation, no actual data copy — just slot allocation."""
+        new_slot = self.alloc_slot()
+        self._cow_count += 1
+        return new_slot
+
+    def get_stats(self) -> dict:
+        return {
+            "alloc": self._alloc_count,
+            "evict": self._evict_count,
+            "cow": self._cow_count,
+            "free": len(self._free_slots),
+            "used": len(self._used_slots),
+        }
+
+
+class MockMambaStatePoolHost:
+    """Simulates KDA state DRAM backup pool (L2).
+    Handles D2H (backup) and H2D (load_back/COW) timing for 14.45MB/slot transfers.
+    Uses the same bandwidth model as MockTokenToKVPoolHost but with slot granularity.
+    """
+
+    MEMORY_READ_BANDWIDTH_BYTES = None
+    MEMORY_WRITE_BANDWIDTH_BYTES = None
+
+    def __init__(self, size: int, slot_bytes: int):
+        self.size = size  # number of slots L2 can hold
+        self.slot_bytes = slot_bytes  # 14.45 MB per slot
+        self._slots = {}  # {slot_hash: placeholder}
+        from collections import OrderedDict
+        self._lru = OrderedDict()  # {slot_hash: access_time}
+
+    def _est_bandwidth(self, size_bytes: float, cat: str) -> float:
+        """Saturating bandwidth model: x*bw/(t0*bw + x), same as MockTokenToKVPoolHost."""
+        if self.MEMORY_READ_BANDWIDTH_BYTES is None:
+            try:
+                from hisim.simulation.manager import ConfigManager
+                pcfg = ConfigManager.get_platform_config()
+                self.MEMORY_READ_BANDWIDTH_BYTES = pcfg.memory_read_bandwidth
+                self.MEMORY_WRITE_BANDWIDTH_BYTES = pcfg.memory_write_bandwidth
+            except Exception:
+                self.MEMORY_READ_BANDWIDTH_BYTES = 64e9  # 64 GB/s default
+                self.MEMORY_WRITE_BANDWIDTH_BYTES = 64e9
+
+        if cat == "H2D":
+            eff = 0.85
+            t0 = 6.67e-6
+            bw = self.MEMORY_READ_BANDWIDTH_BYTES * eff
+        else:
+            eff = 0.85
+            t0 = 4e-6
+            bw = self.MEMORY_WRITE_BANDWIDTH_BYTES * eff
+        return size_bytes * bw / (t0 * bw + size_bytes)
+
+    def backup_from_device(self, slot_idx: int, slot_hash: str):
+        """D2H: Backup one slot (14.45MB) from HBM to DRAM. Accumulates timing."""
+        from hisim.simulation.manager.state import StateManager
+
+        bw = self._est_bandwidth(self.slot_bytes, cat="D2H")
+        dur = self.slot_bytes / bw
+        StateManager.inc_hicache_kda_l2_backup_dur(dur)
+
+        # Store in L2
+        self._slots[slot_hash] = slot_idx
+        self._lru[slot_hash] = len(self._lru)
+
+        # Evict if L2 full
+        while len(self._slots) > self.size:
+            evicted_hash, _ = self._lru.popitem(last=False)
+            self._slots.pop(evicted_hash, None)
+
+    def load_to_device(self, slot_hash: str) -> int:
+        """H2D: Load one slot (14.45MB) from DRAM to HBM (COW hit). Returns slot idx.
+        Accumulates timing. Returns -1 if not in L2."""
+        from hisim.simulation.manager.state import StateManager
+
+        if slot_hash not in self._slots:
+            return -1
+
+        bw = self._est_bandwidth(self.slot_bytes, cat="H2D")
+        dur = self.slot_bytes / bw
+        StateManager.inc_hicache_kda_l2_load_dur(dur)
+
+        # Update LRU
+        self._lru.move_to_end(slot_hash)
+        return self._slots[slot_hash]
+
+    def evict(self) -> str:
+        """Evict LRU slot from L2 (for L3 backup). Returns slot_hash or None."""
+        if not self._lru:
+            return None
+        slot_hash, _ = self._lru.popitem(last=False)
+        self._slots.pop(slot_hash, None)
+        return slot_hash
+
+    def has(self, slot_hash: str) -> bool:
+        return slot_hash in self._slots
 
 
 class MockHiCacheStorage:
@@ -1281,3 +1444,49 @@ class MockHiCacheStorage:
             with open(self.storage_file_path, "w"):
                 pass
             return True
+
+    def batch_set_mamba(self, slot_hashes: List[str]) -> bool:
+        """L3 write: KDA state slots (slot-level, not token-level).
+        Uses 'mamba_' prefix to distinguish from MLA KV in kvcm."""
+        if hasattr(self, "storage_manager"):
+            prefixed_keys = [f"mamba_{h}" for h in slot_hashes]
+            int_hash_keys = [_pass_str_to_block_ids(k) for k in prefixed_keys]
+            trace_id = "1"
+            write_timestamp = int(time.time() * 1000)
+            res = self.storage_manager.WriteCache(
+                self.instance_id, trace_id, write_timestamp, int_hash_keys,
+            )
+            MockHiCacheStorage._DEBUG_BATCH_SET_COUNT += 1
+            return True
+        else:
+            for h in slot_hashes:
+                self.storage.add(f"mamba_{h}")
+                with open(self.storage_file_path, "a+") as f:
+                    f.write(f"mamba_{h}\n")
+            return True
+
+    def batch_exists_mamba(self, slot_hashes: List[str]) -> dict:
+        """L3 query: KDA state slots. Returns {slot_hash: hit(1/0)}.
+        Unlike MLA's batch_exists (returns consecutive hit length),
+        KDA slots are independent — each slot is a hit or miss."""
+        if hasattr(self, "storage_manager"):
+            prefixed_keys = [f"mamba_{h}" for h in slot_hashes]
+            int_hash_keys = [_pass_str_to_block_ids(k) for k in prefixed_keys]
+            trace_id = "2"
+            read_timestamp = int(time.time() * 1000)
+            block_mask = 0
+            input_len = len(int_hash_keys) * _KVCM_BLOCK_SIZE
+            res = self.storage_manager.GetCacheLocation(
+                self.instance_id, trace_id, read_timestamp,
+                int_hash_keys, block_mask, input_len,
+            )
+            MockHiCacheStorage._DEBUG_BATCH_EXISTS_COUNT += 1
+            # KDA: kvcm_hit_length gives consecutive prefix hits
+            # For slot-level, we interpret >0 as hit for that slot
+            hits = {}
+            for i, h in enumerate(slot_hashes):
+                hits[h] = 1 if i < res.kvcm_hit_length else 0
+            MockHiCacheStorage._DEBUG_BATCH_EXISTS_HITS += sum(hits.values())
+            return hits
+        else:
+            return {h: (1 if f"mamba_{h}" in self.storage else 0) for h in slot_hashes}

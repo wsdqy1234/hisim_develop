@@ -215,7 +215,8 @@ class ConfigManager:
         with open(Envs.config_path()) as f:
             config: dict = json.load(f)
         predictor_config = config.get("predictor", {})
-        if predictor_config.get("name") == "aiconfigurator":
+        predictor_name = predictor_config.get("name", "aiconfigurator")
+        if predictor_name == "aiconfigurator":
             device_name = predictor_config.get("device_name")
             hw.name = device_name
             database_mode = predictor_config.get("database_mode", "SILICON")
@@ -232,5 +233,12 @@ class ConfigManager:
                 decode_scale_factor=decode_scale_factor,
                 xgb_model_path=xgb_model_path,
             )
+        elif predictor_name == "k3_profile_based":
+            from hisim.time_predictor.k3_predictor import K3ProfilePredictor
+            return K3ProfilePredictor(
+                model=model,
+                hw=hw,
+                config=sched_config,
+            )
         else:
-            raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")
+            raise ValueError(f"Unknown predictor name: {predictor_name}")
