@@ -138,6 +138,7 @@ class ModelInfo:
             "deepseek_v3",
             "kimi_k2",
             "kimi_k3",
+            "kimi_linear",
             "gpt_oss",
             "gpt2",
             "qwen",
@@ -216,7 +217,7 @@ class ModelInfo:
 
     @classmethod
     def from_dict(cls, config: Dict, save_to_registry=False):
-        if config.get("model_type") == "kimi_k3":
+        if config.get("model_type") in ("kimi_k3", "kimi_linear"):
             text_config = config.get("text_config", {})
             # text_config may be a config object (e.g. KimiLinearConfig), convert to dict
             if not isinstance(text_config, dict):
@@ -258,12 +259,11 @@ class ModelInfo:
             )
             if config.get("shared_expert_intermediate_size"):
                 model_config["n_shared_experts"] = 1
-        elif config.get("model_type") == "kimi_k3":
-            text_config = config.get("text_config", {})
-            # text_config may be a config object (e.g. KimiLinearConfig), convert to dict
-            if not isinstance(text_config, dict):
-                text_config = vars(text_config) if hasattr(text_config, "__dict__") else {}
-            linear_config = text_config.get("linear_attn_config", {})
+        elif config.get("model_type") in ("kimi_k3", "kimi_linear"):
+            # kimi_k3: nested text_config; kimi_linear: flat top-level fields.
+            # After the flattening above, linear_attn_config and the MLA dims
+            # are reachable from `config` in both layouts.
+            linear_config = config.get("linear_attn_config", {})
             # linear_attn_config may also be a config object
             if not isinstance(linear_config, dict):
                 linear_config = vars(linear_config) if hasattr(linear_config, "__dict__") else {}
@@ -274,10 +274,10 @@ class ModelInfo:
             model_config["attn_linear_conv_kernel_dim"] = linear_config.get("short_conv_kernel_size")
             model_config["attn_linear_key_head_dim"] = linear_config.get("head_dim")
             model_config["attn_linear_num_key_heads"] = linear_config.get("num_heads")
-            text_kv_lora_rank = text_config.get("kv_lora_rank", 0)
+            text_kv_lora_rank = config.get("kv_lora_rank", 0)
             if text_kv_lora_rank:
                 model_config["kv_lora_rank"] = text_kv_lora_rank
-            text_qk_rope = text_config.get("qk_rope_head_dim", 0)
+            text_qk_rope = config.get("qk_rope_head_dim", 0)
             if text_qk_rope:
                 model_config["qk_rope_head_dim"] = text_qk_rope
         else:

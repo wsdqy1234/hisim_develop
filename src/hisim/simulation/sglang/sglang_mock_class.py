@@ -207,6 +207,29 @@ def get_num_new_pages(
     return sum_num_new_pages.item()
 
 
+class MockKVIndexTranslator:
+    """KV index translator stub (sglang >= 0.5.10 calls ``rebind_write_loc`` in
+    ``ForwardBatch.init_new``; real translation only matters for attention
+    kernels, which are intercepted)."""
+
+    is_translating = False
+
+    def rebind_write_loc(self, forward_batch) -> None:
+        pass
+
+    def build_index_table(self, *args, **kwargs):
+        return None
+
+    def index_table_for_batch(self, forward_batch):
+        return None
+
+    def sliding_window_write_loc_for(self, out_cache_loc):
+        return out_cache_loc
+
+    def make_capture_tables(self, *args, **kwargs):
+        return None
+
+
 class _MockMambaPool:
     """Mock Mamba (KDA) state pool for _MambaStrategy.build."""
     def __init__(self):
@@ -277,6 +300,9 @@ class MockReqToTokenPool:
             self._alloc_v1,
         )
         _version_dispatcher.register_method("alloc", ["0.5.9"], self._alloc_v2)
+        _version_dispatcher.register_method(
+            "alloc", ["0.5.18", "0.5.19"], self._alloc_v3
+        )
 
         _version_dispatcher.register_method(
             "free",
@@ -284,6 +310,9 @@ class MockReqToTokenPool:
             self._free_v1,
         )
         _version_dispatcher.register_method("free", ["0.5.9"], self._free_v2)
+        _version_dispatcher.register_method(
+            "free", ["0.5.18", "0.5.19"], self._free_v3
+        )
 
         self._alloc_func = _version_dispatcher.get_compat_method("alloc")
         self._free_func = _version_dispatcher.get_compat_method("free")
@@ -293,6 +322,78 @@ class MockReqToTokenPool:
 
     def available_size(self):
         return len(self.free_slots)
+
+    def schedulable_token_capacity(self, physical_capacity: int) -> int:
+        # sglang >= 0.5.18: ModelRunner.effective_max_total_num_tokens /
+        # tp_worker / invariant_checker call this. No aux cache in HiSim.
+        return physical_capacity
+
+    # ---- sglang >= 0.5.19 HybridReqToTokenPool mamba APIs ----
+
+    def translate_mamba_indices(self, mamba_indices):
+        # Identity for a static pool (slots are physical).
+        return mamba_indices
+
+    def mamba2_layer_index(self, layer_id: int) -> int:
+        assert layer_id in self.mamba_map
+        return self.mamba_map[layer_id]
+
+    def mamba2_layer_cache(self, layer_id: int):
+        return None
+
+    def get_mamba_indices(self, reqs):
+        return torch.tensor(
+            [int(r.kv.mamba_pool_idx) for r in reqs],
+            dtype=torch.int64,
+        )
+
+    def get_speculative_mamba2_params_all_layers(self):
+        return None
+
+    def get_state_buf_infos(self):
+        return None
+
+    def get_state_dim_per_tensor(self):
+        return None
+
+    def get_state_slice_outer_counts(self):
+        return None
+
+    def get_state_conv_shard_groups(self):
+        return None
+
+    def clone_with_new_mamba(self, *args, **kwargs):
+        return self
+
+    def _init_mamba_pool(self, *args, **kwargs):
+        pass
+
+    def _alloc_ping_pong_buffer(self, *args, **kwargs):
+        return None
+
+    # ---- sglang >= 0.5.19 aux-cache/row APIs (no-op without an aux cache) ----
+
+    def alloc_aux_to_lengths(self, *, req_pool_indices_cpu, target_seq_lens_cpu):
+        pass
+
+    def attach_aux_cache(self, aux_cache):
+        pass
+
+    def reset_aux_cache_allocator(self):
+        pass
+
+    def alloc_rows(self, need_size: int):
+        # Take need_size rows with no Req bound (beam members etc.).
+        if need_size > len(self.free_slots):
+            return None
+        if need_size == 0:
+            return []
+        select_index = self.free_slots[-need_size:]
+        del self.free_slots[-need_size:]
+        return select_index
+
+    def free_rows(self, indices):
+        self.free_slots.extend(indices)
 
     # ---- sglang 0.5.18 K3 Mamba/KDA compatibility ----
     # These methods are called by schedule_batch.py's Mamba track/prealloc code.
@@ -307,11 +408,14 @@ class MockReqToTokenPool:
         return 1 - mamba_next_track_idx
 
     def get_mamba_ping_pong_keep_idx(self, req) -> int:
-        return getattr(req, "mamba_last_track_idx", 0)
+        _kv = getattr(req, "kv", req)
+        return getattr(_kv, "mamba_last_track_idx", 0) or 0
 
     def set_mamba_ping_pong_slot(self, req, idx: int, value):
-        if hasattr(req, "mamba_ping_pong_track_buffer") and req.mamba_ping_pong_track_buffer is not None:
-            req.mamba_ping_pong_track_buffer[idx] = value
+        _kv = getattr(req, "kv", req)
+        buf = getattr(_kv, "mamba_ping_pong_track_buffer", None)
+        if buf is not None:
+            buf[idx] = value
 
     def donate_mamba_ping_pong_slot(self, src_req, dst_req):
         # 0.5.18: donate ping-pong slot from finished/retracted req to new req.
@@ -394,6 +498,27 @@ class MockReqToTokenPool:
                 r.req_pool_idx = select_index[offset]
                 offset += 1
         return [r.req_pool_idx for r in reqs]
+
+    def _alloc_v3(self, reqs: list) -> Optional[List[int]]:
+        # sglang >= 0.5.18: req_pool_idx moved into the Req.kv state object
+        # (r.kv.holds_kv / r.kv.req_pool_idx), mirroring the stock
+        # ReqToTokenPool.alloc semantics.
+        need_size = sum(1 for r in reqs if not r.kv.holds_kv)
+        if need_size > len(self.free_slots):
+            return None
+        select_index = self.free_slots[:need_size]
+        self.free_slots = self.free_slots[need_size:]
+        offset = 0
+        for r in reqs:
+            if not r.kv.holds_kv:
+                r.kv.req_pool_idx = select_index[offset]
+                offset += 1
+        return [r.kv.req_pool_idx for r in reqs]
+
+    def _free_v3(self, req):
+        assert req.kv.holds_kv, "request must have req_pool_idx"
+        self.free_slots.append(req.kv.req_pool_idx)
+        req.kv.req_pool_idx = None
 
     def free(self, *args, **kwargs):
         return self._free_func(*args, **kwargs)
@@ -687,6 +812,22 @@ class MockBaseTokenToKVPoolAllocator:
 
     def debug_print(self) -> str:
         return ""
+
+    def verify_byte_accounting(self):
+        # sglang >= 0.5.19 scheduler self-check (static pools return []).
+        return []
+
+    # -- sglang >= 0.5.19 scheduler-facing capacity hooks (called
+    #    unconditionally by ScheduleBatch.check_decode_mem) --
+
+    def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> None:
+        from sglang.srt.mem_cache.common import evict_from_tree_cache
+
+        evict_from_tree_cache(tree_cache, num_tokens)
+
+    def check_decode_capacity(self, *, num_tokens: int, tree_cache) -> bool:
+        self.evict_to_free_tokens(tree_cache, num_tokens)
+        return self.available_size() >= num_tokens
 
     def available_size(self):
         return (len(self.free_pages) + len(self.release_pages)) * self.page_size

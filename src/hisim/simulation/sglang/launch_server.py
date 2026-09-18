@@ -209,6 +209,32 @@ if (not _is_cuda and not _is_npu) or _force_cpu:
     except Exception as e:
         logger.warning(f"Failed to patch _MambaStrategy: {e}")
 
+    # Patch: relax MambaComponent's HybridReqToTokenPool isinstance assert.
+    # sglang 0.5.19's MambaComponent.__init__ asserts
+    # isinstance(params.req_to_token_pool, HybridReqToTokenPool); HiSim passes
+    # its MockReqToTokenPool. Rebind the memory_pool attribute to a subclass
+    # whose metaclass accepts the mock in isinstance checks (real pools still
+    # pass; the class remains constructible).
+    try:
+        import sglang.srt.mem_cache.memory_pool as _mp
+        _OrigHybridPool = _mp.HybridReqToTokenPool
+
+        class _HybridPoolMeta(type(_OrigHybridPool)):
+            def __instancecheck__(cls, instance):
+                if type(instance).__name__ == "MockReqToTokenPool":
+                    return True
+                return super().__instancecheck__(instance)
+
+        _HybridPoolAlias = _HybridPoolMeta(
+            "HybridReqToTokenPool", (_OrigHybridPool,), {}
+        )
+        _mp.HybridReqToTokenPool = _HybridPoolAlias
+        logger.info(
+            "Patched HybridReqToTokenPool isinstance to accept MockReqToTokenPool"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to patch HybridReqToTokenPool: {e}")
+
 # =============================================================================
 # Install HiSim hooks (must be before sglang import)
 # =============================================================================
@@ -259,16 +285,24 @@ if __name__ == "__main__":
         )
 
     # CPU simulation: patch health check to always return 200.
-    # The detokenizer subprocess may not be running, causing /health to return 503.
-    # In simulation mode we don't need the detokenizer — skip the health check.
+    # The real /health fires a health_generate roundtrip through the
+    # scheduler+detokenizer, which the CPU simulation cannot always serve
+    # (mocked forward). Remove the stock route and register ours so FastAPI
+    # does not shadow it (routes match in registration order).
     if _force_cpu or (not _is_cuda and not _is_npu):
         try:
             from sglang.srt.entrypoints.http_server import app as _fastapi_app
-            import fastapi
+
+            _fastapi_app.router.routes = [
+                r
+                for r in _fastapi_app.router.routes
+                if getattr(r, "path", None) != "/health"
+            ]
 
             @_fastapi_app.get("/health")
             async def _mock_health():
                 return {"status": "ok"}
+
             logger.info("Patched /health to always return 200 (CPU simulation)")
         except Exception as e:
             logger.warning(f"could not patch /health: {e}")

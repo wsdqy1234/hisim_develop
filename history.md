@@ -1039,3 +1039,36 @@ pop_l3_direct_load_count()  # 复位
 - `test/hisim_cache_analyzer_v2.py` — radix tree 模型（sglang 风格）
 - `test/hisim_cache_analyzer_v3.py` — V2 + HiSim 逻辑（write_through/load_back/prefetch/contiguous prefix）
 - `docs/HiSim_Simulation_Test_Report.md` — 完整测试报告（含配置说明、运行方法、结果对比）
+
+## 2026-09-16 — Kimi-K3 (MLA+KDA) 接入 HiSim：Two Pools 分层缓存适配（commit 7e03847 + 1913086）
+
+> 补记：以下为这两个 commit 的工作内容（详见仓库内 K3_HISIM_ADAPTATION_SUMMARY.md / K3_CACHE_VERIFICATION_REPORT.md / K3_HISIM_L2L3_ANALYSIS.md / HiSim_Simulation_Test_Report.md）。
+
+**背景**：接入 Kimi-K3（MLA FULL + KDA/Mamba 混合架构，23 层裁剪版 Kimi-K3-23L：5 层 MLA + 18 层 KDA，W4A8，Ascend 910C TP=8）。sglang 0.5.18 将 `HiRadixCache` 重构为组件化 `UnifiedRadixCache`（TreeComponent/UnifiedTreeCore/HybridCacheController），HiSim 原 hook 打在旧类上导致 L2/L3 层从未挂载（此前 L2/L3 恒 0 的真正根因）。
+
+**主要工作**（6 个阶段累计解决 38 个问题）：
+1. **Hook 类名/组件修正**：`C_HiRadixCacheHook` 改挂 `UnifiedRadixCache`（unified_radix_cache）；0.5.18 的 `match_prefix` 把 `host_hit_length` 固定 0 → wrap 之（full_kv_hit_length − device 命中）；`_all_reduce` no-op（TP=1 仿真）、`check_prefetch_progress` 补丁
+2. **Two Pools mock**：`_MockMambaPool`（conv/temporal state buffer，18 KDA 层，15.15MB/slot）、`MockMambaStatePoolHost`、MockReqToTokenPool 补 mamba_map/ping-pong track/donate 等 K3 调度接口；`mamba2_config=True` 强制 hybrid_ssm 双组件
+3. **`_mock_start_writing/loading` 支持 MAMBA 池**：遍历 `op.pool_transfers` 双池备份/读回（修复前只处理 FULL 池、KDA 的 L2 双写在仿真中从未执行）+ KDA 时延与 MLA 取 max
+4. **launch_server 5 层 sgl_kernel mock**（模块/OpNamespace/register_fake/define/dispatch）+ cudart mock + transfer_kv no-op 注入 + `kimi_linear_config`/`_MambaStrategy.matches` patch；`k3_profile_based` 时序预测器（910C 实测 8 点 prefill 插值 + 80.5ms decode 基准，23L）
+5. **验证**：basic/eviction/mixed/pressure 4 案例（10/10、20/20、40/40 全过，prefix_reuse 0.90-0.97，L2 backup/hit/load 链路全通）；V3 分析器对齐 HiSim 无 prefetch 时 total 差 0.04pp；L1=160K 的死亡螺旋（backup 失败→级联删除→树缩小）定位为非单调现象的根因
+
+## 2026-09-18 — develop_dqy 适配 sglang 0.5.19 + K3 仿真联调
+
+将 develop_dqy（基于 sglang 0.5.18.dev922 docker 开发）适配到本机 sglang 0.5.19（release），本地无 K3 权重，构造 mock 模型（kimi_linear config + auto_map 远程配置类 + hf-mirror 拉 Kimi/Qwen tokenizer），`AcceleratorInfo` 用 Ascend 910C + simpyssd NVMe tier + k3_profile_based 预测器。
+
+**适配修复清单（0.5.18.dev922 → 0.5.19 API 漂移）**：
+1. `COMPATIBLE_VERSIONS` += "0.5.18"、"0.5.19"
+2. `ModelInfo.from_config` 支持 `kimi_linear` 扁平格式（原仅 kimi_k3 嵌套 text_config）；model_type 白名单补 kimi_linear
+3. `C_ModelRunnerHook.override_initialize`：补 `self.loader` stub（0.5.19 `preloaded_weights_bytes` 属性读它）、`MockKVIndexTranslator` + prefill/decode attention backend 字符串；`init_attention_backends`/`init_cuda_graphs` no-op（0.5.10+ 调度器单独初始化，mock 环境无法构建真实 backend）
+4. `MockReqToTokenPool`：补 `schedulable_token_capacity`、aux-cache 系列（alloc_aux_to_lengths/attach_aux_cache/reset_aux_cache_allocator/alloc_rows/free_rows）、0.5.19 HybridReqToTokenPool mamba API（translate_mamba_indices 恒等映射等 11 个）；**alloc/free 版本分派 v3**（0.5.18+ `req_pool_idx` 移入 `req.kv` 状态对象，仿 stock ReqToTokenPool.alloc 语义）
+5. `MockBaseTokenToKVPoolAllocator`：补 0.5.19 调度器无条件调用的容量钩子 `evict_to_free_tokens`/`check_decode_capacity` + `verify_byte_accounting`
+6. launch_server：`HybridReqToTokenPool` isinstance 放宽（metaclass 别名接受 MockReqToTokenPool，MambaComponent 构造断言）；`/health` 路由真替换（删旧路由再注册——原补丁被 FastAPI 先注册路由遮蔽，探活请求会打穿到 scheduler 触发 detokenizer 心跳看门狗误杀）；PULL socket 重建改为 `HISIM_REBUILD_PULL_SOCKET=1` 显式开启（0.5.18 docker fork 兼容专用；0.5.19 上重建会因旧 listener 延迟关闭与 tokenizer PUSH 轮询分走消息）
+7. `wrapped_get_new_batch_prefill`：K3 mamba ping-pong track 初始化移到 `req.kv`（0.5.18+ 这些字段在 KVState）；`wrapped_recv_requests` 对 custom_params=None 的健康检查/预热请求加防护；`wrapped_process_batch_result` 异常从静默吞掉改为 warning+traceback（此前输出流中断被完全掩盖）
+
+**验证结果**：
+- K3 双池挂载成功：`Components: (FULL, MAMBA)`、`pools=KV + MAMBA, transfer_layer_num=23`、`hybrid_ssm=True`
+- 小规模端到端：hisim-collection 4/4 完成，TTFT 846ms（K3 prefill 0.439s 基准生效）、TPOT 489ms，全程 0 异常；K3ProfilePredictor 的 prefill/decode 时延正确落入 iteration.jsonl
+- 分级修复过程中逐个击破 0.5.19 的 AttributeError 链（loader → schedulable_token_capacity → kv_index_translator → HybridReqToTokenPool 断言 → verify_byte_accounting → check_decode_capacity → mamba_pool_idx/kv 状态对象 → MambaComponent.translate_mamba_indices）
+
+**遗留问题（待排查）**：OFFLINE 模式下高并发突发（>6 个 40K 级请求同时到达）时，约 2/3 请求在 tokenizer manager → scheduler 的 ZMQ 管道中丢失（FUTURE_QUEUE 停在 6/18，无 Batch 对象、无异常日志；逐个慢发全部可达，4-6 并发小请求正常）。已排除：socket 重建分走消息（已禁用重建仍复现）、max_recv_per_poll 限制（-1）、mamba 预算门控（None）。怀疑方向：recv_skipper 跳收、tokenizer manager 并发发送路径、或 OFFLINE receiver 与调度器时钟跳跃的交互。绕过方式：压低并发（≤6）或分批提交请求。

@@ -33,6 +33,7 @@ from hisim.simulation.sglang.sglang_mock_class import (
     MockTokenToKVPoolHost,
     MockMambaStatePoolHost,
     MockHiCacheStorage,
+    MockKVIndexTranslator,
 )
 from hisim.simulation.utils import (
     calc_metrics,
@@ -101,6 +102,14 @@ class C_ModelRunnerHook(BaseHook):
 
             self.model = MockModel()
 
+            # sglang >= 0.5.19: ModelRunner.preloaded_weights_bytes reads
+            # self.loader (set by the real weight-loading path that this hook
+            # replaces). Provide a stub loader.
+            class _StubModelLoader:
+                preloaded_weights_bytes = 0
+
+            self.loader = _StubModelLoader()
+
             # Attributes that may not be set by the hook but are expected by sglang
             self.use_ngram_embedding = False
             self.is_hybrid_swa = False
@@ -120,6 +129,13 @@ class C_ModelRunnerHook(BaseHook):
             class _NoopNgramEmbeddingManager:
                 enabled = False
             self.ngram_embedding_manager = _NoopNgramEmbeddingManager()
+
+            # sglang >= 0.5.19: ForwardBatch/scheduler read the KV index
+            # translator and attention backend strings; real translation only
+            # matters for attention kernels, which are intercepted.
+            self.kv_index_translator = MockKVIndexTranslator()
+            self.prefill_attention_backend_str = "torch_native"
+            self.decode_attention_backend_str = "torch_native"
 
 
             self.dtype = self.model_config.dtype
@@ -325,6 +341,15 @@ class C_ModelRunnerHook(BaseHook):
 
         target.initialize = override_initialize
         target.forward = _version_dispatcher.get_compat_method("forward")
+
+        # sglang >= 0.5.10: the scheduler separately initializes attention
+        # backends and CUDA graphs after ModelRunner init. Both are irrelevant
+        # for the simulation (the forward pass is intercepted), and building
+        # real backends would require real devices — no-op them.
+        if hasattr(target, "init_attention_backends"):
+            target.init_attention_backends = lambda self, *args, **kwargs: None
+        if hasattr(target, "init_cuda_graphs"):
+            target.init_cuda_graphs = lambda self, *args, **kwargs: None
 
         # Mock alloc_memory_pool: HiSim already set up mock pools in override_initialize.
         # The real alloc_memory_pool triggers kv_cache_configurator which needs real GPU/NPU.
@@ -1753,13 +1778,17 @@ class C_SchedulerHook(BaseHook):
                 def _report_leak(self, *a, **kw): pass
             self.invariant_checker = _NoopInvariantChecker()
 
-            # sglang 0.5.18: Rebuild PULL socket to fix fork+IPC connection issue.
-            # After fork, the inherited PUSH bind fd may cause libzmq IPC state
-            # corruption, preventing PULL from connecting. Rebuild with a fresh
-            # zmq.Context and reconnect to the same endpoint.
-            # Note: SchedulerRequestReceiver is frozen=True dataclass, so we
-            # bypass __setattr__ via object.__setattr__.
-            if hasattr(self, "request_receiver"):
+            # sglang 0.5.18 (docker): rebuild PULL socket to fix fork+IPC
+            # connection issues after fork. OFF by default on sglang >= 0.5.19
+            # where the inherited socket works fine: rebuilding re-binds the
+            # endpoint while the deferred-closed old socket keeps LISTENING on
+            # it, so the tokenizer's PUSH round-robins messages between the
+            # live and the dead listener and silently drops half the requests.
+            # Set HISIM_REBUILD_PULL_SOCKET=1 to enable (0.5.18 docker only).
+            if (
+                hasattr(self, "request_receiver")
+                and os.getenv("HISIM_REBUILD_PULL_SOCKET", "0") == "1"
+            ):
                 try:
                     import zmq as _zmq
                     _rr = self.request_receiver
@@ -1770,15 +1799,28 @@ class C_SchedulerHook(BaseHook):
                             _endpoint = _endpoint.decode()
                         logger.info(f"Rebuilding PULL socket: old endpoint={_endpoint}")
                         try:
-                            _old_sock.close()
+                            # linger=0: drop the old connection immediately.
+                            # A lazy close leaves the old PULL attached to the
+                            # endpoint and the tokenizer's PUSH round-robins
+                            # messages between the live and the dead socket,
+                            # silently dropping every other request.
+                            _old_sock.close(linger=0)
                         except Exception:
                             pass
                         _new_ctx = _zmq.Context(2)
                         _new_sock = _new_ctx.socket(_zmq.PULL)
-                        _new_sock.connect(_endpoint)
-                        # frozen=True dataclass: use object.__setattr__ to bypass
+                        # The old socket owned (bound) the endpoint — re-bind
+                        # it, otherwise the tokenizer's PUSH has no listener
+                        # and everything after the first few in-flight
+                        # messages is silently queued forever.
+                        for _attempt in range(20):
+                            try:
+                                _new_sock.bind(_endpoint)
+                                break
+                            except _zmq.ZMQError:
+                                time.sleep(0.1)
                         object.__setattr__(_rr, "recv_from_tokenizer", _new_sock)
-                        logger.info(f"PULL socket rebuilt and reconnected to {_endpoint}")
+                        logger.info(f"PULL socket rebuilt and bound to {_endpoint}")
                 except Exception as e:
                     logger.warning(f"PULL socket rebuild failed: {e}")
 
@@ -1793,6 +1835,12 @@ class C_SchedulerHook(BaseHook):
                     raw_reqs = _orig_recv(self_rr, *args, **kwargs)
                     if raw_reqs is None:
                         raw_reqs = []
+
+                    if os.getenv("HISIM_DEBUG_RECV"):
+                        logger.info(
+                            f"[RECV] {len(raw_reqs)} reqs: "
+                            f"{[r.__class__.__name__ for r in raw_reqs]}"
+                        )
 
                     if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
                         return raw_reqs
@@ -1902,7 +1950,11 @@ class C_SchedulerHook(BaseHook):
                     req_stats.rid = req.rid
                     req_stats.input_length = len(req.input_ids)
                     req_stats.output_length = req.sampling_params.max_new_tokens
-                    simulation_args = req.sampling_params.custom_params.get("simulation", {})
+                    # Health-check/warm-up requests carry no simulation params.
+                    custom_params = req.sampling_params.custom_params
+                    simulation_args = (
+                        custom_params.get("simulation", {}) if custom_params else {}
+                    )
                     if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
                         req_stats.created_time = simulation_args.get("server_created_time", now)
                         req_stats.last_event_time = req_stats.created_time
@@ -1932,16 +1984,16 @@ class C_SchedulerHook(BaseHook):
 
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
             # sglang 0.5.18 K3 compat: initialize Mamba/KDA track attributes
-            # on Req objects in waiting_queue before prepare_for_extend
+            # on Req objects in waiting_queue before prepare_for_extend.
+            # sglang >= 0.5.18 moved these fields into the Req.kv state object.
             for req in getattr(self, "waiting_queue", []):
-                if not hasattr(req, "mamba_ping_pong_track_buffer") or \
-                   getattr(req, "mamba_ping_pong_track_buffer", None) is None:
-                    req.mamba_ping_pong_track_buffer = torch.tensor(
+                _kv = getattr(req, "kv", req)
+                if getattr(_kv, "mamba_ping_pong_track_buffer", None) is None:
+                    _kv.mamba_ping_pong_track_buffer = torch.tensor(
                         [-1, -1], dtype=torch.int32
                     )
-                if not hasattr(req, "mamba_next_track_idx") or \
-                   getattr(req, "mamba_next_track_idx", None) is None:
-                    req.mamba_next_track_idx = 0
+                if getattr(_kv, "mamba_next_track_idx", None) is None:
+                    _kv.mamba_next_track_idx = 0
 
             new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
             now = time.time()
@@ -2160,6 +2212,10 @@ class C_SchedulerHook(BaseHook):
             try:
                 ret = original_process_batch_result(self, *args, **kwargs)
             except Exception:
+                logger.warning(
+                    "original process_batch_result failed (output may be dropped)",
+                    exc_info=True,
+                )
                 ret = None
             if batch is not None:
                 if len(batch.reqs) == 0:
