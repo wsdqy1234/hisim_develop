@@ -1071,4 +1071,19 @@ pop_l3_direct_load_count()  # 复位
 - 小规模端到端：hisim-collection 4/4 完成，TTFT 846ms（K3 prefill 0.439s 基准生效）、TPOT 489ms，全程 0 异常；K3ProfilePredictor 的 prefill/decode 时延正确落入 iteration.jsonl
 - 分级修复过程中逐个击破 0.5.19 的 AttributeError 链（loader → schedulable_token_capacity → kv_index_translator → HybridReqToTokenPool 断言 → verify_byte_accounting → check_decode_capacity → mamba_pool_idx/kv 状态对象 → MambaComponent.translate_mamba_indices）
 
-**遗留问题（待排查）**：OFFLINE 模式下高并发突发（>6 个 40K 级请求同时到达）时，约 2/3 请求在 tokenizer manager → scheduler 的 ZMQ 管道中丢失（FUTURE_QUEUE 停在 6/18，无 Batch 对象、无异常日志；逐个慢发全部可达，4-6 并发小请求正常）。已排除：socket 重建分走消息（已禁用重建仍复现）、max_recv_per_poll 限制（-1）、mamba 预算门控（None）。怀疑方向：recv_skipper 跳收、tokenizer manager 并发发送路径、或 OFFLINE receiver 与调度器时钟跳跃的交互。绕过方式：压低并发（≤6）或分批提交请求。
+**遗留问题（已解决，见下一条）**：OFFLINE 模式下高并发突发（>6 个 40K 级请求同时到达）时，约 2/3 请求在 tokenizer manager → scheduler 的 ZMQ 管道中丢失（FUTURE_QUEUE 停在 6/18，无 Batch 对象、无异常日志；逐个慢发全部可达，4-6 并发小请求正常）。已排除：socket 重建分走消息（已禁用重建仍复现）、max_recv_per_poll 限制（-1）、mamba 预算门控（None）。
+
+## 2026-09-18 — K3 突发丢请求根因：bench_serving hisim-collection 的 decode→re-tokenize 破坏 token 精确回放
+
+**根因**（并非 ZMQ/调度器丢消息，请求从未离开 HTTP 层）：`bench_serving.py: sample_hisim_collection_requests` 把 trace 的 `input_ids` 先 `tokenizer.decode()` 成文本再发 `"text"`。两个后果：
+1. **OOV id → 空文本被服务端拒绝**：mock K3 trace 的 session 1/2 用 5M/10M 偏移的假 token id（超出 Qwen 词表 151936），decode 后为空字符串 → tokenizer manager 抛 `ValueError("texts cannot be empty and tokenizer must be initialized")` → http_server 以 200 + SSE error 事件返回。18 个请求中 12 个（session 1/2 全部轮次）被拒，session 0 因每轮以合法 id 0..39999 开头 decode 非空而全部通过 → FUTURE_QUEUE 恒 6/18，OFFLINE 等不到 total_request 永久挂起。bench 端把 SSE error 流当成功（无 "text" 键即忽略），错误被完全掩盖。
+2. **即使合法 id 也被静默破坏**：decode→re-tokenize 不是恒等变换，token 数与原始序列漂移，破坏 trace 设计的逐轮前缀复用结构（缓存仿真致命）。此前 6 个"成功"请求的 token 数已偏离 input_length 记录。
+
+（历史注：严谨对比用的 weka 24 轮跑的是 in-process `SGLangBenchmarkRunner`（`input_ids=req.token_ids` 直接下发），不受影响；仅 bench_serving HTTP 路径踩坑。）
+
+**修复**（bench_serving.py）：
+1. `sample_hisim_collection_requests`：`input_ids` 原样透传（sglang `/generate` 原生接受 `input_ids`；payload 按 `isinstance(prompt, str)` 分派 text/input_ids），无 input_ids 时回退 `prompt` 字段；`DatasetRow.prompt`/`RequestFuncInput.prompt` 类型放宽为 `Union[str, List[int]]`
+2. `async_request_sglang_generate`：SSE 流中 `{"error": ...}` 事件显式置 `success=False` + 记录 error message（不再吞掉）
+3. gather 后统计失败请求并打印；simulation 模式下任何失败直接 `RuntimeError`（快速失败，杜绝"挂死半小时查不到错"）
+
+**验证**（18×40K 突发，K3 mock 模型 + 910C 配置）：18/18 到达并完成（`All requests received. Starting simulation now.`），总输入 token 724,500 与 trace 逐位一致（3×(40000+40100+…+40500)），prefix_cache_reused_ratio=0.9376（逐轮 cached-token 32768/40064/40192…），chunked prefill（16384 分块）与 `Proactive evict → L2` 降级链路正常，virtual 时长 93.5s。修复同步 cherry-pick 至 develop_lfz 与 develop_lfz_0.5.19。
