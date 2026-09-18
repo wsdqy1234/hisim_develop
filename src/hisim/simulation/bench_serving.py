@@ -80,7 +80,9 @@ def _create_bench_client_session():
 
 @dataclass
 class RequestFuncInput:
-    prompt: str
+    # str for text prompts, List[int] for token-exact replay (hisim-collection
+    # traces pass input_ids straight through).
+    prompt: Union[str, List[int]]
     api_url: str
     prompt_len: int
     output_len: int
@@ -441,10 +443,12 @@ async def async_request_openai_chat_completions(
                                     "completion_tokens", output_len
                                 )
 
-                        output.generated_text = generated_text
-                        output.success = True
-                        output.latency = latency
-                        output.output_len = output_len
+                    output.generated_text = generated_text
+                    # Keep success=False when the stream carried an error
+                    # event (see the "error" branch above).
+                    output.success = not output.error
+                    output.latency = latency
+                    output.output_len = output_len
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -604,10 +608,22 @@ async def async_request_sglang_generate(
                         else:
                             data = json.loads(chunk)
 
+                            if "error" in data:
+                                # Server-side rejection (e.g. empty prompt,
+                                # tokenization failure). Surface it instead of
+                                # silently treating the stream as a success.
+                                err = data["error"]
+                                output.error = (
+                                    err.get("message", str(err))
+                                    if isinstance(err, dict)
+                                    else str(err)
+                                )
+                                output.success = False
+
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if "text" in data and data["text"]:
+                            elif "text" in data and data["text"]:
                                 timestamp = time.perf_counter()
                                 generated_text = data["text"]
                                 output_len = data["meta_info"]["completion_tokens"]
@@ -993,7 +1009,8 @@ def is_file_valid_json(path):
 
 @dataclass
 class DatasetRow:
-    prompt: str
+    # str for text prompts, List[int] for token-exact replay.
+    prompt: Union[str, List[int]]
     prompt_len: int
     output_len: int
     text_prompt_len: Optional[int] = None
@@ -1740,9 +1757,24 @@ def sample_hisim_collection_requests(
     )
     for idx in range(num_requests):
         item = raw_input_requests[idx]
+        # Token-exact replay: pass input_ids straight to the backend instead of
+        # decoding to text. Decoding is lossy (out-of-vocab ids decode to "",
+        # and decode -> re-tokenize never reproduces the original token
+        # sequence), which silently corrupts the trace's prefix-reuse
+        # structure: out-of-vocab rounds get rejected by the server with
+        # "texts cannot be empty", and in-vocab rounds get a different token
+        # count than the recorded input_length.
+        if item.get("input_ids") is not None:
+            prompt: Any = item["input_ids"]
+        elif item.get("prompt") is not None:
+            prompt = item["prompt"]
+        else:
+            raise ValueError(
+                f"Trace row {idx} has neither 'input_ids' nor 'prompt' field."
+            )
         input_requests.append(
             DatasetRow(
-                prompt=tokenizer.decode(item["input_ids"]),
+                prompt=prompt,
                 prompt_len=item["input_length"],
                 output_len=item["output_length"],
                 timestamp=item[timestamp_field_name],
@@ -2241,6 +2273,19 @@ async def benchmark(
             )
         )
     outputs: List[RequestFuncOutput] = await asyncio.gather(*tasks)
+
+    failed_outputs = [o for o in outputs if not o.success]
+    if failed_outputs:
+        print(
+            f"WARNING: {len(failed_outputs)}/{len(outputs)} requests failed. "
+            f"First error: {failed_outputs[0].error!r}"
+        )
+        if args.bench_mode == "simulation":
+            raise RuntimeError(
+                f"{len(failed_outputs)}/{len(outputs)} requests failed in "
+                f"simulation mode; the run is invalid. First error: "
+                f"{failed_outputs[0].error!r}"
+            )
 
     # Stop profiler
     if profile:
