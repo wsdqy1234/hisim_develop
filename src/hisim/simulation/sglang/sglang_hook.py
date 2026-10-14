@@ -45,6 +45,29 @@ from hisim.simulation.sglang.version import VersionDispatcher
 logger = get_logger("hisim")
 
 
+def req_mamba_get(req, name, default=None):
+    """Read a mamba attribute from req.kv (sglang >= 0.5.18) or bare req (0.5.9).
+
+    sglang 0.5.18 moved ``mamba_pool_idx`` / ``mamba_ping_pong_track_buffer`` /
+    ``mamba_last_track_idx`` / ``mamba_next_track_idx`` / ``mamba_last_track_seqlen``
+    / ``mamba_cow_src_index`` onto ``req.kv``. ``mamba_branching_seqlen`` stays a
+    bare Req attribute.
+    """
+    _kv = getattr(req, "kv", None)
+    if _kv is not None and hasattr(_kv, name):
+        return getattr(_kv, name)
+    return getattr(req, name, default)
+
+
+def req_mamba_set(req, name, value):
+    """Write a mamba attribute to req.kv (0.5.18+) or bare req (0.5.9)."""
+    _kv = getattr(req, "kv", None)
+    if _kv is not None and hasattr(_kv, name):
+        setattr(_kv, name, value)
+    else:
+        setattr(req, name, value)
+
+
 class C_EngineHook(BaseHook):
     HOOK_CLASS_NAME = "Engine"
     HOOK_MODULE_NAME = "sglang.srt.entrypoints.engine"
@@ -1459,15 +1482,31 @@ class C_HiRadixCacheHook(BaseHook):
                                 _nid = _ni[0] if _ni else 0
                                 for _i in range(_n):
                                     _slot_idx = int(_mdi[_i]) if _mdi is not None and hasattr(_mdi, '__getitem__') else _i
-                                    _slot_hash = f"kda_{_nid}"
+                                    # Hash key is node-id based (not physical
+                                    # slot idx: backup and load use different
+                                    # physical slots, so slot idx would never
+                                    # match). The loop index disambiguates
+                                    # multiple slots within one node.
+                                    _slot_hash = f"kda_{_nid}_{_i}"
                                     mh.backup_from_device(_slot_idx, _slot_hash)
                                     _mamba_slot_hashes.append(_slot_hash)
                             except Exception as e:
                                 logger.debug(f"mamba backup_from_device failed: {e}")
+                        logger.debug(
+                            f"[KDA-WRITE] nodes={len(_ni)} dev={0 if _di is None else len(_di)} "
+                            f"mamba_slots={len(_mamba_slot_hashes)} hashes={_mamba_slot_hashes[:4]}"
+                        )
                     elif _pt:
                         _diag_w["full_only"] += 1
                     # L3 (SSD) backup — mirror real sglang's write_backup_storage
                     # which is called from _finish_write_through_ack
+                    if st is None:
+                        logger.debug("[KDA-L3] skip: storage backend is None")
+                    elif not _ni:
+                        logger.debug(
+                            f"[KDA-L3] skip: empty node_ids (di={_di is not None}, "
+                            f"mamba_slots={len(_mamba_slot_hashes)})"
+                        )
                     if st is not None and _ni:
                         _kv_bytes = float(getattr(MockTokenToKVPoolHost, 'KV_CACHE_BYTES', 0) or 0)
                         if _kv_bytes == 0:
@@ -1616,7 +1655,7 @@ class C_HiRadixCacheHook(BaseHook):
                                 _nid = _ni[0] if _ni else 0
                                 for _i in range(_n):
                                     _slot_idx = int(_mdi[_i]) if _mdi is not None and hasattr(_mdi, '__getitem__') else _i
-                                    _slot_hash = f"kda_{_nid}"
+                                    _slot_hash = f"kda_{_nid}_{_i}"
                                     _l2_hit = mh.has(_slot_hash)
                                     if _l2_hit:
                                         mh.load_to_device(_slot_hash)
@@ -1955,6 +1994,11 @@ class C_SchedulerHook(BaseHook):
     INFERENCE_PREDICTOR: InferTimePredictor = None
 
     REQUEST_STATS: dict[str, RequestStats] = defaultdict(RequestStats)
+    # Cross-phase accumulator for the canonical metrics.json consumed by
+    # bench_serving.load_simulation_metrics(). REQUEST_STATS is cleared after
+    # every phase dump (so metrics_phaseN.json stay per-phase), but this list
+    # keeps raw RequestStats copies so the canonical file aggregates all phases.
+    ALL_REQUEST_STATS: list[RequestStats] = []
     ITERATION_STATS: list[dict] = []
     LAST_CPU_TS: float = 0
     LAST_FLUSH_TS: float = 0
@@ -2152,6 +2196,10 @@ class C_SchedulerHook(BaseHook):
                                 ]["total_request"]
                                 if len(C_SchedulerHook.FUTURE_QUEUE) == total_request:
                                     C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = True
+                                    # New run: reset the cross-phase canonical
+                                    # accumulator and phase counter.
+                                    C_SchedulerHook.ALL_REQUEST_STATS = []
+                                    C_SchedulerHook._offline_phase = 0
                                     heapq.heapify(C_SchedulerHook.FUTURE_QUEUE)
                                     logger.info("All requests received. Starting simulation now.")
                                 else:
@@ -2161,7 +2209,8 @@ class C_SchedulerHook(BaseHook):
                                     )
                         return extra_requests
                     else:
-                        # Release requests from FUTURE_QUEUE based on virtual clock
+                        # Release GENERATE requests from FUTURE_QUEUE based on
+                        # the virtual clock.
                         current_timestamp = StateManager.get_global_clock()
                         released = []
                         while len(C_SchedulerHook.FUTURE_QUEUE) > 0:
@@ -2170,9 +2219,31 @@ class C_SchedulerHook(BaseHook):
                                 break
                             released.append(req)
                             heapq.heappop(C_SchedulerHook.FUTURE_QUEUE)
-                        if released:
-                            pass
-                        return released
+                        # Always forward CONTROL messages (ProfileReq,
+                        # AbortReq, flush, ...). They are not part of the
+                        # virtual-clock schedule, and once
+                        # OFFLINE_RECV_ALL_REQUEST is set they must NOT be
+                        # dropped: bench_serving issues a second
+                        # /start_profile right after the workload, and if it
+                        # lands in the window before the auto-trigger resets
+                        # the flag it would otherwise vanish and the client
+                        # would block forever waiting for a response.
+                        extra_requests = [
+                            r
+                            for r in raw_reqs
+                            if r.__class__.__name__
+                            not in (
+                                "TokenizedGenerateReqInput",
+                                "BatchTokenizedGenerateReqInput",
+                            )
+                        ]
+                        if os.getenv("HISIM_DEBUG_RECV") and extra_requests:
+                            logger.info(
+                                f"[RECV-CTRL] forwarding "
+                                f"{[r.__class__.__name__ for r in extra_requests]} "
+                                f"(released={len(released)})"
+                            )
+                        return released + extra_requests
 
                 # Patch at class level (not instance level, since msgspec.Struct
                 # doesn't allow instance setattr)
@@ -2266,14 +2337,6 @@ class C_SchedulerHook(BaseHook):
             _tc = getattr(self, 'tree_cache', None)
             _hicache_cn = getattr(_tc, '_hicache_cn', 0) if _tc is not None else 0
 
-            # Set cache reference on MockReqToTokenPool so _alloc_v2 can
-            # trigger mamba eviction when pp_buf alloc(2) fails.
-            _rtp = getattr(self, 'req_to_token_pool', None)
-            if _rtp is not None and getattr(_rtp, '_cache', None) is None:
-                _rtp._cache = _tc
-                logger.info("[HISIM] Set _cache reference on %s for pp_buf eviction",
-                            type(_rtp).__name__)
-
             # OFFLINE mode: release requests from FUTURE_QUEUE based on
             # virtual clock timestamp. Requests are released when their
             # arrival_time <= current virtual clock, regardless of whether
@@ -2364,45 +2427,19 @@ class C_SchedulerHook(BaseHook):
                                 )
                             except Exception:
                                 pass
-                        # KDA/Mamba L2→L1 load_back: estimate slot count from
-                        # host_hit and track_interval, then load from L2 or L3
-                        _mh = getattr(tc, 'mamba_pool_host', None) if tc is not None else None
-                        if _mh is not None:
-                            _ti = getattr(C_HiCacheController, 'MAMBA_TRACK_INTERVAL', 256) or 256
-                            _mload = max(1, host_hit // _ti) if _ti > 0 else 1
-                            _l2_keys = list(_mh._lru.keys())
-                            _st = None
-                            _dr_bw = 14.6e9
-                            try:
-                                _cc = getattr(tc, 'cache_controller', None)
-                                if _cc is not None:
-                                    _st = getattr(_cc, 'storage_backend', None)
-                                from hisim.simulation.manager import ConfigManager as _CM
-                                _pcfg = _CM.get_platform_config()
-                                _dr_bw = getattr(_pcfg, 'disk_read_bandwidth', 14.6e9) or 14.6e9
-                            except Exception:
-                                pass
-                            for _i in range(min(_mload, len(_l2_keys))):
-                                _sh = _l2_keys[_i]
-                                if _mh.has(_sh):
-                                    _mh.load_to_device(_sh)
-                                elif _st is not None:
-                                    try:
-                                        _mhits = _st.batch_exists_mamba([_sh])
-                                        if any(_mhits.values()):
-                                            _sb = getattr(_mh, 'slot_bytes', 15151104)
-                                            StateManager.inc_hicache_kda_l3_load_dur(_sb / _dr_bw)
-                                            _mh.backup_from_device(-1, _sh, from_l3=True)
-                                            _mh.load_to_device(_sh)
-                                    except Exception:
-                                        pass
+                        # KDA/Mamba L2→L1 load_back is handled by
+                        # _mock_start_loading, which uses the load op's
+                        # node_ids to resolve the correct per-node hash
+                        # (kda_<node>_<i>). Do NOT fish arbitrary LRU keys out
+                        # of the L2 pool: that restored unrelated checkpoints
+                        # and double-counted the H2D timing.
                     # KDA COW/Replay diagnostics: check mamba_cow_src_index and
                     # mamba_branching_seqlen set during init_next_round_input→match_prefix
                     for req in actual_batch.reqs:
-                        _cow_src = getattr(req, 'mamba_cow_src_index', None)
+                        _cow_src = req_mamba_get(req, 'mamba_cow_src_index', None)
                         _branching = getattr(req, 'mamba_branching_seqlen', None)
                         _prefix_len = len(getattr(req, 'prefix_indices', []))
-                        _mpi = getattr(req, 'mamba_pool_idx', None)
+                        _mpi = req_mamba_get(req, 'mamba_pool_idx', None)
                         if _prefix_len > 0 and _mpi is not None:
                             _kda_diag = getattr(C_SchedulerHook, '_kda_checkpoint_diag', None)
                             if _kda_diag is None:
@@ -2517,9 +2554,9 @@ class C_SchedulerHook(BaseHook):
                 }
             if batch is not None and hasattr(batch, 'reqs') and batch.reqs:
                 for _req in batch.reqs:
-                    _mpi = getattr(_req, 'mamba_pool_idx', None)
-                    _ppb = getattr(_req, 'mamba_ping_pong_track_buffer', None)
-                    _cow = getattr(_req, 'mamba_cow_src_index', None)
+                    _mpi = req_mamba_get(_req, 'mamba_pool_idx', None)
+                    _ppb = req_mamba_get(_req, 'mamba_ping_pong_track_buffer', None)
+                    _cow = req_mamba_get(_req, 'mamba_cow_src_index', None)
                     _ppb_str = _ppb.tolist() if _ppb is not None else 'None'
                     _mpi_str = _mpi.item() if _mpi is not None and hasattr(_mpi, 'item') else str(_mpi)
                     _cow_str = _cow.item() if _cow is not None and hasattr(_cow, 'item') else str(_cow)
@@ -2540,27 +2577,33 @@ class C_SchedulerHook(BaseHook):
             if batch is not None and hasattr(batch, 'reqs') and batch.reqs:
                 _track_interval = int(os.environ.get("SGLANG_MAMBA_TRACK_INTERVAL", "256"))
                 for _req in batch.reqs:
-                    _lts_before = getattr(_req, 'mamba_last_track_seqlen', None)
+                    _lts_before = req_mamba_get(_req, 'mamba_last_track_seqlen', None)
+                    _lts_bare = getattr(_req, 'mamba_last_track_seqlen', None)
                     _kcl = getattr(_req, 'kv_committed_len', None)
                     _iil = len(getattr(_req, 'input_ids', []))
                     _oir = len(getattr(_req, 'origin_input_ids', []))
                     _prefix = len(getattr(_req, 'prefix_indices', []))
                     logger.info(
-                        f"[LTS-BEFORE] rid={_req.rid} mamba_last_track_seqlen={_lts_before} "
-                        f"kv_committed_len={_kcl} input_ids_len={_iil} "
-                        f"origin_input_ids_len={_oir} prefix_indices_len={_prefix} "
-                        f"track_interval={_track_interval}"
+                        f"[LTS-BEFORE] rid={_req.rid} kv_lts={_lts_before} "
+                        f"bare_lts={_lts_bare} kv_committed_len={_kcl} "
+                        f"input_ids_len={_iil} origin_input_ids_len={_oir} "
+                        f"prefix_indices_len={_prefix} track_interval={_track_interval}"
                     )
-                    # Compute the actual seq_len: kv_committed_len if available,
-                    # else origin_input_ids length. This represents how far the
-                    # Mamba recurrent state has been computed.
+                    # Fallback only: on sglang 0.5.18+ prepare_for_extend sets
+                    # req.kv.mamba_last_track_seqlen natively; only fill it in
+                    # when the native path left it unset (mock forward never
+                    # runs the real Mamba model).
                     _seq_len = _kcl
                     if _seq_len is None or _seq_len == 0:
                         _seq_len = _oir
-                    if _seq_len and _seq_len > 0:
+                    if (
+                        (_lts_before is None or _lts_before == 0)
+                        and _seq_len
+                        and _seq_len > 0
+                    ):
                         _track_boundary = (_seq_len // _track_interval) * _track_interval
                         if _track_boundary > 0:
-                            _req.mamba_last_track_seqlen = _track_boundary
+                            req_mamba_set(_req, 'mamba_last_track_seqlen', _track_boundary)
                             logger.info(
                                 f"[LTS-SET] rid={_req.rid} seq_len={_seq_len} "
                                 f"track_interval={_track_interval} "
@@ -2569,10 +2612,10 @@ class C_SchedulerHook(BaseHook):
                             )
                 # --- Logging point 2: Prefill complete (mamba_last_track_seqlen set) ---
                 for _req in batch.reqs:
-                    _lts = getattr(_req, 'mamba_last_track_seqlen', None)
-                    _mpi = getattr(_req, 'mamba_pool_idx', None)
-                    _ppb = getattr(_req, 'mamba_ping_pong_track_buffer', None)
-                    _keep = getattr(_req, 'mamba_last_track_idx', None)
+                    _lts = req_mamba_get(_req, 'mamba_last_track_seqlen', None)
+                    _mpi = req_mamba_get(_req, 'mamba_pool_idx', None)
+                    _ppb = req_mamba_get(_req, 'mamba_ping_pong_track_buffer', None)
+                    _keep = req_mamba_get(_req, 'mamba_last_track_idx', None)
                     _mpi_v = int(_mpi.item()) if _mpi is not None and hasattr(_mpi, 'item') else (_mpi if _mpi is not None else '?')
                     _ppb_v = _ppb.tolist() if _ppb is not None else 'None'
                     logger.info(
@@ -2607,8 +2650,8 @@ class C_SchedulerHook(BaseHook):
                             batch.mamba_cow_src_indices = None
                             batch.mamba_cow_dst_indices = None
                             for _req in batch.reqs:
-                                _req.mamba_cow_src_index = None
-                                _req.mamba_needs_clear = False
+                                req_mamba_set(_req, 'mamba_cow_src_index', None)
+                                req_mamba_set(_req, 'mamba_needs_clear', False)
                             _batch_cow_src = None
                             _batch_cow_dst = None
                             break
@@ -2634,7 +2677,7 @@ class C_SchedulerHook(BaseHook):
                         _pl = 0
                         _nl = 0
                         for _req in batch.reqs:
-                            _mpi = getattr(_req,'mamba_pool_idx',None)
+                            _mpi = req_mamba_get(_req,'mamba_pool_idx',None)
                             if _mpi is not None:
                                 _mvi = _mpi.item() if hasattr(_mpi,'item') else int(_mpi)
                                 if _mvi == _ds:
@@ -2663,8 +2706,8 @@ class C_SchedulerHook(BaseHook):
                     batch.mamba_cow_src_indices = None
                     batch.mamba_cow_dst_indices = None
                     for _req in batch.reqs:
-                        _req.mamba_cow_src_index = None
-                        _req.mamba_needs_clear = False
+                        req_mamba_set(_req, 'mamba_cow_src_index', None)
+                        req_mamba_set(_req, 'mamba_needs_clear', False)
                 else:
                     # No COW — either no prefix match or checkpoint unavailable.
                     # Track replay tokens ONLY for prefill/extend batches where
@@ -2690,7 +2733,7 @@ class C_SchedulerHook(BaseHook):
                         for _req in batch.reqs:
                             _branching = getattr(_req, 'mamba_branching_seqlen', None)
                             _prefix_len = len(getattr(_req, 'prefix_indices', []))
-                            _mpi = getattr(_req, 'mamba_pool_idx', None)
+                            _mpi = req_mamba_get(_req, 'mamba_pool_idx', None)
                             if _prefix_len > 0 and _mpi is not None:
                                 # Prefill with prefix match but no COW → replay needed
                                 if _branching is not None:
@@ -2769,8 +2812,8 @@ class C_SchedulerHook(BaseHook):
             _pre_donations = {}
             if batch is not None and hasattr(batch, 'reqs'):
                 for _r in batch.reqs:
-                    _mpi = getattr(_r, "mamba_pool_idx", None)
-                    _lts = getattr(_r, "mamba_last_track_seqlen", None)
+                    _mpi = req_mamba_get(_r, "mamba_pool_idx", None)
+                    _lts = req_mamba_get(_r, "mamba_last_track_seqlen", None)
                     _olen = len(getattr(_r, "output_ids", []))
                     if _mpi is not None and _olen >= 0:
                         _pre_donations[_r.rid] = (_mpi, _lts, _olen)
@@ -2959,6 +3002,15 @@ class C_SchedulerHook(BaseHook):
                 else:
                     metrics_stats = stats
 
+                # Accumulate raw (unaligned) copies for the canonical
+                # metrics.json. The phase file below uses the live objects,
+                # which the alignment step mutates; keeping pristine copies
+                # lets metrics.json aggregate every phase.
+                import copy as _copy
+                C_SchedulerHook.ALL_REQUEST_STATS.extend(
+                    _copy.copy(_s) for _s in metrics_stats
+                )
+
                 # Ensure gen_token_latencies has at least one entry (TTFT).
                 # Requests that finish after extend without decode batches
                 # (mock forward produces stop tokens) have empty latencies.
@@ -3085,10 +3137,63 @@ class C_SchedulerHook(BaseHook):
                         _peak_mamba * _KDA_ENTRY + _peak_mla * _MLA_ENTRY
                     )
 
+                # Aggregated MLA prefix-hit metrics. Computed BEFORE the files
+                # are written (the save below happens earlier in the function
+                # than the per-request diagnostic logging used to sit), so the
+                # values actually persist to metrics_phaseN.json and, via the
+                # `_canon` borrow loop, to the canonical metrics.json.
+                _agg_prefix_hit = 0
+                _agg_prefix_hit_l1 = 0
+                _agg_prefill_new = 0
+                for _item in metrics_stats:
+                    _l2 = _item.l2_hit_tokens
+                    _l1 = _item.final_reused_tokens - _l2
+                    _l3 = _item.l3_hit_tokens
+                    _new_tok = _item.input_length - _l1 - _l2 - _l3
+                    _agg_prefix_hit += (_l1 + _l2 + _l3)
+                    _agg_prefix_hit_l1 += _l1
+                    _agg_prefill_new += max(0, _new_tok)
+                metrics["mla_prefix_hit_tokens_agg"] = _agg_prefix_hit
+                metrics["mla_prefix_hit_l1_tokens_agg"] = _agg_prefix_hit_l1
+                metrics["mla_prefill_new_tokens_agg"] = _agg_prefill_new
+
+                # --- Canonical metrics.json (aggregated across all phases) ---
+                # bench_serving.load_simulation_metrics() reads metrics.json;
+                # the per-phase metrics_phaseN.json files are kept separately
+                # for multi-phase analysis.
+                _canon_items = [
+                    _copy.copy(_s) for _s in C_SchedulerHook.ALL_REQUEST_STATS
+                ]
+                if _canon_items:
+                    for _s in _canon_items:
+                        if len(_s.gen_token_latencies) == 0:
+                            _s.gen_token_latencies.append(0.0)
+                    _canon_items.sort(key=lambda _r: _r.created_time)
+                    _cmin = _canon_items[0].created_time
+                    for _s in _canon_items:
+                        _s.created_time -= _cmin
+                        _s.queue_start -= _cmin
+                        _s.queue_end -= _cmin
+                        _s.last_event_time -= _cmin
+                    _canon = calc_metrics(_canon_items)
+                    _canon["time_cost"] = metrics.get("time_cost", 0.0)
+                    _canon["num_completed_requests"] = len(_canon_items)
+                    # Borrow phase-scoped diagnostics (instantaneous counters)
+                    # for keys the aggregate calc does not produce.
+                    for _k, _v in metrics.items():
+                        if _k not in _canon:
+                            _canon[_k] = _v
+                else:
+                    _canon = metrics
+
                 try:
                     _suffix = f"_phase{_phase}" if _phase is not None else ""
                     with open(f"{output_dir}/metrics{_suffix}.json", "w") as f:
                         f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
+
+                    # Canonical file consumed by bench_serving.
+                    with open(f"{output_dir}/metrics.json", "w") as f:
+                        f.write(json.dumps(_canon, cls=CustomJsonEncoder) + "\n")
 
                     with open(f"{output_dir}/iteration{_suffix}.jsonl", "w") as f:
                         for item in C_SchedulerHook.ITERATION_STATS:
@@ -3151,26 +3256,18 @@ class C_SchedulerHook(BaseHook):
                             f"kv_wm={_ud.get('kv_watermark',0)} "
                             f"v2p_valid={_ud.get('v2p_valid_ratio',0):.2f}"
                         )
-                    # Log per-request L1/L2/L3 hit breakdown
-                    # Also compute aggregated MLA prefill/prefix-hit metrics
-                    _agg_prefix_hit = 0
-                    _agg_prefix_hit_l1 = 0
-                    _agg_prefill_new = 0
+                    # Log per-request L1/L2/L3 hit breakdown. The aggregated
+                    # MLA prefix-hit metrics are computed earlier (before the
+                    # files are written) so they persist.
                     for item in metrics_stats:
                         l2 = item.l2_hit_tokens
                         l1 = item.final_reused_tokens - l2
                         l3 = item.l3_hit_tokens
                         new_tok = item.input_length - l1 - l2 - l3
-                        _agg_prefix_hit += (l1 + l2 + l3)
-                        _agg_prefix_hit_l1 += l1
-                        _agg_prefill_new += max(0, new_tok)
                         logger.info(
                             f"Req #{item.rid}: input={item.input_length} "
                             f"L1={l1} L2={l2} L3={l3} New={new_tok}"
                         )
-                    metrics["mla_prefix_hit_tokens_agg"] = _agg_prefix_hit
-                    metrics["mla_prefix_hit_l1_tokens_agg"] = _agg_prefix_hit_l1
-                    metrics["mla_prefill_new_tokens_agg"] = _agg_prefill_new
 
                 except Exception as e:
                     logger.error(f"Failed to dump results. Error: {e}")
@@ -3232,10 +3329,16 @@ class C_SchedulerHook(BaseHook):
                             try:
                                 _phase = getattr(C_SchedulerHook, "_offline_phase", 0) + 1
                                 C_SchedulerHook._offline_phase = _phase
-                                wrapped_profile(self, recv_req, _phase=_phase)
+                                _dump_result = wrapped_profile(self, recv_req, _phase=_phase)
                             except Exception as e:
                                 logger.error(f"HiSim profile dump failed: {e}")
-                            return None
+                                _dump_result = None
+                            # Must return a ProfileReqOutput: the scheduler's
+                            # ProfileReq handler sends the return value back to
+                            # the HTTP layer. Returning None leaves
+                            # /start_profile without a response and the client
+                            # (bench_serving) blocks forever.
+                            return _dump_result
                         result = _orig_pm_profile(recv_req, *a, **kw)
                         try:
                             wrapped_profile(self, recv_req, *a, **kw)

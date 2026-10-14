@@ -274,6 +274,32 @@ if (not _is_cuda and not _is_npu) or _force_cpu:
     except Exception as e:
         logger.warning(f"Failed to patch _MambaStrategy: {e}")
 
+    # Patch: relax MambaComponent's HybridReqToTokenPool isinstance assert.
+    # sglang 0.5.19's MambaComponent.__init__ asserts
+    # isinstance(params.req_to_token_pool, HybridReqToTokenPool); HiSim passes
+    # its MockReqToTokenPool. Rebind the memory_pool attribute to a subclass
+    # whose metaclass accepts the mock in isinstance checks (real pools still
+    # pass; the class remains constructible).
+    try:
+        import sglang.srt.mem_cache.memory_pool as _mp
+        _OrigHybridPool = _mp.HybridReqToTokenPool
+
+        class _HybridPoolMeta(type(_OrigHybridPool)):
+            def __instancecheck__(cls, instance):
+                if type(instance).__name__ == "MockReqToTokenPool":
+                    return True
+                return super().__instancecheck__(instance)
+
+        _HybridPoolAlias = _HybridPoolMeta(
+            "HybridReqToTokenPool", (_OrigHybridPool,), {}
+        )
+        _mp.HybridReqToTokenPool = _HybridPoolAlias
+        logger.info(
+            "Patched HybridReqToTokenPool isinstance to accept MockReqToTokenPool"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to patch HybridReqToTokenPool: {e}")
+
     # Patch MultiEndedAllocator with observation counters.
     # In unified memory mode, MultiEndedAllocator manages the dynamic split
     # between KV and Mamba sub-pools. These counters verify unified memory
@@ -742,6 +768,37 @@ if __name__ == "__main__":
     SimulationArgs.add_cli_args(g)
 
     raw_args = parser.parse_args(sys.argv[1:])
+
+    # K3 (kimi_linear) relies on the extra_buffer mamba radix strategy: the KDA
+    # checkpoint donation is built on ping-pong track buffers, and the HiSim
+    # MockReqToTokenPool mirrors that strategy. sglang 0.5.19's MambaComponent
+    # reads enable_mamba_extra_buffer from ServerArgs (not from the pool), so if
+    # the cache resolves to "no_buffer" while the mock allocates ping-pong
+    # buffers the two disagree and prepare_for_caching_req takes the
+    # mamba_pool.copy_from path. Force the strategy for K3 unless the user set
+    # it explicitly.
+    try:
+        import json as _json
+        _mpath = getattr(raw_args, "model_path", None)
+        _is_k3 = False
+        if _mpath and os.path.exists(os.path.join(_mpath, "config.json")):
+            with open(os.path.join(_mpath, "config.json")) as _cf:
+                _mc = _json.load(_cf)
+            _mt = _mc.get("model_type", "")
+            _tc = _mc.get("text_config")
+            _tcmt = _tc.get("model_type", "") if isinstance(_tc, dict) else ""
+            _is_k3 = _mt in ("kimi_k3", "kimi_linear") or _tcmt == "kimi_linear"
+        if _is_k3 and getattr(raw_args, "mamba_radix_cache_strategy", None) in (
+            None,
+            "auto",
+        ):
+            raw_args.mamba_radix_cache_strategy = "extra_buffer"
+            logger.info(
+                "K3 detected: forcing --mamba-radix-cache-strategy=extra_buffer"
+            )
+    except Exception as _e:
+        logger.warning(f"could not force mamba strategy for K3: {_e}")
+
     server_args = ServerArgs.from_cli_args(raw_args)
     simulation_args = SimulationArgs.from_cli_args(raw_args)
 

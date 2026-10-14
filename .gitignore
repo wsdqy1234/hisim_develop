@@ -21,3 +21,5 @@ dist/
 dump*/
 
 test/hisim
+# bench_serving result dumps written to CWD (e.g. sglang_1014_9_hisim-collection.jsonl)
+sglang_*.jsonl

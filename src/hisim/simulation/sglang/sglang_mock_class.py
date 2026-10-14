@@ -254,6 +254,16 @@ class _MockMambaPool:
     def get_kv_size_bytes(self):
         return 14653440  # 18 layers × 814,080 B/layer — matches sglang MambaSubPoolSpec.entry_bytes()
 
+    def copy_from(self, src_indices, dst_indices):
+        """Device-to-device slot copy (no_buffer strategy path).
+
+        HiSim tracks KDA state symbolically, so there is no real state to
+        move. Without this method the catch-all __getattr__ returns None and
+        sglang 0.5.19's MambaComponent.prepare_for_caching_req raises
+        "'NoneType' object is not callable" on every chunked prefill.
+        """
+        return None
+
     def __getattr__(self, name):
         return None
 
@@ -384,8 +394,36 @@ class MockReqToTokenPool:
     def _init_mamba_pool(self, *args, **kwargs):
         pass
 
-    def _alloc_ping_pong_buffer(self, *args, **kwargs):
-        return None
+    def _alloc_ping_pong_buffer(self, req):
+        """Allocate the ping-pong track buffer for a new request.
+
+        Mirrors HybridReqToTokenPool._alloc_ping_pong_buffer. Returns the
+        allocated slots tensor (so the caller can roll them back on failure),
+        or None if the mamba pool is exhausted.
+        """
+        n = (
+            1
+            if self.enable_mamba_extra_buffer_lazy
+            else self.mamba_ping_pong_track_buffer_size
+        )
+        slots = self.mamba_allocator.alloc(n)
+        if slots is None:
+            return None
+        buf = torch.full(
+            (self.mamba_ping_pong_track_buffer_size,),
+            -1,
+            dtype=slots.dtype,
+            device=slots.device,
+        )
+        buf[:n] = slots
+        req.kv.mamba_ping_pong_track_buffer = buf
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = (
+            0
+            if self.enable_mamba_extra_buffer_lazy
+            else self.get_mamba_ping_pong_other_idx(0)
+        )
+        return slots
 
     # ---- sglang >= 0.5.19 aux-cache/row APIs (no-op without an aux cache) ----
 
@@ -424,25 +462,28 @@ class MockReqToTokenPool:
         return 1 - mamba_next_track_idx
 
     def get_mamba_ping_pong_keep_idx(self, req) -> int:
-        _kv = getattr(req, "kv", req)
-        return getattr(_kv, "mamba_last_track_idx", 0) or 0
+        return getattr(req.kv, "mamba_last_track_idx", 0) or 0
 
     def set_mamba_ping_pong_slot(self, req, idx: int, value):
-        _kv = getattr(req, "kv", req)
-        buf = getattr(_kv, "mamba_ping_pong_track_buffer", None)
+        """Update a ping-pong slot value and sync the device-side mapping.
+
+        The req holds the authoritative buffer; this keeps the
+        req_index_to_mamba_ping_pong_track_buffer_mapping in sync so that
+        set_mamba_track_indices_from_reqs reads correct slot indices.
+        """
+        buf = getattr(req.kv, "mamba_ping_pong_track_buffer", None)
         if buf is not None:
             buf[idx] = value
+            self._mock_pp_mapping[req.kv.req_pool_idx] = buf
 
     def donate_mamba_ping_pong_slot(self, req, new_slot):
         # Native: donate the keep_idx pp_buf slot to radix cache, replace with new_slot.
         # Returns the donated slot value (shape [1]) for cache insertion.
         donate_idx = self.get_mamba_ping_pong_keep_idx(req)
         mamba_value_donated = (
-            req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
+            req.kv.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
         )
         self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
-        # Sync mapping
-        self._mock_pp_mapping[req.req_pool_idx] = req.mamba_ping_pong_track_buffer
         return mamba_value_donated
 
     def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
@@ -450,48 +491,62 @@ class MockReqToTokenPool:
         # UnifiedHybridReqToTokenPool overrides for virtual→physical translation.
         return mamba_indices
 
-    def free_mamba_cache(self, req=None, mamba_ping_pong_track_buffer_to_keep=None, *args, **kwargs):
-        # 0.5.18: free mamba state cache slots when a request finishes.
-        # Matches HybridReqToTokenPool.free_mamba_cache:
-        # 1. Always free mamba_pool_idx (if set and != -1)
-        # 2. Free non-keep pp_buf slot (filter -1)
-        # 3. Clear pp_buf attributes
+    def free_mamba_cache(
+        self,
+        req=None,
+        mamba_ping_pong_track_buffer_to_keep=None,
+        *args,
+        **kwargs,
+    ):
+        # Free mamba state cache slots when a request finishes (0.5.18+).
+        # Mirrors HybridReqToTokenPool.free_mamba_cache:
+        #   1. always free req.kv.mamba_pool_idx (the active state slot);
+        #   2. free the non-keep ping-pong slot (the keep slot belongs to the
+        #      prefix-cache value that was donated);
+        #   3. clear the req.kv tracking attributes.
         if req is None:
-            if args and hasattr(args[0], 'mamba_ping_pong_track_buffer'):
+            if args and hasattr(getattr(args[0], "kv", args[0]), "mamba_pool_idx"):
                 req = args[0]
             else:
                 return
         import torch as _t
-        import logging as _fmc_l
-        _log = _fmc_l.getLogger("hisim.mock.mamba_allocator")
 
-        # 1. Always free mamba_pool_idx (COW dst or alloc-time slot)
-        _mpi = getattr(req, 'mamba_pool_idx', None)
+        _kv = req.kv
+
+        # 1. Always free the active mamba slot (if any).
+        _mpi = getattr(_kv, "mamba_pool_idx", None)
         if _mpi is not None:
-            _mpi_val = _mpi.item() if hasattr(_mpi, 'item') else int(_mpi)
+            _mpi_val = _mpi.item() if hasattr(_mpi, "item") else int(_mpi)
             if _mpi_val != -1:
                 self.mamba_allocator.free(_t.tensor([_mpi_val], dtype=_t.int64))
-            req.mamba_pool_idx = None
+            _kv.mamba_pool_idx = None
 
-        # 2. Free non-keep pp_buf slots
-        _pp = getattr(req, 'mamba_ping_pong_track_buffer', None)
-        if _pp is not None:
+        # 2. Free the non-keep ping-pong slot(s).
+        _pp = getattr(_kv, "mamba_ping_pong_track_buffer", None)
+        if _pp is not None and self.enable_mamba_extra_buffer:
             if mamba_ping_pong_track_buffer_to_keep is not None:
-                other_idx = 1 - mamba_ping_pong_track_buffer_to_keep
-                other_slot = _pp[other_idx]
-                _other_val = other_slot.item() if hasattr(other_slot, 'item') else int(other_slot)
+                other_idx = self.get_mamba_ping_pong_other_idx(
+                    mamba_ping_pong_track_buffer_to_keep
+                )
+                _other = _pp[other_idx]
+                _other_val = _other.item() if hasattr(_other, "item") else int(_other)
                 if _other_val != -1:
-                    self.mamba_allocator.free(_t.tensor([_other_val], dtype=_t.int64))
+                    self.mamba_allocator.free(
+                        _t.tensor([_other_val], dtype=_t.int64)
+                    )
             else:
+                _vals = []
                 for _i in range(len(_pp)):
-                    _v = _pp[_i].item() if hasattr(_pp[_i], 'item') else int(_pp[_i])
+                    _v = _pp[_i].item() if hasattr(_pp[_i], "item") else int(_pp[_i])
                     if _v != -1:
-                        self.mamba_allocator.free(_t.tensor([_v], dtype=_t.int64))
+                        _vals.append(_v)
+                if _vals:
+                    self.mamba_allocator.free(_t.tensor(_vals, dtype=_t.int64))
 
-        # 3. Clear pp_buf attributes
-        req.mamba_ping_pong_track_buffer = None
-        req.mamba_next_track_idx = None
-        req.mamba_last_track_idx = None
+        # 3. Clear the req.kv tracking attributes.
+        _kv.mamba_ping_pong_track_buffer = None
+        _kv.mamba_next_track_idx = None
+        _kv.mamba_last_track_idx = None
 
     @property
     def mamba_allocator(self):
@@ -535,8 +590,12 @@ class MockReqToTokenPool:
                         return
                     _vals = idx.tolist() if hasattr(idx, 'tolist') else [idx]
                     for v in _vals:
-                        if v not in self.free_slots:
-                            self.free_slots.append(v)
+                        assert v not in self.free_slots, (
+                            f"double free of mamba slot {v} "
+                            f"(alloc_count={self._alloc_count}, "
+                            f"free_count={self._free_count}, capacity={self.capacity})"
+                        )
+                        self.free_slots.append(v)
                     self._free_count += len(_vals)
                     _ma_l.info("[MA-FREE] slots=%s remaining=%d free=%s alloc_count=%d free_count=%d",
                                 _vals, len(self.free_slots), self.free_slots, self._alloc_count, self._free_count)
@@ -577,8 +636,9 @@ class MockReqToTokenPool:
         return select_index
 
     def _alloc_v2(self, reqs: list) -> Optional[List[int]]:
-        import logging as _alloc_l
-        _ma_l = _alloc_l.getLogger("hisim.mock.mamba_allocator")
+        # sglang 0.5.9: req_pool_idx is a bare Req attribute. This version is
+        # never dispatched on the authoritative 0.5.19 target; mamba allocation
+        # lives in _alloc_v3 (mirroring HybridReqToTokenPool.alloc).
         chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
         if not any(r.is_dllm() for r in reqs):
             assert len(chunked) <= 1, (
@@ -598,102 +658,100 @@ class MockReqToTokenPool:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
                 offset += 1
-            # --- Allocate mamba_pool_idx (main state slot, 1 per request) ---
-            # Mirrors HybridReqToTokenPool.alloc: if mamba_pool_idx is already
-            # set (chunked prefill continuation or COW reuse), skip allocation.
-            if getattr(r, 'mamba_pool_idx', None) is None:
-                _mp_slots = self.mamba_allocator.alloc(1)
-                if _mp_slots is not None:
-                    r.mamba_pool_idx = _mp_slots[0]
-                    r.mamba_needs_clear = True
-                else:
-                    _cache = getattr(self, '_cache', None)
-                    if _cache is not None:
-                        try:
-                            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-                            _ma_l.info("[MA-PP-EVICT] rid=%s triggering eviction for mamba_pool_idx alloc(1)",
-                                       getattr(r, 'rid', '?'))
-                            _cache.evict(EvictParams(num_tokens=0, mamba_num=1))
-                            _mp_slots = self.mamba_allocator.alloc(1)
-                        except Exception as _e:
-                            _ma_l.warning("[MA-PP-EVICT] eviction failed: %s", _e)
-                    if _mp_slots is None:
-                        _ma_l.warning(
-                            "[MA-PP-FAIL] rid=%s mamba_pool_idx alloc(1) failed — rolling back, request deferred",
-                            getattr(r, 'rid', '?'))
-                        for _rr in reqs:
-                            if _rr.req_pool_idx in select_index:
-                                self.free_slots.append(_rr.req_pool_idx)
-                                _rr.req_pool_idx = None
-                        return None
-                    r.mamba_pool_idx = _mp_slots[0]
-                    r.mamba_needs_clear = True
-            # --- Allocate ping-pong tracking buffer (2 slots) ---
-            # Only if extra_buffer is enabled and pp_buf not yet set.
-            if self.enable_mamba_extra_buffer and getattr(r, 'mamba_ping_pong_track_buffer', None) is None:
-                _pp_slots = self.mamba_allocator.alloc(2)
-                if _pp_slots is None:
-                    _cache = getattr(self, '_cache', None)
-                    if _cache is not None:
-                        try:
-                            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-                            _ma_l.info("[MA-PP-EVICT] rid=%s triggering eviction for pp_buf alloc(2)",
-                                       getattr(r, 'rid', '?'))
-                            _cache.evict(EvictParams(num_tokens=0, mamba_num=2))
-                            _pp_slots = self.mamba_allocator.alloc(2)
-                        except Exception as _e:
-                            _ma_l.warning("[MA-PP-EVICT] eviction failed: %s", _e)
-                if _pp_slots is not None:
-                    import torch as _t
-                    r.mamba_ping_pong_track_buffer = _pp_slots.clone()
-                    r.mamba_next_track_idx = 0
-                    r.mamba_last_track_idx = self.get_mamba_ping_pong_other_idx(0)
-                else:
-                    _ma_l.warning(
-                        "[MA-PP-FAIL] rid=%s pp_buf alloc(2) failed after eviction — rolling back, request deferred",
-                        getattr(r, 'rid', '?'))
-                    # Roll back all req_pool_idx and mamba_pool_idx we assigned in this call
-                    for _rr in reqs:
-                        if _rr.req_pool_idx in select_index:
-                            self.free_slots.append(_rr.req_pool_idx)
-                            _rr.req_pool_idx = None
-                        _mpi = getattr(_rr, 'mamba_pool_idx', None)
-                        if _mpi is not None and _mpi != -1:
-                            self.mamba_allocator.free(
-                                __import__('torch').tensor([int(_mpi)], dtype=__import__('torch').int64))
-                            _rr.mamba_pool_idx = None
-                    return None
-            # --- Sync mappings (mirrors native alloc) ---
-            _mpi_val = int(r.mamba_pool_idx.item()) if hasattr(r.mamba_pool_idx, 'item') else int(r.mamba_pool_idx)
-            self.req_index_to_mamba_index_mapping[r.req_pool_idx] = _mpi_val
-            if r.mamba_ping_pong_track_buffer is not None:
-                self._mock_pp_mapping[r.req_pool_idx] = r.mamba_ping_pong_track_buffer
-            # --- Logging point 1: Alloc complete ---
-            _pp_str = r.mamba_ping_pong_track_buffer.tolist() if r.mamba_ping_pong_track_buffer is not None else 'None'
-            _ma_l.info(
-                "[ALLOC] rid=%s req_pool_idx=%d mamba_pool_idx=%d pp_buf=%s "
-                "next_track=%s last_track=%s needs_clear=%s",
-                getattr(r, 'rid', '?'), r.req_pool_idx, _mpi_val, _pp_str,
-                getattr(r, 'mamba_next_track_idx', '?'),
-                getattr(r, 'mamba_last_track_idx', '?'),
-                getattr(r, 'mamba_needs_clear', '?'),
-            )
         return [r.req_pool_idx for r in reqs]
 
     def _alloc_v3(self, reqs: list) -> Optional[List[int]]:
         # sglang >= 0.5.18: req_pool_idx moved into the Req.kv state object
         # (r.kv.holds_kv / r.kv.req_pool_idx), mirroring the stock
-        # ReqToTokenPool.alloc semantics.
+        # ReqToTokenPool.alloc semantics. This version also mirrors
+        # HybridReqToTokenPool.alloc's mamba_pool_idx + ping-pong buffer
+        # allocation: both live on req.kv for 0.5.18+.
+        import logging as _alloc_l
+        _ma_l = _alloc_l.getLogger("hisim.mock.mamba_allocator")
+
         need_size = sum(1 for r in reqs if not r.kv.holds_kv)
         if need_size > len(self.free_slots):
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+
+        # Track ONLY what this call allocates, so rollback never touches slots
+        # owned by a continuing (chunked prefill / COW) request.
+        _new_kv_reqs: list = []
+        _new_mamba_pairs: list = []  # (req, slot_int)
+        _new_pp_pairs: list = []  # (req, slots_tensor)
+
+        def _rollback():
+            if _new_pp_pairs:
+                import torch as _t
+                self.mamba_allocator.free(
+                    _t.cat([t for _, t in _new_pp_pairs])
+                )
+                for _r, _ in _new_pp_pairs:
+                    _r.kv.mamba_ping_pong_track_buffer = None
+                    _r.kv.mamba_next_track_idx = None
+                    _r.kv.mamba_last_track_idx = None
+            if _new_mamba_pairs:
+                import torch as _t
+                self.mamba_allocator.free(
+                    _t.tensor([s for _, s in _new_mamba_pairs], dtype=_t.int64)
+                )
+                for _r, _ in _new_mamba_pairs:
+                    _r.kv.mamba_pool_idx = None
+            for _r in _new_kv_reqs:
+                self.free_slots.append(_r.kv.req_pool_idx)
+                _r.kv.req_pool_idx = None
+
         offset = 0
         for r in reqs:
             if not r.kv.holds_kv:
                 r.kv.req_pool_idx = select_index[offset]
+                _new_kv_reqs.append(r)
                 offset += 1
+
+        mamba_indices: list = []
+        for r in reqs:
+            if r.kv.holds_mamba:
+                # Continuing chunked prefill / radix-cache reuse: slot retained.
+                pass
+            else:
+                _mid = self.mamba_allocator.alloc(1)
+                if _mid is None:
+                    _ma_l.warning(
+                        "[MA-ALLOC-FAIL] rid=%s mamba_pool exhausted "
+                        "(available=0, batch=%d), deferring request",
+                        getattr(r, "rid", "?"), len(reqs),
+                    )
+                    _rollback()
+                    return None
+                r.kv.mamba_pool_idx = _mid[0]
+                r.kv.mamba_needs_clear = True
+                _new_mamba_pairs.append((r, int(_mid[0])))
+            mamba_indices.append(r.kv.mamba_pool_idx)
+
+            if self.enable_mamba_extra_buffer:
+                if r.kv.mamba_ping_pong_track_buffer is None:
+                    _pp = self._alloc_ping_pong_buffer(r)
+                    if _pp is None:
+                        _ma_l.warning(
+                            "[MA-ALLOC-FAIL] rid=%s ping-pong buffer exhausted, "
+                            "deferring request",
+                            getattr(r, "rid", "?"),
+                        )
+                        _rollback()
+                        return None
+                    _new_pp_pairs.append((r, _pp))
+
+        # Sync mappings (mirrors native alloc).
+        for r in reqs:
+            _mpi = r.kv.mamba_pool_idx
+            _mpi_val = int(_mpi.item()) if hasattr(_mpi, "item") else int(_mpi)
+            self.req_index_to_mamba_index_mapping[r.kv.req_pool_idx] = _mpi_val
+            if r.kv.mamba_ping_pong_track_buffer is not None:
+                self._mock_pp_mapping[r.kv.req_pool_idx] = (
+                    r.kv.mamba_ping_pong_track_buffer
+                )
+
         return [r.kv.req_pool_idx for r in reqs]
 
     def _free_v3(self, req):
@@ -1756,7 +1814,9 @@ class MockMambaStatePoolHost:
             self._slots.pop(evicted_hash, None)
             _evicted.append(evicted_hash)
         if _evicted:
-            self._last_evicted_hashes = _evicted
+            # Accumulate: a single write batch may trigger several evictions,
+            # and the consumer clears this list after promoting to L3.
+            self._last_evicted_hashes.extend(_evicted)
 
     def load_to_device(self, slot_hash: str) -> int:
         """H2D: Load one slot (14.45MB) from DRAM to HBM (COW hit). Returns slot idx.
@@ -1895,6 +1955,20 @@ class MockHiCacheStorage:
     ) -> bool:
         if self.exists(key):
             return True
+        if hasattr(self, "storage_manager"):
+            # KVCM backend: write through the kvcm interface. The common-set
+            # path below only exists for the non-kvcm fallback; without this
+            # branch `self.storage` is undefined and every L3 write raised
+            # AttributeError (silently caught by the caller).
+            try:
+                int_hash_keys = [_pass_str_to_block_ids(str(key))]
+                self.storage_manager.WriteCache(
+                    self.instance_id, "1", int(time.time() * 1000), int_hash_keys
+                )
+                return True
+            except Exception as e:
+                logger.debug(f"KVCM set failed for {key}: {e}")
+                return False
         self.storage.add(key)
         with open(self.storage_file_path, "a+") as f:
             f.write(key + "\n")
@@ -1942,6 +2016,24 @@ class MockHiCacheStorage:
             return True
 
     def exists(self, key: str) -> bool:
+        if hasattr(self, "storage_manager"):
+            # KVCM backend: query the kvcm interface. `self.storage` is only
+            # populated by the non-kvcm fallback, so the old `key in
+            # self.storage` form raised AttributeError under KVCM.
+            try:
+                int_hash_keys = [_pass_str_to_block_ids(str(key))]
+                res = self.storage_manager.GetCacheLocation(
+                    self.instance_id,
+                    "2",
+                    int(time.time() * 1000),
+                    int_hash_keys,
+                    0,
+                    len(int_hash_keys) * _KVCM_BLOCK_SIZE,
+                )
+                return res.kvcm_hit_length > 0
+            except Exception as e:
+                logger.debug(f"KVCM exists failed for {key}: {e}")
+                return False
         return key in self.storage
 
     def batch_exists(self, keys: List[str], extra_info) -> int:

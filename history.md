@@ -1087,3 +1087,33 @@ pop_l3_direct_load_count()  # 复位
 3. gather 后统计失败请求并打印；simulation 模式下任何失败直接 `RuntimeError`（快速失败，杜绝"挂死半小时查不到错"）
 
 **验证**（18×40K 突发，K3 mock 模型 + 910C 配置）：18/18 到达并完成（`All requests received. Starting simulation now.`），总输入 token 724,500 与 trace 逐位一致（3×(40000+40100+…+40500)），prefix_cache_reused_ratio=0.9376（逐轮 cached-token 32768/40064/40192…），chunked prefill（16384 分块）与 `Proactive evict → L2` 降级链路正常，virtual 时长 93.5s。修复同步 cherry-pick 至 develop_lfz 与 develop_lfz_0.5.19。
+
+## 2026-10-14 — 修复 d1c368f（Kimi-K3 One Pool + KDA L2/L3 闭环）在本地 sglang 0.5.19 上无法运行的问题
+
+**背景**：`d1c368f`（One Pool 适配 + KDA L2/L3 闭环 + 实验报告）在 docker fork `0.5.18.dev922` 上开发，直接在本地 release 版 `0.5.19` 上跑会崩溃/挂死。本次以本地 0.5.19 为权威目标逐项修复并验证。分支 `develop_dqy`。
+
+**P0（阻断级）**：
+1. **启动断言**：`d1c368f` 删掉了 `launch_server.py` 中 `HybridReqToTokenPool` 的 isinstance 放宽补丁 → 0.5.19 `MambaComponent.__init__` 的 `isinstance(params.req_to_token_pool, HybridReqToTokenPool)` 断言失败，Two Pools 起不来。恢复为 metaclass `__instancecheck__` 别名：`MockReqToTokenPool` 通过，真实池不受影响。
+2. **canonical `metrics.json` 缺失**：`wrapped_pm_profile` 只写 `metrics_phaseN.json`，`bench_serving.load_simulation_metrics()` 读不到 `metrics.json` → `metrics.bench_mode` 处 None 崩溃。修复：`wrapped_profile` 用 `C_SchedulerHook.ALL_REQUEST_STATS`（跨 phase 的 `RequestStats` 拷贝）聚合写出 canonical `metrics.json`，同时保留 per-phase 文件；新 OFFLINE run 收到全部请求时重置累加器与 `_offline_phase`。
+3. **mamba 分配落在死代码**：`d1c368f` 把 mamba 分配只放进 `_alloc_v2`（仅 0.5.9 分派），0.5.19 走 `_alloc_v3` 从不分配 mamba。修复：把 `mamba_pool_idx` + ping-pong buffer 分配移植进 `_alloc_v3`（镜像原生 `HybridReqToTokenPool.alloc`），含：真实 `_alloc_ping_pong_buffer(req)`；只回滚"本次调用"分配的资源（`holds_kv` 续批请求不被误伤）；同步 `req_index_to_mamba_index_mapping` 与 `_mock_pp_mapping`；池耗尽返回 `None`（defer，不 assert 崩溃）。`_alloc_v2` 还原为纯 `req_pool_idx`。
+
+**P1**：
+4. **mamba 属性写错对象**：0.5.18+ 这些字段在 `req.kv`（KVState），`d1c368f` 写在 bare `req` 上。新增 `req_mamba_get/req_mamba_set` 帮助函数（优先 `req.kv`，回退 bare），把 hook 端所有 mamba 读写（`mamba_pool_idx`/ping-pong/`mamba_last_track_seqlen`/`mamba_cow_src_index`/`mamba_needs_clear`/`_pre_donations`、KDA COW/REPLAY、`[LTS-SET]`）重指向 `req.kv`。
+5. **KDA L2/L3 闭环修复**：
+   - **KVCM L3 写/查为空**（关键）：`MockHiCacheStorage.set/exists` 在 KVCM 后端下访问未定义的 `self.storage` → AttributeError 被调用方静默吞掉 → 所有 MLA L3 写/查无效（`l3_writes=0`）。修复：KVCM 路径改走 `storage_manager.WriteCache` / `GetCacheLocation`。
+   - `_last_evicted_hashes` 覆盖改累加（`.extend`）。
+   - KDA hash `kda_{nid}` → 稳定 `kda_{nid}_{i}`（循环下标，**非**物理 slot id，保持 §G 历史修复意图）。
+   - 删除 L2→L1 的"任意前 N 个 LRU key 回填"块（语义错误），改由真实 load op 处理。
+6. **OFFLINE 控制消息丢失（bench 挂死）**：`_wrapped_recv_requests` 在 `OFFLINE_RECV_ALL_REQUEST=True` 时只返回虚拟时钟放行的 generate 请求，静默丢弃 `ProfileReq` 等控制消息；`bench_serving` 工作负载后的第二次 `/start_profile` 若落在 auto-trigger 复位标志前的窗口即被丢弃 → 客户端永远等不到响应。修复：else 分支总是透传非 generate 控制消息。
+7. **no_buffer 路径 `copy_from` 崩溃**：0.5.19 `MambaComponent.prepare_for_caching_req` 在不启用 extra_buffer 时调用 `mamba_pool.copy_from`，mock 的 catch-all `__getattr__` 返回 `None` → `'NoneType' object is not callable`（chunked prefill 首请求即崩）。修复：`_MockMambaPool.copy_from` 提供 no-op；并在 K3 检测时强制 `mamba_radix_cache_strategy=extra_buffer`（K3 原生策略），使 mock 池与原生 cache 的 `enable_mamba_extra_buffer` 一致。
+8. **聚合 MLA 前缀命中指标未持久化**：`mla_prefix_hit_tokens_agg`/`mla_prefix_hit_l1_tokens_agg`/`mla_prefill_new_tokens_agg` 在写文件之后才计算。修复：移到写文件前（经 `_canon` borrow 同时进入 `metrics.json` 与 phase 文件）。
+9. **清理**：删除引用已移除 `_alloc_v2` 驱逐逻辑的死代码块；`_MockMambaPool`/`_StrictMambaAllocator` 补 double-free 断言；删除根目录 `sglang_09*_*.jsonl` 垃圾文件。
+
+**验证**（本地 sglang 0.5.19，mock K3-23L，Ascend 910C 配置，tp=8，`max_mamba_cache_size=80`）：
+- Two Pools 正常启动（`Components: (FULL, MAMBA)`），`/health` OK。
+- 18×40K 回归：18/18 完成；0 ALLOC-FAIL / 0 调度异常 / 0 double-free；`kda_write_calls=25 l3_writes=25`、`kda_load_calls=4 l3_hits=4`、`L2 hit_requests=3 hit_tokens=120512`、`mla_prefix_hit_tokens_agg` 已持久化。
+- 9 请求 smoke：端到端通过，`metrics.json` + `metrics_phase1.json` 同时写出。
+
+**关键文件**：`src/hisim/simulation/sglang/launch_server.py`（isinstance 别名 + K3 策略强制）、`sglang_hook.py`（metrics 聚合、req.kv 对齐、OFFLINE 控制消息透传、KDA L3）、`sglang_mock_class.py`（`_alloc_v3` mamba、`copy_from`、KVCM set/exists、`_alloc_ping_pong_buffer`）。
+
+**遗留（P2，未做）**：`mamba_num`/`budget_kda_bytes` 语义、`peak_resident` 公式、traceback 恢复、INFO 日志门控、launch_server 0.5.19 失效补丁（`_handle_page_major_kv_layout`/`_handle_unified_memory_pool`/`MultiEndedAllocator`）、layer map 运行时从 model_config 派生、`get_num_kv_heads` 补丁；One Pool 本地 bring-up；KDA-heavy / MLA-heavy / dynamic 实验重跑与 `docs/k3_onepool_vs_twopools_0519_rerun.md`。
