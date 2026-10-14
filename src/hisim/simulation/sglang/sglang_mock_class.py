@@ -31,15 +31,13 @@ _KVCM_BLOCK_SIZE = 16
 def _mock_mamba_pool_size() -> int:
     """Mamba slot capacity for the mock allocator/pool.
 
-    Default is ample so KDA requests are never rejected for insufficient
-    mamba slots (which would spin the scheduler on NO_TOKEN). Set
-    HISIM_MAMBA_POOL_SIZE=165 (config max_mamba_cache_size) to reproduce
-    mamba pool overflow scenarios.
+    Default matches max_mamba_cache_size (80). Set HISIM_MAMBA_POOL_SIZE
+    to override for stress testing.
     """
     try:
-        return max(1, int(os.environ.get("HISIM_MAMBA_POOL_SIZE", "2000")))
+        return max(1, int(os.environ.get("HISIM_MAMBA_POOL_SIZE", "80")))
     except ValueError:
-        return 2000
+        return 80
 
 
 def alloc_extend_cpu(
@@ -254,7 +252,7 @@ class _MockMambaPool:
         self.mamba_cache = _MockMambaCache()
 
     def get_kv_size_bytes(self):
-        return 15151104  # MAMBA_SLOT_BYTES for K3 TP=8
+        return 14653440  # 18 layers × 814,080 B/layer — matches sglang MambaSubPoolSpec.entry_bytes()
 
     def __getattr__(self, name):
         return None
@@ -290,9 +288,24 @@ class MockReqToTokenPool:
         # layer_transfer_counter for HybridCacheController
         self.layer_transfer_counter = None
 
-    def register_layer_transfer_counter(self, layer_transfer_counter):
-        self.layer_transfer_counter = layer_transfer_counter
+        # Mirrors HybridReqToTokenPool: enable_mamba_extra_buffer controls
+        # whether ping-pong tracking buffers are used. K3 uses extra_buffer
+        # strategy by default (mamba_radix_cache_strategy='extra_buffer').
+        self.enable_mamba_extra_buffer = True
+        self.enable_mamba_extra_buffer_lazy = False
 
+        # req_index_to_mamba_index_mapping: tensor[req_pool_idx] → mamba_pool_idx.
+        # Set during alloc, used by scheduler/attention backends and free_mamba_cache.
+        self.req_index_to_mamba_index_mapping = torch.zeros(
+            (size,), dtype=torch.int32, device=device
+        )
+        # req_index_to_mamba_ping_pong_track_buffer_mapping: tensor[req_pool_idx] → pp_buf[2].
+        self._mock_pp_mapping = torch.full(
+            (size, 2), -1, dtype=torch.int64, device=device
+        )
+
+        # Version dispatcher for alloc/free — must be set in __init__ so that
+        # Two Pools Plain mode (no init_hicache) also works.
         _version_dispatcher = VersionDispatcher()
         _version_dispatcher.register_method(
             "alloc",
@@ -316,6 +329,9 @@ class MockReqToTokenPool:
 
         self._alloc_func = _version_dispatcher.get_compat_method("alloc")
         self._free_func = _version_dispatcher.get_compat_method("free")
+
+    def register_layer_transfer_counter(self, layer_transfer_counter):
+        self.layer_transfer_counter = layer_transfer_counter
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -417,43 +433,126 @@ class MockReqToTokenPool:
         if buf is not None:
             buf[idx] = value
 
-    def donate_mamba_ping_pong_slot(self, src_req, dst_req):
-        # 0.5.18: donate ping-pong slot from finished/retracted req to new req.
-        # Real impl transfers src's ping-pong state into dst slot and returns
-        # the dst slot. There is no real state in simulation, but the return
-        # value flows into insert_params.mamba_value — returning dst keeps the
-        # radix-cache bookkeeping valid (chunked stash would otherwise hit
-        # `assert params.mamba_value is not None` in commit_insert_component_data).
-        return dst_req
+    def donate_mamba_ping_pong_slot(self, req, new_slot):
+        # Native: donate the keep_idx pp_buf slot to radix cache, replace with new_slot.
+        # Returns the donated slot value (shape [1]) for cache insertion.
+        donate_idx = self.get_mamba_ping_pong_keep_idx(req)
+        mamba_value_donated = (
+            req.mamba_ping_pong_track_buffer[donate_idx].unsqueeze(-1).clone()
+        )
+        self.set_mamba_ping_pong_slot(req, donate_idx, new_slot[0])
+        # Sync mapping
+        self._mock_pp_mapping[req.req_pool_idx] = req.mamba_ping_pong_track_buffer
+        return mamba_value_donated
 
-    def free_mamba_cache(self, *args, **kwargs):
+    def translate_mamba_indices(self, mamba_indices: torch.Tensor) -> torch.Tensor:
+        # Identity for non-unified pool (Two Pools mode).
+        # UnifiedHybridReqToTokenPool overrides for virtual→physical translation.
+        return mamba_indices
+
+    def free_mamba_cache(self, req=None, mamba_ping_pong_track_buffer_to_keep=None, *args, **kwargs):
         # 0.5.18: free mamba state cache slots when a request finishes.
-        pass
+        # Matches HybridReqToTokenPool.free_mamba_cache:
+        # 1. Always free mamba_pool_idx (if set and != -1)
+        # 2. Free non-keep pp_buf slot (filter -1)
+        # 3. Clear pp_buf attributes
+        if req is None:
+            if args and hasattr(args[0], 'mamba_ping_pong_track_buffer'):
+                req = args[0]
+            else:
+                return
+        import torch as _t
+        import logging as _fmc_l
+        _log = _fmc_l.getLogger("hisim.mock.mamba_allocator")
+
+        # 1. Always free mamba_pool_idx (COW dst or alloc-time slot)
+        _mpi = getattr(req, 'mamba_pool_idx', None)
+        if _mpi is not None:
+            _mpi_val = _mpi.item() if hasattr(_mpi, 'item') else int(_mpi)
+            if _mpi_val != -1:
+                self.mamba_allocator.free(_t.tensor([_mpi_val], dtype=_t.int64))
+            req.mamba_pool_idx = None
+
+        # 2. Free non-keep pp_buf slots
+        _pp = getattr(req, 'mamba_ping_pong_track_buffer', None)
+        if _pp is not None:
+            if mamba_ping_pong_track_buffer_to_keep is not None:
+                other_idx = 1 - mamba_ping_pong_track_buffer_to_keep
+                other_slot = _pp[other_idx]
+                _other_val = other_slot.item() if hasattr(other_slot, 'item') else int(other_slot)
+                if _other_val != -1:
+                    self.mamba_allocator.free(_t.tensor([_other_val], dtype=_t.int64))
+            else:
+                for _i in range(len(_pp)):
+                    _v = _pp[_i].item() if hasattr(_pp[_i], 'item') else int(_pp[_i])
+                    if _v != -1:
+                        self.mamba_allocator.free(_t.tensor([_v], dtype=_t.int64))
+
+        # 3. Clear pp_buf attributes
+        req.mamba_ping_pong_track_buffer = None
+        req.mamba_next_track_idx = None
+        req.mamba_last_track_idx = None
 
     @property
     def mamba_allocator(self):
         if not hasattr(self, "_mock_mamba_allocator"):
-            # In HiSim simulation we don't need real limited mamba slot
-            # allocation — just provide ample capacity so KDA requests are
-            # never rejected for insufficient mamba slots (which would spin
-            # the scheduler on NO_TOKEN for long-sequence requests).
-            # `free_slots` kept as a python list for cheap slicing; `alloc`
-            # returns a torch tensor (scheduler expects mamba_pool_idx tensor).
             import torch as _torch
             _pool_size = _mock_mamba_pool_size()
-            self._mock_mamba_allocator = type("MockMambaSlotAllocator", (), {
-                "device": self.device,
-                "_alloc_iter": None,
-                "free_slots": list(range(1, _pool_size + 1)),
-                "available_size": lambda self: len(self.free_slots),
-                "schedulable_available_size": lambda self: len(self.free_slots),
-                "alloc_group_begin": lambda self, n: setattr(self, "_alloc_iter", iter(self.free_slots[:min(n, len(self.free_slots))]) if n > 0 else None),
-                "alloc_group_end": lambda self: setattr(self, "_alloc_iter", None),
-                "alloc": lambda self, n: _torch.tensor(self.free_slots[:min(n, len(self.free_slots))], dtype=_torch.int64, device=self.device) if n > 0 else _torch.empty((0,), dtype=_torch.int64, device=self.device),
-                "free": lambda self, idx: None,
-                "clear": lambda self: setattr(self, "free_slots", list(range(1, _pool_size + 1))),
-            })()
-            self._mock_mamba_allocator._pool_size = _pool_size
+            # Real alloc/free with fixed capacity — matches One Pool's
+            # max_mamba_cache_size constraint. When full, alloc returns
+            # None, triggering mamba eviction in the scheduler.
+            import logging as _ma_logging
+            _ma_l = _ma_logging.getLogger("hisim.mock.mamba_allocator")
+            class _StrictMambaAllocator:
+                def __init__(self, capacity, device):
+                    self.device = device
+                    self.capacity = capacity
+                    self.free_slots = list(range(1, capacity + 1))
+                    self._alloc_count = 0
+                    self._free_count = 0
+                    _ma_l.info("[MA-INIT] capacity=%d device=%s free_slots=%s", capacity, device, self.free_slots)
+                def available_size(self):
+                    return len(self.free_slots)
+                def schedulable_available_size(self):
+                    return len(self.free_slots)
+                def alloc_group_begin(self, n):
+                    pass  # no-op, slots are allocated individually
+                def alloc_group_end(self):
+                    pass  # no-op
+                def alloc(self, n=1):
+                    if n <= 0 or len(self.free_slots) < n:
+                        _ma_l.info("[MA-ALLOC-FAIL] n=%d available=%d free=%s alloc_count=%d free_count=%d",
+                                    n, len(self.free_slots), self.free_slots, self._alloc_count, self._free_count)
+                        return None
+                    slots = self.free_slots[:n]
+                    self.free_slots = self.free_slots[n:]
+                    self._alloc_count += n
+                    _ma_l.info("[MA-ALLOC] n=%d slots=%s remaining=%d free=%s alloc_count=%d",
+                                n, slots, len(self.free_slots), self.free_slots, self._alloc_count)
+                    return _torch.tensor(slots, dtype=_torch.int64, device=self.device)
+                def free(self, idx):
+                    if idx is None:
+                        return
+                    _vals = idx.tolist() if hasattr(idx, 'tolist') else [idx]
+                    for v in _vals:
+                        if v not in self.free_slots:
+                            self.free_slots.append(v)
+                    self._free_count += len(_vals)
+                    _ma_l.info("[MA-FREE] slots=%s remaining=%d free=%s alloc_count=%d free_count=%d",
+                                _vals, len(self.free_slots), self.free_slots, self._alloc_count, self._free_count)
+                def get_stats(self):
+                    return {
+                        "capacity": self.capacity,
+                        "available": len(self.free_slots),
+                        "alloc_count": self._alloc_count,
+                        "free_count": self._free_count,
+                        "free_slots": list(self.free_slots),
+                    }
+                def clear(self):
+                    self.free_slots = list(range(1, self.capacity + 1))
+                    self._alloc_count = 0
+                    self._free_count = 0
+            self._mock_mamba_allocator = _StrictMambaAllocator(_pool_size, self.device)
         return self._mock_mamba_allocator
 
     @property
@@ -478,6 +577,8 @@ class MockReqToTokenPool:
         return select_index
 
     def _alloc_v2(self, reqs: list) -> Optional[List[int]]:
+        import logging as _alloc_l
+        _ma_l = _alloc_l.getLogger("hisim.mock.mamba_allocator")
         chunked = [i for i, r in enumerate(reqs) if r.req_pool_idx is not None]
         if not any(r.is_dllm() for r in reqs):
             assert len(chunked) <= 1, (
@@ -497,6 +598,86 @@ class MockReqToTokenPool:
             if r.req_pool_idx is None:
                 r.req_pool_idx = select_index[offset]
                 offset += 1
+            # --- Allocate mamba_pool_idx (main state slot, 1 per request) ---
+            # Mirrors HybridReqToTokenPool.alloc: if mamba_pool_idx is already
+            # set (chunked prefill continuation or COW reuse), skip allocation.
+            if getattr(r, 'mamba_pool_idx', None) is None:
+                _mp_slots = self.mamba_allocator.alloc(1)
+                if _mp_slots is not None:
+                    r.mamba_pool_idx = _mp_slots[0]
+                    r.mamba_needs_clear = True
+                else:
+                    _cache = getattr(self, '_cache', None)
+                    if _cache is not None:
+                        try:
+                            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+                            _ma_l.info("[MA-PP-EVICT] rid=%s triggering eviction for mamba_pool_idx alloc(1)",
+                                       getattr(r, 'rid', '?'))
+                            _cache.evict(EvictParams(num_tokens=0, mamba_num=1))
+                            _mp_slots = self.mamba_allocator.alloc(1)
+                        except Exception as _e:
+                            _ma_l.warning("[MA-PP-EVICT] eviction failed: %s", _e)
+                    if _mp_slots is None:
+                        _ma_l.warning(
+                            "[MA-PP-FAIL] rid=%s mamba_pool_idx alloc(1) failed — rolling back, request deferred",
+                            getattr(r, 'rid', '?'))
+                        for _rr in reqs:
+                            if _rr.req_pool_idx in select_index:
+                                self.free_slots.append(_rr.req_pool_idx)
+                                _rr.req_pool_idx = None
+                        return None
+                    r.mamba_pool_idx = _mp_slots[0]
+                    r.mamba_needs_clear = True
+            # --- Allocate ping-pong tracking buffer (2 slots) ---
+            # Only if extra_buffer is enabled and pp_buf not yet set.
+            if self.enable_mamba_extra_buffer and getattr(r, 'mamba_ping_pong_track_buffer', None) is None:
+                _pp_slots = self.mamba_allocator.alloc(2)
+                if _pp_slots is None:
+                    _cache = getattr(self, '_cache', None)
+                    if _cache is not None:
+                        try:
+                            from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+                            _ma_l.info("[MA-PP-EVICT] rid=%s triggering eviction for pp_buf alloc(2)",
+                                       getattr(r, 'rid', '?'))
+                            _cache.evict(EvictParams(num_tokens=0, mamba_num=2))
+                            _pp_slots = self.mamba_allocator.alloc(2)
+                        except Exception as _e:
+                            _ma_l.warning("[MA-PP-EVICT] eviction failed: %s", _e)
+                if _pp_slots is not None:
+                    import torch as _t
+                    r.mamba_ping_pong_track_buffer = _pp_slots.clone()
+                    r.mamba_next_track_idx = 0
+                    r.mamba_last_track_idx = self.get_mamba_ping_pong_other_idx(0)
+                else:
+                    _ma_l.warning(
+                        "[MA-PP-FAIL] rid=%s pp_buf alloc(2) failed after eviction — rolling back, request deferred",
+                        getattr(r, 'rid', '?'))
+                    # Roll back all req_pool_idx and mamba_pool_idx we assigned in this call
+                    for _rr in reqs:
+                        if _rr.req_pool_idx in select_index:
+                            self.free_slots.append(_rr.req_pool_idx)
+                            _rr.req_pool_idx = None
+                        _mpi = getattr(_rr, 'mamba_pool_idx', None)
+                        if _mpi is not None and _mpi != -1:
+                            self.mamba_allocator.free(
+                                __import__('torch').tensor([int(_mpi)], dtype=__import__('torch').int64))
+                            _rr.mamba_pool_idx = None
+                    return None
+            # --- Sync mappings (mirrors native alloc) ---
+            _mpi_val = int(r.mamba_pool_idx.item()) if hasattr(r.mamba_pool_idx, 'item') else int(r.mamba_pool_idx)
+            self.req_index_to_mamba_index_mapping[r.req_pool_idx] = _mpi_val
+            if r.mamba_ping_pong_track_buffer is not None:
+                self._mock_pp_mapping[r.req_pool_idx] = r.mamba_ping_pong_track_buffer
+            # --- Logging point 1: Alloc complete ---
+            _pp_str = r.mamba_ping_pong_track_buffer.tolist() if r.mamba_ping_pong_track_buffer is not None else 'None'
+            _ma_l.info(
+                "[ALLOC] rid=%s req_pool_idx=%d mamba_pool_idx=%d pp_buf=%s "
+                "next_track=%s last_track=%s needs_clear=%s",
+                getattr(r, 'rid', '?'), r.req_pool_idx, _mpi_val, _pp_str,
+                getattr(r, 'mamba_next_track_idx', '?'),
+                getattr(r, 'mamba_last_track_idx', '?'),
+                getattr(r, 'mamba_needs_clear', '?'),
+            )
         return [r.req_pool_idx for r in reqs]
 
     def _alloc_v3(self, reqs: list) -> Optional[List[int]]:
@@ -1103,37 +1284,32 @@ class MockTokenToKVPoolHost:
         self.pin_memory = False
         self.device = device
 
-        self.dtype = device_pool.store_dtype
+        self.dtype = getattr(device_pool, 'store_dtype', torch.float32)
         self.size_per_token = self.get_size_per_token()
         if host_size > 0:
             self.size = int(host_size * 1e9 // self.size_per_token)
         else:
-            self.size = int(device_pool.size * host_to_device_ratio)
+            self.size = int(getattr(device_pool, 'size', 200000) * host_to_device_ratio)
         # Align up the host memory pool size to the page size
         self.page_num = self.size // self.page_size + 1
         self.size = self.page_num * self.page_size
         self.logical_size = self.size  # used by HybridCacheController
         self.entry_map = {}  # used by append_host_mem_release
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
+        self.start_layer = getattr(device_pool, 'start_layer', 0)
+        self.end_layer = getattr(device_pool, 'end_layer', 23)
         self.layer_transfer_counter = None
 
-        if self.size <= device_pool.size:
+        _dp_size = getattr(device_pool, 'size', 200000)
+        if self.size <= _dp_size:
             logger.warning(
                 f"Host memory pool ({self.size} tokens) is not larger than device pool "
-                f"({device_pool.size} tokens). L2 may evict before L1 does."
+                f"({_dp_size} tokens). L2 may evict before L1 does."
             )
 
         # Verify there is enough available host memory.
-        # Use actual mock buffer size (1x1 per token) for the check, not the
-        # virtual size_per_token (which uses real head_num/dim for capacity).
-        mock_per_token = (
-            self.device_pool.head_num
-            * self.device_pool.head_dim
-            * self.layer_num
-            * self.dtype.itemsize
-            * 2
-        )
+        # Mock buffer uses 1x1 per token (not real head_dim), so the actual
+        # memory per token matches size_per_token (not the virtual capacity).
+        mock_per_token = self.size_per_token
         host_mem = psutil.virtual_memory()
         requested_bytes = self.size * mock_per_token
         # preserve at least 10GB for other usage
@@ -1165,13 +1341,13 @@ class MockTokenToKVPoolHost:
         return None
 
     def get_size_per_token(self):
-        self.layer_num = self.device_pool.layer_num
+        self.layer_num = getattr(self.device_pool, 'layer_num', 23)
         # Use real model params for capacity calculation (not mock 1x1)
         real_head_num = getattr(self.device_pool, '_real_head_num', 1)
         real_head_dim = getattr(self.device_pool, '_real_head_dim', 1)
         # Keep mock 1x1 for actual buffer allocation (saves memory)
-        self.head_num = self.device_pool.head_num
-        self.head_dim = self.device_pool.head_dim
+        self.head_num = getattr(self.device_pool, 'head_num', 1)
+        self.head_dim = getattr(self.device_pool, 'head_dim', 576)
         return real_head_dim * real_head_num * self.layer_num * self.dtype.itemsize * 2
 
     def init_kv_buffer(self):
@@ -1496,12 +1672,22 @@ class MockMambaStatePoolHost:
         self._slots = {}  # {slot_hash: placeholder}
         self.free_slots = list(range(size))
         self.release_slots = []
+        self._last_evicted_hashes = []  # hashes evicted during last backup (for L3 promotion)
         from collections import OrderedDict
         self._lru = OrderedDict()  # {slot_hash: access_time}
         self.layer_transfer_counter = None
 
     def available_size(self):
         return len(self.free_slots)
+
+    def get_stats(self) -> dict:
+        """Return L2 KDA cache pool statistics (instantaneous snapshot)."""
+        return {
+            "cached_slots": len(self._slots),  # slots currently cached in L2
+            "capacity": self.size,             # total L2 capacity
+            "free_slots": len(self.free_slots),
+            "lru_entries": len(self._lru),     # LRU tracked entries
+        }
 
     def alloc(self, need_size):
         if need_size > len(self.free_slots):
@@ -1546,29 +1732,31 @@ class MockMambaStatePoolHost:
     def backup_from_device(self, slot_idx: int, slot_hash: str, from_l3: bool = False):
         """D2H: Backup one slot (MAMBA_SLOT_BYTES) from HBM to DRAM. Accumulates timing.
 
-        If from_l3=True, this is an SSD→DRAM read (L3 prefetch load_back).
-        The timing goes to kda_l3_load_dur instead of kda_l2_backup_dur.
+        If from_l3=True, this is an L3→L2 restore (data already in DRAM from SSD read).
+        No additional D2H timing — SSD read timing is handled by the caller.
         """
         from hisim.simulation.manager.state import StateManager
 
-        bw = self._est_bandwidth(self.slot_bytes, cat="D2H")
-        dur = self.slot_bytes / bw
-
-        if from_l3:
-            # L3 SSD read → DRAM (prefetch load_back path)
-            StateManager.inc_hicache_kda_l3_load_dur(dur)
-        else:
-            # Normal HBM → DRAM backup (eviction path)
+        if not from_l3:
+            # Normal HBM → DRAM backup (eviction path): count D2H timing
+            bw = self._est_bandwidth(self.slot_bytes, cat="D2H")
+            dur = self.slot_bytes / bw
             StateManager.inc_hicache_kda_l2_backup_dur(dur)
+        # from_l3=True: data already in DRAM (SSD read already timed by caller)
+        # No additional timing — just store in L2
 
         # Store in L2 (even for L3 load_back: data now in DRAM)
         self._slots[slot_hash] = slot_idx
         self._lru[slot_hash] = len(self._lru)
 
-        # Evict if L2 full
+        # Evict if L2 full — collect evicted hashes for L3 promotion
+        _evicted = []
         while len(self._slots) > self.size:
             evicted_hash, _ = self._lru.popitem(last=False)
             self._slots.pop(evicted_hash, None)
+            _evicted.append(evicted_hash)
+        if _evicted:
+            self._last_evicted_hashes = _evicted
 
     def load_to_device(self, slot_hash: str) -> int:
         """H2D: Load one slot (14.45MB) from DRAM to HBM (COW hit). Returns slot idx.

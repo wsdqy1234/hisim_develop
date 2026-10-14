@@ -191,46 +191,217 @@ class C_ModelRunnerHook(BaseHook):
             self.end_layer = getattr(self.model, "end_layer", model_num_layers)
             self.num_effective_layers = self.end_layer - self.start_layer
 
-            self.req_to_token_pool = MockReqToTokenPool(
-                size=max_num_reqs,
-                max_context_len=model.max_seq_len,
-                device=self.device,
-                enable_memory_saver=False,
-            )
-
-            self.token_to_kv_pool = MockTokenToKVPool(
-                self.max_total_num_tokens,
-                page_size=self.page_size,
-                dtype=self.kv_cache_dtype,
-                head_num=self.model_config.get_num_kv_heads(
-                    1  # get_attention_tp_size()
-                ),
-                head_dim=self.model_config.head_dim,
-                layer_num=self.num_effective_layers,
-                device=self.device,
-                enable_memory_saver=self.server_args.enable_memory_saver,
-                start_layer=self.start_layer,
-                end_layer=self.end_layer,
-            )
-
-            if self.page_size == 1:
-                self.token_to_kv_pool_allocator = MockTokenToKVPoolAllocator(
-                    size=self.max_total_num_tokens,
-                    page_size=1,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=self.token_to_kv_pool,
-                    need_sort=False,
+            # In unified memory mode, let sglang's kv_cache_configurator
+            # create the real UnifiedHybridReqToTokenPool + UnifiedKVPool.
+            # Only create mock pools for Two Pools (hierarchical/plain) mode.
+            _is_unified = getattr(self.server_args, 'enable_unified_memory', False)
+            if _is_unified:
+                logger.info("Unified memory mode: skipping mock pool creation, "
+                            "letting sglang configurator create real unified pools")
+                # Set attributes needed by init_kv_cache_configurator
+                self.pre_model_load_memory = 0
+                self.sliding_window_size = None
+                self._proc_scaled_bwd_llk_shm = None
+                self._proc_scaled_bwd_glk_shm = None
+                self.is_hybrid_swa_compress = False
+                self.use_mla_backend = False  # Keep False: MLA kernel paths crash on NPU simulation
+                # HiSim MLA Capacity Simulation: override head_num/head_dim so
+                # MHASubPoolSpec entry_bytes matches real MLA (5760 B/token).
+                # MHA: entry_bytes = 5 × head_num × head_dim × 2(K+V) × 2(bf16) = 5760
+                # With head_dim=288 (set by launch_server patch): head_num = 1
+                # Override get_num_kv_heads to return 1 for correct sizing.
+                _orig_get_nkh = type(self.model_config).get_num_kv_heads
+                def _hisim_get_nkh(self_mc, tensor_parallel_size, dcp_size=1):
+                    if getattr(self_mc, 'kv_lora_rank', None) is not None:
+                        return 1  # HiSim MLA capacity: 1 head × 288 dim = 288 (MLA = 576/2)
+                    return _orig_get_nkh(self_mc, tensor_parallel_size, dcp_size)
+                type(self.model_config).get_num_kv_heads = _hisim_get_nkh
+                logger.info("HiSim MLA capacity: head_num=1, head_dim=288 → entry_bytes=5760")
+                from sglang.srt.model_executor.model_runner_components.layer_setup import ModelLayerInfo
+                self.layer_info = ModelLayerInfo(
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
+                    num_effective_layers=self.num_effective_layers,
                 )
+                self.forward_stream = None
+                self.memory_pool_config = None
+                self.draft_model_idx = None
+                self.post_capture_kv_active = False
+                self.kv_cache_dtype_str = (
+                    getattr(self.server_args, "kv_cache_data_type", None) or "auto"
+                )
+                self.spec_aux_config = None
+                self.spec_algorithm = None
+                try:
+                    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+                    self.spec_algorithm = SpeculativeAlgorithm.from_string(
+                        getattr(self.server_args, "spec_algorithm", None) or "none"
+                    )
+                except Exception:
+                    self.spec_algorithm = None
+                # Resolve spec_aux_config (even with no spec, returns a valid config)
+                try:
+                    from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+                        resolve_spec_aux_hidden_state_config,
+                    )
+                    self.spec_aux_config = resolve_spec_aux_hidden_state_config(
+                        server_args=self.server_args,
+                        model_config=self.model_config,
+                        spec_algorithm=self.spec_algorithm,
+                        is_draft_worker=self.is_draft_worker,
+                    )
+                except Exception:
+                    from types import SimpleNamespace as _SSNS
+                    self.spec_aux_config = _SSNS(
+                        eagle_use_aux_hidden_state=False,
+                        eagle_aux_hidden_state_layer_ids=[],
+                        dflash_use_aux_hidden_state=False,
+                        dflash_target_layer_ids=[],
+                    )
+                # Initialize the configurator and configure real unified pools
+                self.init_kv_cache_configurator()
+                # Ensure use_mla_backend is True on the configurator (K3 uses MLA).
+                # The configurator may not inherit this from ModelRunner, causing
+                # init_unified_mamba_pools to use MHASubPoolSpec instead of MLA.
+                self.kv_cache_configurator.use_mla_backend = True
+                result = self.kv_cache_configurator.configure(
+                    pre_model_load_memory=self.pre_model_load_memory
+                )
+                self.max_total_num_tokens = result.max_total_num_tokens
+                self.max_running_requests = result.max_running_requests
+                self.req_to_token_pool = result.req_to_token_pool
+                # Override max_running_requests to force Mamba pool overflow.
+                # The configurator caps max_running_requests to
+                # max_mamba_cache_size/5, which prevents overflow by design.
+                # For pressure testing, we need more concurrent requests than
+                # the configurator allows, so the Mamba sub-pool overflows and
+                # triggers compact/flush_peer in MultiEndedAllocator.
+                _user_mrr = getattr(self.server_args, 'max_running_requests', None)
+                if _user_mrr is not None and _user_mrr > self.max_running_requests:
+                    logger.info(
+                        f"Overriding max_running_requests: {self.max_running_requests}"
+                        f" -> {_user_mrr} (user-specified, for pressure testing)"
+                    )
+                    self.max_running_requests = _user_mrr
+                    # Resize req_to_token_pool to support more concurrent requests.
+                    # ReqToTokenPool has _alloc_size = size + 1 (padding row at 0),
+                    # req_to_token tensor, req_generation tensor, and free_slots list.
+                    # HybridReqToTokenPool also has req_index_to_mamba_index_mapping
+                    # and req_index_to_mamba_ping_pong_track_buffer_mapping.
+                    import torch
+                    _pool = self.req_to_token_pool
+                    _new_alloc = _user_mrr + 1
+                    _pool.req_to_token = torch.zeros(
+                        (_new_alloc, _pool.max_context_len),
+                        dtype=_pool.req_to_token.dtype,
+                        device=_pool.req_to_token.device,
+                    )
+                    _pool.req_generation = torch.zeros(
+                        _new_alloc, dtype=torch.int64,
+                        device=_pool.req_generation.device,
+                    )
+                    _pool._alloc_size = _new_alloc
+                    _pool.size = _user_mrr
+                    _pool.free_slots = list(range(1, _new_alloc))
+                    # Resize HybridReqToTokenPool mamba mapping tensors
+                    if hasattr(_pool, 'req_index_to_mamba_index_mapping'):
+                        _pool.req_index_to_mamba_index_mapping = torch.zeros(
+                            _new_alloc, dtype=torch.int32, device=_pool.device,
+                        )
+                    if hasattr(_pool, 'req_index_to_mamba_ping_pong_track_buffer_mapping'):
+                        _pp_size = _pool.mamba_ping_pong_track_buffer_size
+                        _pool.req_index_to_mamba_ping_pong_track_buffer_mapping = torch.zeros(
+                            (_new_alloc, _pp_size), dtype=torch.int64, device=_pool.device,
+                        )
+                self.token_to_kv_pool = result.token_to_kv_pool
+                self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+                self.memory_pool_config = result.memory_pool_config
+
+                # HiSim Mamba State Mock: Replace UnifiedMambaPool with a catch-all
+                # mock (like Two Pools' _MockMambaPool). The forward pass is mocked,
+                # so actual Mamba state data is irrelevant. But mamba_component.py
+                # calls mamba_pool methods (copy_from, get_cpu_copy, replayssm_*)
+                # that trigger NPU kernels and crash in CPU simulation.
+                # Keep mamba_allocator (MultiEndedAllocator) fully functional —
+                # alloc/free/compact/flush_peer still track the dynamic KV/Mamba split.
+                _real_mamba_pool = self.req_to_token_pool.mamba_pool
+                _real_allocator = self.req_to_token_pool.mamba_allocator
+
+                class _HiSimMambaPoolMock:
+                    """Catch-all mock for MambaPool data operations.
+                    Passes through size/attributes but no-ops all methods.
+                    mamba_allocator (MultiEndedAllocator) remains real."""
+                    def __init__(self, real_pool):
+                        self._real = real_pool
+                        self.size = getattr(real_pool, 'size', 0)
+                        self.num_mamba_layers = getattr(real_pool, 'num_mamba_layers', 17)
+                        self.layer_transfer_counter = None
+                        self.replayssm_write_pos = None
+                        self.replayssm_cache_base = None
+                        self.replayssm_is_flush = None
+                        # Provide mamba_cache with tiny CPU tensors (for attribute reads)
+                        import torch as _t
+                        _n = self.num_mamba_layers
+                        class _MockCache:
+                            conv = [_t.zeros(_n, 1, 1, 4, dtype=_t.float32)]
+                            temporal = _t.zeros(_n, 1, 1, 4, dtype=_t.float32)
+                        self.mamba_cache = _MockCache()
+                    def copy_from(self, src, dst):
+                        pass  # no-op: data doesn't matter (forward mocked)
+                    def get_cpu_copy(self, indices):
+                        return None
+                    def load_cpu_copy(self, cache_cpu, indices):
+                        pass
+                    def __getattr__(self, name):
+                        return None  # catch-all: any other method → None
+
+                self.req_to_token_pool.mamba_pool = _HiSimMambaPoolMock(_real_mamba_pool)
+                # mamba_allocator stays real (MultiEndedAllocator)
+                logger.info(f"Unified pools created: req_to_token_pool={type(self.req_to_token_pool).__name__}, "
+                            f"token_to_kv_pool={type(self.token_to_kv_pool).__name__}, "
+                            f"max_total_tokens={self.max_total_num_tokens}, "
+                            f"mamba_pool=mocked (NPU bypass), mamba_allocator=real")
             else:
-                self.token_to_kv_pool_allocator = MockPagedTokenToKVPoolAllocator(
-                    size=self.max_total_num_tokens,
+                self.req_to_token_pool = MockReqToTokenPool(
+                    size=max_num_reqs,
+                    max_context_len=model.max_seq_len,
+                    device=self.device,
+                    enable_memory_saver=False,
+                )
+
+                self.token_to_kv_pool = MockTokenToKVPool(
+                    self.max_total_num_tokens,
                     page_size=self.page_size,
                     dtype=self.kv_cache_dtype,
+                    head_num=self.model_config.get_num_kv_heads(
+                        1  # get_attention_tp_size()
+                    ),
+                    head_dim=self.model_config.head_dim,
+                    layer_num=self.num_effective_layers,
                     device=self.device,
-                    kvcache=self.token_to_kv_pool,
-                    need_sort=False,
+                    enable_memory_saver=self.server_args.enable_memory_saver,
+                    start_layer=self.start_layer,
+                    end_layer=self.end_layer,
                 )
+
+                if self.page_size == 1:
+                    self.token_to_kv_pool_allocator = MockTokenToKVPoolAllocator(
+                        size=self.max_total_num_tokens,
+                        page_size=1,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=False,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = MockPagedTokenToKVPoolAllocator(
+                        size=self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                        need_sort=False,
+                    )
 
             # self.init_memory_pool(50)
             self.attn_backend = None
@@ -1246,6 +1417,7 @@ class C_HiRadixCacheHook(BaseHook):
                 except Exception:
                     pass
 
+
                 def _mock_start_writing(cc=cache.cache_controller, host=full_host, c=cache, mh=mamba_host, st=_storage):
                     if len(cc.write_queue) == 0:
                         return
@@ -1276,6 +1448,7 @@ class C_HiRadixCacheHook(BaseHook):
                         _xv = getattr(_xn, 'value', str(_xn))
                         if _xv == 'mamba':
                             _mamba_xfers.append(_xfer)
+                    _mamba_slot_hashes = []
                     if _mamba_xfers and mh is not None:
                         _diag_w["mamba_pt"] += 1
                         for _xfer in _mamba_xfers:
@@ -1285,7 +1458,10 @@ class C_HiRadixCacheHook(BaseHook):
                                 _n = len(_mhi) if hasattr(_mhi, '__len__') else 1
                                 _nid = _ni[0] if _ni else 0
                                 for _i in range(_n):
-                                    mh.backup_from_device(0, f"mamba_{_nid}_{_i}")
+                                    _slot_idx = int(_mdi[_i]) if _mdi is not None and hasattr(_mdi, '__getitem__') else _i
+                                    _slot_hash = f"kda_{_nid}"
+                                    mh.backup_from_device(_slot_idx, _slot_hash)
+                                    _mamba_slot_hashes.append(_slot_hash)
                             except Exception as e:
                                 logger.debug(f"mamba backup_from_device failed: {e}")
                     elif _pt:
@@ -1315,26 +1491,46 @@ class C_HiRadixCacheHook(BaseHook):
                                 _diag_w["l3_writes"] += 1
                                 _l3_dur = _kv_bytes / _disk_write_bw if _di is not None else 0
                                 StateManager.inc_hicache_l3_backup_dur(_l3_dur)
-                                # KDA L3 backup
-                                if _mamba_xfers and mh is not None:
-                                    _slot_bytes = getattr(mh, 'slot_bytes', 15151104)
-                                    st.batch_set_mamba([f"mamba_{nid}"])
-                                    _kda_l3_dur = _slot_bytes / _disk_write_bw
-                                    StateManager.inc_hicache_kda_l3_backup_dur(_kda_l3_dur)
                             except Exception as e:
                                 logger.debug(f"L3 write failed node {nid}: {e}")
+                        # KDA L3 backup: write-through all backed-up slots
+                        # + overflow promotion from L2 eviction
+                        _l3_mamba = list(_mamba_slot_hashes)
+                        if mh is not None:
+                            _evicted = getattr(mh, '_last_evicted_hashes', None) or []
+                            if _evicted:
+                                _l3_mamba.extend(_evicted)
+                                mh._last_evicted_hashes = []
+                        if _l3_mamba:
+                            try:
+                                st.batch_set_mamba(_l3_mamba)
+                                _slot_bytes = getattr(mh, 'slot_bytes', 14653440) if mh else 14653440
+                                _kda_l3_dur = (_slot_bytes * len(_l3_mamba)) / _disk_write_bw
+                                StateManager.inc_hicache_kda_l3_backup_dur(_kda_l3_dur)
+                            except Exception as e:
+                                logger.debug(f"KDA L3 write failed: {e}")
                     # Set host_value on components (FULL + MAMBA)
                     if _tc is not None and hasattr(_tc, 'node_by_id') and _ni:
                         for nid in _ni:
                             try:
                                 node = _tc.node_by_id(nid)
                                 if node is not None and hasattr(node, 'component_data'):
-                                    if _HA_CT.FULL in node.component_data and _hi is not None and len(_hi) > 0:
-                                        node.component_data[_HA_CT.FULL].host_value = _hi
-                                    if _mamba_xfers and _HA_CT.MAMBA in node.component_data:
+                                    try:
+                                        _fv = node.component_data[_HA_CT.FULL]
+                                    except (KeyError, IndexError, TypeError):
+                                        _fv = None
+                                    try:
+                                        _mv = node.component_data[_HA_CT.MAMBA]
+                                    except (KeyError, IndexError, TypeError):
+                                        _mv = None
+                                    if _fv is not None and _hi is not None and len(_hi) > 0:
+                                        _fv.host_value = _hi
+                                    if _mamba_xfers and _mv is not None:
                                         _mhi = getattr(_mamba_xfers[0], 'host_indices', None)
                                         if _mhi is not None:
-                                            node.component_data[_HA_CT.MAMBA].host_value = _mhi.clone() if hasattr(_mhi, 'clone') else _mhi
+                                            _mv.host_value = _mhi.clone() if hasattr(_mhi, 'clone') else _mhi
+                                    if _mv is not None and _mv.value is not None and _mv.host_value is None:
+                                        _mv.host_value = _mv.value.clone() if hasattr(_mv.value, 'clone') else _mv.value
                             except Exception as e:
                                 logger.debug(f"set host_value failed node {nid}: {e}")
                     try:
@@ -1395,13 +1591,6 @@ class C_HiRadixCacheHook(BaseHook):
                                     _ntok = len(_di) if _di is not None else 0
                                     if _ntok > 0:
                                         StateManager.inc_l3_direct_load_count(_ntok)
-                                # KDA L3 read
-                                if mh is not None:
-                                    _m_hits = st.batch_exists_mamba([f"mamba_{nid}"])
-                                    if any(_m_hits.values()):
-                                        _slot_bytes = getattr(mh, 'slot_bytes', 15151104)
-                                        _kda_l3_dur = _slot_bytes / _disk_read_bw
-                                        StateManager.inc_hicache_kda_l3_load_dur(_kda_l3_dur)
                             except Exception as e:
                                 logger.debug(f"L3 read failed node {nid}: {e}")
                     # FULL pool load (H2D)
@@ -1410,7 +1599,7 @@ class C_HiRadixCacheHook(BaseHook):
                             host.load_to_device_per_layer(host.device_pool, _hi, _di, 0, "kernel")
                         except Exception as e:
                             logger.debug(f"load_to_device_per_layer failed: {e}")
-                    # Process sidecar pool transfers (MAMBA/KDA)
+                    # Process sidecar pool transfers (MAMBA/KDA) with L3→L2→L1 restore
                     _mamba_loads = []
                     for _xfer in _pt:
                         _xn = getattr(_xfer, 'name', None)
@@ -1426,7 +1615,19 @@ class C_HiRadixCacheHook(BaseHook):
                                 _n = len(_mhi) if hasattr(_mhi, '__len__') else 1
                                 _nid = _ni[0] if _ni else 0
                                 for _i in range(_n):
-                                    mh.load_to_device(f"mamba_{_nid}_{_i}")
+                                    _slot_idx = int(_mdi[_i]) if _mdi is not None and hasattr(_mdi, '__getitem__') else _i
+                                    _slot_hash = f"kda_{_nid}"
+                                    _l2_hit = mh.has(_slot_hash)
+                                    if _l2_hit:
+                                        mh.load_to_device(_slot_hash)
+                                    elif st is not None:
+                                        _m_hits = st.batch_exists_mamba([_slot_hash])
+                                        if any(_m_hits.values()):
+                                            _slot_bytes = getattr(mh, 'slot_bytes', 14653440)
+                                            _kda_l3_dur = _slot_bytes / _disk_read_bw
+                                            StateManager.inc_hicache_kda_l3_load_dur(_kda_l3_dur)
+                                            mh.backup_from_device(-1, _slot_hash, from_l3=True)
+                                            mh.load_to_device(_slot_hash)
                             except Exception as e:
                                 logger.debug(f"mamba load_to_device failed: {e}")
                     elif _pt:
@@ -1437,10 +1638,18 @@ class C_HiRadixCacheHook(BaseHook):
                             try:
                                 node = _tc.node_by_id(nid)
                                 if node is not None and hasattr(node, 'component_data'):
-                                    if _mamba_loads and _HA_CT.MAMBA in node.component_data:
-                                        _mdi = getattr(_mamba_loads[0], 'device_indices', None)
+                                    if _mamba_loads:
+                                        _mdi = None
+                                        for _ml in _mamba_loads:
+                                            _tmp = getattr(_ml, 'device_indices', None)
+                                            if _tmp is not None:
+                                                _mdi = _tmp
+                                                break
                                         if _mdi is not None:
-                                            node.component_data[_HA_CT.MAMBA].value = _mdi.clone() if hasattr(_mdi, 'clone') else _mdi
+                                            try:
+                                                node.component_data[_HA_CT.MAMBA].value = _mdi.clone() if hasattr(_mdi, 'clone') else _mdi
+                                            except (KeyError, IndexError, TypeError):
+                                                pass
                             except Exception as e:
                                 logger.debug(f"set mamba value failed node {nid}: {e}")
                     try:
@@ -1474,6 +1683,9 @@ class C_HiRadixCacheHook(BaseHook):
                 logger.debug("Applied mock start_writing/start_loading overrides")
 
             try:
+                _is_unified = getattr(server_args, 'enable_unified_memory', False)
+                if _is_unified:
+                    raise Exception("Skip original init_hicache in unified memory mode")
                 original_init_hicache(self, server_args, params)
             except Exception as e:
                 logger.warning(f"original init_hicache failed ({e}), using manual setup")
@@ -1489,33 +1701,45 @@ class C_HiRadixCacheHook(BaseHook):
                 _page_size = params.page_size
 
                 # Create mock host pools
+                # L2 size configurable for eviction testing (default: 330 Mamba slots, hicache_size GB KV)
+                _l2_mamba_size = int(os.environ.get("HISIM_L2_MAMBA_SIZE", "330"))
+                _l2_kv_size = float(os.environ.get("HISIM_L2_KV_SIZE_GB", str(server_args.hicache_size)))
                 _full_host = MockTokenToKVPoolHost(
                     _kvcache,
                     server_args.hicache_ratio,
-                    server_args.hicache_size,
+                    _l2_kv_size,
                     _page_size,
                     server_args.hicache_mem_layout,
                     pin_memory=False,
                     device="cpu",
                 )
                 _mamba_host = MockMambaStatePoolHost(
-                    size=330,  # MAMBA_POOL_SIZE * 2 (L2 = 2x L1)
-                    slot_bytes=15151104,  # MAMBA_SLOT_BYTES for K3
+                    size=_l2_mamba_size,
+                    slot_bytes=14653440,
                 )
+                logger.info(f"L2 pools: mamba_size={_l2_mamba_size} kv_size_gb={_l2_kv_size}")
 
                 # Create host_pool_group with PoolEntry objects
+                # K3 0-indexed layer mapping:
+                # Full Attention (KV): layers [3,7,11,15,19] → sub-pool indices [0,1,2,3,4]
+                # KDA (MAMBA): layers [0,1,2,4,5,6,8,9,10,12,13,14,16,17,18,20,21,22] → [0..17]
+                _k3_kv_map = {3: 0, 7: 1, 11: 2, 15: 3, 19: 4}
+                _k3_mamba_map = {
+                    0: 0, 1: 1, 2: 2, 4: 3, 5: 4, 6: 5, 8: 6, 9: 7, 10: 8,
+                    12: 9, 13: 10, 14: 11, 16: 12, 17: 13, 18: 14, 20: 15, 21: 16, 22: 17,
+                }
                 self.host_pool_group = HostPoolGroup(entries=[
                     PoolEntry(
                         name=PoolName.KV,
                         host_pool=_full_host,
                         device_pool=_kvcache,
-                        layer_mapper=lambda i: i if i < 5 else None,
+                        layer_mapper=lambda i, _m=_k3_kv_map: _m.get(i),
                     ),
                     PoolEntry(
                         name=PoolName.MAMBA,
                         host_pool=_mamba_host,
-                        device_pool=params.req_to_token_pool.mamba_pool,
-                        layer_mapper=lambda i: i - 5 if 5 <= i < 23 else None,
+                        device_pool=getattr(params.req_to_token_pool, 'mamba_pool', _kvcache),
+                        layer_mapper=lambda i, _m=_k3_mamba_map: _m.get(i),
                     ),
                 ])
 
@@ -1539,6 +1763,13 @@ class C_HiRadixCacheHook(BaseHook):
 
                 # Apply mock start_writing/start_loading overrides (defined above)
                 _apply_mock_start_overrides(self, _full_host, _mamba_host)
+
+                # Override backup/prefetch thread funcs on the controller instance
+                # to prevent real async threads from running (causes NPU crash).
+                # C_HiCacheController.hook overrides these on HiCacheController class,
+                # but HybridCacheController has its own methods that shadow them.
+                self.cache_controller.backup_thread_func = lambda *a, **kw: None
+                self.cache_controller.prefetch_thread_func = lambda *a, **kw: None
 
                 # Set host pool attributes on cache and components
                 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _CT
@@ -1593,7 +1824,7 @@ class C_HiRadixCacheHook(BaseHook):
                 if hasattr(self, 'mamba_pool_host') and self.mamba_pool_host is not None and not isinstance(self.mamba_pool_host, MockMambaStatePoolHost):
                     self.mamba_pool_host = MockMambaStatePoolHost(
                         size=330,
-                        slot_bytes=15151104,
+                        slot_bytes=14653440,  # K3 KDA slot bytes (TP=8)
                     )
                     if _CT.MAMBA in self.components:
                         self.components[_CT.MAMBA]._mamba_pool_host = self.mamba_pool_host
@@ -1606,6 +1837,24 @@ class C_HiRadixCacheHook(BaseHook):
                 f"write_through_threshold={getattr(self, 'write_through_threshold', 'N/A')}"
             )
 
+            # P0: Check tree_core hicache state and related params
+            _tc0 = getattr(self, 'tree_core', None)
+            if _tc0 is not None:
+                _hicache_en = getattr(_tc0, '_hicache_enabled', None)
+                if _hicache_en is None:
+                    _hicache_en = getattr(_tc0, 'enable_hicache', None)
+                if _hicache_en is None:
+                    _hicache_en = getattr(_tc0, 'hicache_enabled', None)
+                logger.info(
+                    f"P0 tree_core: hicache_enabled={_hicache_en}, "
+                    f"load_back_threshold={getattr(self, 'load_back_threshold', 'N/A')}, "
+                    f"write_through_threshold={getattr(self, 'write_through_threshold', 'N/A')}, "
+                    f"is_write_back={getattr(self, 'is_write_back', 'N/A')}, "
+                    f"enable_storage={getattr(self, 'enable_storage', 'N/A')}"
+                )
+            else:
+                logger.info("P0 tree_core is None!")
+
         def wrapped_count_ready_acks(self, ack_queue):
             try:
                 return len(ack_queue)
@@ -1615,6 +1864,29 @@ class C_HiRadixCacheHook(BaseHook):
         def wrapped_check_hicache_events(self, *args, **kwargs):
             _cn = getattr(self, '_hicache_cn', 0) + 1
             self._hicache_cn = _cn
+            # Proactive eviction: self IS the UnifiedRadixCache instance.
+            # Disabled when HISIM_DISABLE_PROACTIVE_EVICT is set (L1-only experiments
+            # where cache retention between Build/Reuse/Churn phases is required).
+            # Capacity-driven LRU eviction still works naturally when KV pool is full.
+            _disable_proactive_evict = os.environ.get("HISIM_DISABLE_PROACTIVE_EVICT", "")
+            if not _disable_proactive_evict:
+                try:
+                    _es = self.evictable_size() if hasattr(self, 'evictable_size') else 0
+                except Exception:
+                    _es = 0
+                if _es > 0:
+                    logger.info(f"check_hicache cn={_cn} es={_es}")
+                if _es > 0:
+                    try:
+                        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+                        self.evict(EvictParams(num_tokens=_es, mamba_num=_es))
+                        logger.info(
+                            f"Proactive evict (check_hicache): {_es} tokens+mamba demoted to L2, "
+                            f"L1_avail={self.token_to_kv_pool_allocator.available_size() if hasattr(self, 'token_to_kv_pool_allocator') else -1}, "
+                            f"cn={_cn}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Proactive evict failed: {e}")
             if _cn % 10 != 0:
                 return
             try:
@@ -1627,24 +1899,28 @@ class C_HiRadixCacheHook(BaseHook):
         target._count_ready_acks = wrapped_count_ready_acks
         target.reset = wrapped_reset
 
-        # Fix 0.5.18 host_hit_length: UnifiedTreeCore.match_prefix always sets
-        # host_hit_length=0. The correct value is full_kv_hit_length minus the
-        # number of device-resident matched tokens (len(device_indices)) — i.e.
-        # tokens that matched but are evicted to L2, needing load_back.
-        # Without this, req.host_hit_length stays 0 and HiSim cannot observe
-        # any L2 load_back (l2_hit_tokens==0).
+        # P2: Observe match_prefix result fields for L2 load-back diagnosis.
+        # Do NOT modify host_hit_length — just log for diagnosis.
         original_match_prefix = target.match_prefix
         def wrapped_match_prefix(self, params, orig=original_match_prefix):
             result = orig(self, params)
             try:
-                di = result.device_indices
-                dev_hit = len(di) if di is not None else 0
-                full_hit = result.full_kv_hit_length or 0
-                host_hit = max(0, full_hit - dev_hit)
-                if host_hit > 0:
-                    result = result._replace(host_hit_length=host_hit)
-            except Exception:
-                pass
+                _di = result.device_indices
+                _dev = len(_di) if _di is not None else 0
+                _full = result.full_kv_hit_length or 0
+                _host = getattr(result, 'host_hit_length', 0) or 0
+                _mhost = getattr(result, 'mamba_host_hit_length', None)
+                _ldn = getattr(result, 'last_device_node', None)
+                _lhn = getattr(result, 'last_host_node', None)
+                _bmn = getattr(result, 'best_match_node', None)
+                logger.info(
+                    f"P2 match_prefix: full={_full} dev={_dev} host={_host} "
+                    f"mamba_host={_mhost} last_dev={_ldn} last_host={_lhn} "
+                    f"best_match={_bmn}({type(_bmn).__name__})"
+                )
+
+            except Exception as e:
+                logger.warning(f"P2 match_prefix error: {e}")
             return result
         target.match_prefix = wrapped_match_prefix
         logger.debug("Wrapped match_prefix to compute host_hit_length")
@@ -1950,11 +2226,8 @@ class C_SchedulerHook(BaseHook):
                     req_stats.rid = req.rid
                     req_stats.input_length = len(req.input_ids)
                     req_stats.output_length = req.sampling_params.max_new_tokens
-                    # Health-check/warm-up requests carry no simulation params.
-                    custom_params = req.sampling_params.custom_params
-                    simulation_args = (
-                        custom_params.get("simulation", {}) if custom_params else {}
-                    )
+                    _cp = getattr(req.sampling_params, 'custom_params', None) or {}
+                    simulation_args = _cp.get("simulation", {}) if isinstance(_cp, dict) else {}
                     if C_SchedulerHook.SIM_MODE == MockSimulationMode.BLOCKING:
                         req_stats.created_time = simulation_args.get("server_created_time", now)
                         req_stats.last_event_time = req_stats.created_time
@@ -1983,17 +2256,70 @@ class C_SchedulerHook(BaseHook):
             return recv_reqs
 
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
-            # sglang 0.5.18 K3 compat: initialize Mamba/KDA track attributes
-            # on Req objects in waiting_queue before prepare_for_extend.
-            # sglang >= 0.5.18 moved these fields into the Req.kv state object.
-            for req in getattr(self, "waiting_queue", []):
-                _kv = getattr(req, "kv", req)
-                if getattr(_kv, "mamba_ping_pong_track_buffer", None) is None:
-                    _kv.mamba_ping_pong_track_buffer = torch.tensor(
-                        [-1, -1], dtype=torch.int32
+            # Do NOT initialize mamba_ping_pong_track_buffer here.
+            # sglang's alloc() checks `if req.mamba_ping_pong_track_buffer is None:`
+            # to trigger _alloc_ping_pong_buffer, which allocates real Mamba
+            # slot IDs from mamba_allocator. Setting [-1,-1] prevents that.
+
+            # Proactive eviction now runs in wrapped_check_hicache_events
+            # (after process_batch_result unlocks nodes, before next match_prefix).
+            _tc = getattr(self, 'tree_cache', None)
+            _hicache_cn = getattr(_tc, '_hicache_cn', 0) if _tc is not None else 0
+
+            # Set cache reference on MockReqToTokenPool so _alloc_v2 can
+            # trigger mamba eviction when pp_buf alloc(2) fails.
+            _rtp = getattr(self, 'req_to_token_pool', None)
+            if _rtp is not None and getattr(_rtp, '_cache', None) is None:
+                _rtp._cache = _tc
+                logger.info("[HISIM] Set _cache reference on %s for pp_buf eviction",
+                            type(_rtp).__name__)
+
+            # OFFLINE mode: release requests from FUTURE_QUEUE based on
+            # virtual clock timestamp. Requests are released when their
+            # arrival_time <= current virtual clock, regardless of whether
+            # a batch is running. The scheduler decides batching policy.
+            if (C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE
+                and C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST
+                and len(C_SchedulerHook.FUTURE_QUEUE) > 0):
+                import heapq
+                _now = StateManager.get_global_clock()
+                # If scheduler is idle (no running, no waiting) and next
+                # request hasn't arrived yet, advance clock to next request
+                if (len(self.running_batch.reqs) == 0
+                    and len(self.waiting_queue) == 0):
+                    _next_time = C_SchedulerHook.FUTURE_QUEUE[0][0]
+                    if _next_time > _now:
+                        StateManager.set_global_clock(_next_time + 1e-6)
+                        _now = StateManager.get_global_clock()
+                # Release all requests whose arrival_time <= clock
+                _released = 0
+                _to_process = []
+                while len(C_SchedulerHook.FUTURE_QUEUE) > 0:
+                    _et, _, _req = C_SchedulerHook.FUTURE_QUEUE[0]
+                    if _et > _now:
+                        break
+                    heapq.heappop(C_SchedulerHook.FUTURE_QUEUE)
+                    _to_process.append(_req)
+                    _released += 1
+                if _to_process:
+                    # Process through the normal scheduler path to convert
+                    # TokenizedGenerateReqInput → Req (handle_generate_request)
+                    # before adding to waiting_queue. Direct append bypasses
+                    # the conversion and causes AttributeError when MLA backend
+                    # calls req.init_next_round_input().
+                    try:
+                        self.process_input_requests(_to_process)
+                    except Exception as e:
+                        logger.error(f"OFFLINE release process_input_requests error: {e}", exc_info=True)
+                    logger.info(
+                        f"OFFLINE release: {_released} reqs at clock={_now:.4f}, "
+                        f"waiting={len(self.waiting_queue)}, "
+                        f"future={len(C_SchedulerHook.FUTURE_QUEUE)}"
                     )
-                if getattr(_kv, "mamba_next_track_idx", None) is None:
-                    _kv.mamba_next_track_idx = 0
+
+            # OFFLINE release done above — let scheduler decide batching.
+            # No prefill preemption guard: the scheduler's native batching
+            # policy (enable_mixed_chunk, etc.) determines concurrency.
 
             new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
             now = time.time()
@@ -2038,6 +2364,68 @@ class C_SchedulerHook(BaseHook):
                                 )
                             except Exception:
                                 pass
+                        # KDA/Mamba L2→L1 load_back: estimate slot count from
+                        # host_hit and track_interval, then load from L2 or L3
+                        _mh = getattr(tc, 'mamba_pool_host', None) if tc is not None else None
+                        if _mh is not None:
+                            _ti = getattr(C_HiCacheController, 'MAMBA_TRACK_INTERVAL', 256) or 256
+                            _mload = max(1, host_hit // _ti) if _ti > 0 else 1
+                            _l2_keys = list(_mh._lru.keys())
+                            _st = None
+                            _dr_bw = 14.6e9
+                            try:
+                                _cc = getattr(tc, 'cache_controller', None)
+                                if _cc is not None:
+                                    _st = getattr(_cc, 'storage_backend', None)
+                                from hisim.simulation.manager import ConfigManager as _CM
+                                _pcfg = _CM.get_platform_config()
+                                _dr_bw = getattr(_pcfg, 'disk_read_bandwidth', 14.6e9) or 14.6e9
+                            except Exception:
+                                pass
+                            for _i in range(min(_mload, len(_l2_keys))):
+                                _sh = _l2_keys[_i]
+                                if _mh.has(_sh):
+                                    _mh.load_to_device(_sh)
+                                elif _st is not None:
+                                    try:
+                                        _mhits = _st.batch_exists_mamba([_sh])
+                                        if any(_mhits.values()):
+                                            _sb = getattr(_mh, 'slot_bytes', 15151104)
+                                            StateManager.inc_hicache_kda_l3_load_dur(_sb / _dr_bw)
+                                            _mh.backup_from_device(-1, _sh, from_l3=True)
+                                            _mh.load_to_device(_sh)
+                                    except Exception:
+                                        pass
+                    # KDA COW/Replay diagnostics: check mamba_cow_src_index and
+                    # mamba_branching_seqlen set during init_next_round_input→match_prefix
+                    for req in actual_batch.reqs:
+                        _cow_src = getattr(req, 'mamba_cow_src_index', None)
+                        _branching = getattr(req, 'mamba_branching_seqlen', None)
+                        _prefix_len = len(getattr(req, 'prefix_indices', []))
+                        _mpi = getattr(req, 'mamba_pool_idx', None)
+                        if _prefix_len > 0 and _mpi is not None:
+                            _kda_diag = getattr(C_SchedulerHook, '_kda_checkpoint_diag', None)
+                            if _kda_diag is None:
+                                _kda_diag = {'donate_count':0,'commit_count':0,'hit_count':0,'cow_exec_count':0,'checkpoint_position':0,'prefix_length':0,'historical_replay_tokens':0,'new_tokens':0,'no_cow_count':0,'replay_fallback_count':0}
+                                C_SchedulerHook._kda_checkpoint_diag = _kda_diag
+                            if _cow_src is not None:
+                                _kda_diag['hit_count'] += 1
+                                _kda_diag['cow_exec_count'] += 1
+                                _kda_diag['checkpoint_position'] = _prefix_len
+                                _kda_diag['prefix_length'] = _prefix_len
+                                _rt = max(0, _prefix_len - _prefix_len)  # COW covers full prefix
+                                _kda_diag['historical_replay_tokens'] += _rt
+                                logger.info(f"[KDA-COW-HIT] rid={req.rid} prefix_len={_prefix_len} cow_src={_cow_src} replay_tokens=0")
+                            else:
+                                # No COW → replay needed
+                                if _branching is not None:
+                                    _replay = max(0, _prefix_len - _branching)
+                                else:
+                                    _replay = _prefix_len
+                                _kda_diag['replay_fallback_count'] = (_kda_diag.get('replay_fallback_count', 0)) + 1
+                                _kda_diag['historical_replay_tokens'] += _replay
+                                _kda_diag['no_cow_count'] = (_kda_diag.get('no_cow_count', 0)) + 1
+                                logger.info(f"[KDA-REPLAY] rid={req.rid} prefix_len={_prefix_len} branching={_branching} replay_tokens={_replay} cow_src=None")
                     # Log cache state per prefill batch (L1/L2 pool sizes)
                     tc = getattr(self, 'tree_cache', None)
                     l1_evict = l1_total = l2_avail = 0
@@ -2061,37 +2449,10 @@ class C_SchedulerHook(BaseHook):
                 StateManager.step_global_clock(0.005)
                 StateManager.set_current_inference_dur(0.005)
             else:
-                if C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE and (
-                    len(C_SchedulerHook.FUTURE_QUEUE) != 0
-                    and len(self.running_batch.reqs) == 0
-                ):
-                    next_created_time, _, req = C_SchedulerHook.FUTURE_QUEUE[0]
-                    StateManager.set_global_clock(next_created_time + 1e-6)
-
-            # Proactive eviction: simulate real-world memory pressure.
-            # In real hardware, L1 fills up because requests run for seconds.
-            # In HiSim's virtual clock, requests finish instantly so L1 never
-            # fills. We proactively evict idle (lock_ref==0) nodes to trigger
-            # the L1→L2 demote chain. This is only effective for nodes already
-            # backuped (write_through on insert sets backuped=True). Evicting a
-            # backuped node sets evicted=True, which makes future match_prefix
-            # calls see host_hit_length > 0 → triggers L2 load_back (H2D).
-            _tc = getattr(self, 'tree_cache', None)
-            if _tc is not None and (getattr(_tc, '_hicache_cn', 0) % 10 == 0):
-                try:
-                    _es = _tc.evictable_size() if hasattr(_tc, 'evictable_size') else 0
-                except Exception:
-                    _es = 0
-                if _es > 0:
-                    try:
-                        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-                        _tc.evict(EvictParams(num_tokens=_es))
-                        logger.info(
-                            f"Proactive evict: {_es} tokens demoted to L2, "
-                            f"L1_avail={_tc.token_to_kv_pool_allocator.available_size() if hasattr(_tc, 'token_to_kv_pool_allocator') else -1}"
-                        )
-                    except Exception as e:
-                        logger.warning(f"Proactive evict failed: {e}")
+                # OFFLINE mode virtual clock advancement now handled above
+                # (before original_get_new_batch_prefill) to ensure requests
+                # are released in timestamp order before match_prefix.
+                pass
 
             logger.debug(
                 f"Get new batch prefill: global iteration={StateManager.get_iteration()}, "
@@ -2120,14 +2481,23 @@ class C_SchedulerHook(BaseHook):
                 and getattr(self, "chunked_req", None) is None
                 and actual_batch is None
                 and len(C_SchedulerHook.REQUEST_STATS) > 0
-                and not getattr(C_SchedulerHook, "_metrics_written", False)
             ):
-                C_SchedulerHook._metrics_written = True
+                _rb = getattr(self, "running_batch", None)
+                _rb_count = len(_rb.reqs) if _rb else 0
+                _wq = len(getattr(self, "waiting_queue", []))
+                _fq = len(C_SchedulerHook.FUTURE_QUEUE)
                 logger.info(
-                    "[HiSim] OFFLINE simulation complete: dumping metrics "
+                    f"[AUTO-TRIGGER] running={_rb_count} waiting={_wq} future={_fq} "
+                    f"actual_batch={'None' if actual_batch is None else 'set'} "
+                    f"req_stats={len(C_SchedulerHook.REQUEST_STATS)}"
+                )
+                _phase = getattr(C_SchedulerHook, "_offline_phase", 0) + 1
+                C_SchedulerHook._offline_phase = _phase
+                logger.info(
+                    f"[HiSim] OFFLINE phase {_phase} complete: dumping metrics "
                     f"(completed={len(C_SchedulerHook.REQUEST_STATS)})"
                 )
-                wrapped_profile(self, None)
+                wrapped_profile(self, None, _phase=_phase)
 
             return new_batch
 
@@ -2135,6 +2505,81 @@ class C_SchedulerHook(BaseHook):
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            # KDA Checkpoint tracking: log mamba state for each request
+            # Also ensure _kda_checkpoint_diag exists from initialization
+            if not hasattr(C_SchedulerHook, '_kda_checkpoint_diag') or C_SchedulerHook._kda_checkpoint_diag is None:
+                C_SchedulerHook._kda_checkpoint_diag = {
+                    'donate_count':0,'commit_count':0,
+                    'hit_count':0,'cow_exec_count':0,
+                    'checkpoint_position':0,'prefix_length':0,
+                    'historical_replay_tokens':0,
+                    'new_tokens':0,
+                }
+            if batch is not None and hasattr(batch, 'reqs') and batch.reqs:
+                for _req in batch.reqs:
+                    _mpi = getattr(_req, 'mamba_pool_idx', None)
+                    _ppb = getattr(_req, 'mamba_ping_pong_track_buffer', None)
+                    _cow = getattr(_req, 'mamba_cow_src_index', None)
+                    _ppb_str = _ppb.tolist() if _ppb is not None else 'None'
+                    _mpi_str = _mpi.item() if _mpi is not None and hasattr(_mpi, 'item') else str(_mpi)
+                    _cow_str = _cow.item() if _cow is not None and hasattr(_cow, 'item') else str(_cow)
+                    logger.info(
+                        f"[KDA-TRACK] rid={_req.rid} pool_idx={_mpi_str} "
+                        f"pp_buf={_ppb_str} cow_src={_cow_str} "
+                        f"prefix_len={len(getattr(_req,'prefix_indices',[]))}"
+                    )
+            # In mock mode, the Mamba model never runs, so
+            # batch_result_processor never sets mamba_last_track_seqlen.
+            # Without it, prepare_for_caching_req returns early (cache_len
+            # is None) and the donation/eviction path is never exercised.
+            # Set mamba_last_track_seqlen to the correct track boundary.
+            # In real sglang, the Mamba model tracks at every C tokens during forward.
+            # The scheduler may set mamba_last_track_seqlen to mamba_branching_seqlen
+            # (from prefix match) or kv_committed_len, but neither is the actual
+            # track boundary. We must compute it as (seq_len // C) * C.
+            if batch is not None and hasattr(batch, 'reqs') and batch.reqs:
+                _track_interval = int(os.environ.get("SGLANG_MAMBA_TRACK_INTERVAL", "256"))
+                for _req in batch.reqs:
+                    _lts_before = getattr(_req, 'mamba_last_track_seqlen', None)
+                    _kcl = getattr(_req, 'kv_committed_len', None)
+                    _iil = len(getattr(_req, 'input_ids', []))
+                    _oir = len(getattr(_req, 'origin_input_ids', []))
+                    _prefix = len(getattr(_req, 'prefix_indices', []))
+                    logger.info(
+                        f"[LTS-BEFORE] rid={_req.rid} mamba_last_track_seqlen={_lts_before} "
+                        f"kv_committed_len={_kcl} input_ids_len={_iil} "
+                        f"origin_input_ids_len={_oir} prefix_indices_len={_prefix} "
+                        f"track_interval={_track_interval}"
+                    )
+                    # Compute the actual seq_len: kv_committed_len if available,
+                    # else origin_input_ids length. This represents how far the
+                    # Mamba recurrent state has been computed.
+                    _seq_len = _kcl
+                    if _seq_len is None or _seq_len == 0:
+                        _seq_len = _oir
+                    if _seq_len and _seq_len > 0:
+                        _track_boundary = (_seq_len // _track_interval) * _track_interval
+                        if _track_boundary > 0:
+                            _req.mamba_last_track_seqlen = _track_boundary
+                            logger.info(
+                                f"[LTS-SET] rid={_req.rid} seq_len={_seq_len} "
+                                f"track_interval={_track_interval} "
+                                f"track_boundary={_track_boundary} "
+                                f"(was {_lts_before})"
+                            )
+                # --- Logging point 2: Prefill complete (mamba_last_track_seqlen set) ---
+                for _req in batch.reqs:
+                    _lts = getattr(_req, 'mamba_last_track_seqlen', None)
+                    _mpi = getattr(_req, 'mamba_pool_idx', None)
+                    _ppb = getattr(_req, 'mamba_ping_pong_track_buffer', None)
+                    _keep = getattr(_req, 'mamba_last_track_idx', None)
+                    _mpi_v = int(_mpi.item()) if _mpi is not None and hasattr(_mpi, 'item') else (_mpi if _mpi is not None else '?')
+                    _ppb_v = _ppb.tolist() if _ppb is not None else 'None'
+                    logger.info(
+                        f"[PREFILL] rid={_req.rid} mamba_pool_idx={_mpi_v} "
+                        f"pp_buf={_ppb_v} keep_idx={_keep} "
+                        f"mamba_last_track_seqlen={_lts}"
+                    )
             # Defensive fallback: ensure model_runner.ngram_embedding_manager is a
             # disabled mock. ForwardBatch.init_new reads
             # model_runner.ngram_embedding_manager.enabled; in the forked
@@ -2149,6 +2594,117 @@ class C_SchedulerHook(BaseHook):
                     _mr.ngram_embedding_manager = _NoopNgram()
                 except Exception:
                     object.__setattr__(_mr, "ngram_embedding_manager", _NoopNgram())
+            # Log COW scheduled state and simulate COW execution
+            if batch is not None and hasattr(batch, 'reqs') and batch.reqs:
+                _batch_cow_src = getattr(batch, 'mamba_cow_src_indices', None)
+                _batch_cow_dst = getattr(batch, 'mamba_cow_dst_indices', None)
+                # Defensive check: reject invalid COW src (-1 or out of range)
+                if _batch_cow_src is not None and len(_batch_cow_src) > 0:
+                    for _ci in range(len(_batch_cow_src)):
+                        _csv = int(_batch_cow_src[_ci].item()) if hasattr(_batch_cow_src[_ci],'item') else int(_batch_cow_src[_ci])
+                        if _csv == -1:
+                            logger.warning("[COW-INVALID] batch_idx=%d src_slot=-1 — clearing COW, falling back to full replay", _ci)
+                            batch.mamba_cow_src_indices = None
+                            batch.mamba_cow_dst_indices = None
+                            for _req in batch.reqs:
+                                _req.mamba_cow_src_index = None
+                                _req.mamba_needs_clear = False
+                            _batch_cow_src = None
+                            _batch_cow_dst = None
+                            break
+                _src_str = _batch_cow_src.tolist() if _batch_cow_src is not None else 'None'
+                _dst_str = _batch_cow_dst.tolist() if _batch_cow_dst is not None else 'None'
+                if _batch_cow_src is not None and len(_batch_cow_src) > 0:
+                    logger.info(f"[COW-COLLECTED] src={_src_str} dst={_dst_str}")
+                    # Lightweight State Copy simulation (no NPU kernel)
+                    _kda_diag = getattr(C_SchedulerHook, '_kda_checkpoint_diag', None)
+                    if _kda_diag is None:
+                        _kda_diag = {
+                            'donate_count':0,'commit_count':0,
+                            'hit_count':0,'cow_exec_count':0,
+                            'checkpoint_position':0,'prefix_length':0,
+                            'historical_replay_tokens':0,
+                            'new_tokens':0,
+                        }
+                        C_SchedulerHook._kda_checkpoint_diag = _kda_diag
+                    for _i in range(len(_batch_cow_src)):
+                        _ss = int(_batch_cow_src[_i].item()) if hasattr(_batch_cow_src[_i],'item') else int(_batch_cow_src[_i])
+                        _ds = int(_batch_cow_dst[_i].item()) if hasattr(_batch_cow_dst[_i],'item') else int(_batch_cow_dst[_i])
+                        # Find req by pool_idx to get prefix_len and extend_len
+                        _pl = 0
+                        _nl = 0
+                        for _req in batch.reqs:
+                            _mpi = getattr(_req,'mamba_pool_idx',None)
+                            if _mpi is not None:
+                                _mvi = _mpi.item() if hasattr(_mpi,'item') else int(_mpi)
+                                if _mvi == _ds:
+                                    _pl = len(getattr(_req,'prefix_indices',[]))
+                                    _er = getattr(_req,'extend_range',None)
+                                    _nl = getattr(_er,'length',0) if _er else 0
+                                    break
+                        # checkpoint_position = prefix_length (COW source is
+                        # best_match_node which covers the full matched prefix)
+                        _cp = _pl
+                        # historical_replay = prefix_len - checkpoint_position
+                        # (0 when checkpoint covers the full prefix)
+                        _rt = max(0, _pl - _cp)
+                        _kda_diag['hit_count'] += 1
+                        _kda_diag['cow_exec_count'] += 1
+                        _kda_diag['checkpoint_position'] = _cp
+                        _kda_diag['prefix_length'] = _pl
+                        _kda_diag['historical_replay_tokens'] += _rt
+                        _kda_diag['new_tokens'] += _nl
+                        logger.info(
+                            f"[COW-EXEC-SIM] src_slot={_ss} dst_slot={_ds} "
+                            f"checkpoint_pos={_cp} prefix_len={_pl} "
+                            f"replay_tokens={_rt} new_tokens={_nl}"
+                        )
+                    # Clear deferred COW
+                    batch.mamba_cow_src_indices = None
+                    batch.mamba_cow_dst_indices = None
+                    for _req in batch.reqs:
+                        _req.mamba_cow_src_index = None
+                        _req.mamba_needs_clear = False
+                else:
+                    # No COW — either no prefix match or checkpoint unavailable.
+                    # Track replay tokens ONLY for prefill/extend batches where
+                    # replay is actually needed. Decode batches already have
+                    # active Mamba state and should NOT be counted.
+                    _fm = getattr(batch, 'forward_mode', None)
+                    _is_extend = False
+                    if _fm is not None:
+                        _is_extend = hasattr(_fm, 'is_extend') and _fm.is_extend()
+                    if not _is_extend:
+                        # Decode batch — skip REPLAY-FALLBACK
+                        pass
+                    else:
+                        _kda_diag = getattr(C_SchedulerHook, '_kda_checkpoint_diag', None)
+                        if _kda_diag is None:
+                            _kda_diag = {'donate_count':0,'commit_count':0,
+                                         'hit_count':0,'cow_exec_count':0,
+                                         'checkpoint_position':0,'prefix_length':0,
+                                         'historical_replay_tokens':0,'new_tokens':0,
+                                         'no_cow_count':0,'replay_fallback_count':0}
+                            C_SchedulerHook._kda_checkpoint_diag = _kda_diag
+                        _kda_diag['no_cow_count'] = (_kda_diag.get('no_cow_count', 0)) + 1
+                        for _req in batch.reqs:
+                            _branching = getattr(_req, 'mamba_branching_seqlen', None)
+                            _prefix_len = len(getattr(_req, 'prefix_indices', []))
+                            _mpi = getattr(_req, 'mamba_pool_idx', None)
+                            if _prefix_len > 0 and _mpi is not None:
+                                # Prefill with prefix match but no COW → replay needed
+                                if _branching is not None:
+                                    _replay = max(0, _prefix_len - _branching)
+                                else:
+                                    _replay = _prefix_len
+                                _kda_diag['historical_replay_tokens'] += _replay
+                                _kda_diag['replay_fallback_count'] = (_kda_diag.get('replay_fallback_count', 0)) + 1
+                                logger.info(
+                                    f"[REPLAY-FALLBACK] rid={_req.rid} prefix_len={_prefix_len} "
+                                    f"branching={_branching} replay_tokens={_replay} "
+                                    f"cow_src={getattr(_req, 'mamba_cow_src_index', None)}"
+                                )
+
             ret = original_run_batch(self, *args, **kwargs)
 
             if ret.__class__.__name__ == "GenerationBatchResult":
@@ -2205,18 +2761,83 @@ class C_SchedulerHook(BaseHook):
         def wrapped_process_batch_result(self, *args, **kwargs):
             # CPU simulation: original_process_batch_result may fail because
             # the detokenizer subprocess is not running (ZMQ send fails).
-            # We don't need detokenizer output in simulation — catch and continue.
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            # Capture mamba_pool_idx BEFORE original_process_batch_result,
+            # because cleanup_after_caching_req (called inside) frees it.
+            _pre_donations = {}
+            if batch is not None and hasattr(batch, 'reqs'):
+                for _r in batch.reqs:
+                    _mpi = getattr(_r, "mamba_pool_idx", None)
+                    _lts = getattr(_r, "mamba_last_track_seqlen", None)
+                    _olen = len(getattr(_r, "output_ids", []))
+                    if _mpi is not None and _olen >= 0:
+                        _pre_donations[_r.rid] = (_mpi, _lts, _olen)
             try:
                 ret = original_process_batch_result(self, *args, **kwargs)
-            except Exception:
-                logger.warning(
-                    "original process_batch_result failed (output may be dropped)",
-                    exc_info=True,
-                )
+            except Exception as e:
+                logger.warning(f"process_batch_result exception: {e}")
                 ret = None
+            # Log running_batch state after process_batch_result
+            _rb = getattr(self, "running_batch", None)
+            _rb_count = len(_rb.reqs) if _rb else 0
+            _mode = getattr(getattr(batch, "forward_mode", None), "value", "?") if batch else "?"
+            if batch is not None and hasattr(batch, "reqs"):
+                for _r in batch.reqs:
+                    _fin = getattr(_r, "finished", None)
+                    _olen = len(getattr(_r, "output_ids", []))
+                    _rid = _r.rid
+                    logger.info(f"[PBR] rid={_rid} mode={_mode} output_len={_olen} finished={_fin} running={_rb_count}")
+
+            # KDA Donation detection: use pre-captured mamba_pool_idx
+            # (before cleanup_after_caching_req freed it).
+            _kda_diag = getattr(C_SchedulerHook, '_kda_checkpoint_diag', None)
+            if _kda_diag is not None and batch is not None and hasattr(batch, 'reqs'):
+                for _r in batch.reqs:
+                    _rid = _r.rid
+                    _olen = len(getattr(_r, "output_ids", []))
+                    if _rid in _pre_donations:
+                        _mpi, _lts, _pre_olen = _pre_donations[_rid]
+                        _mpi_val = _mpi.item() if hasattr(_mpi, 'item') else int(_mpi)
+                        _lts_val = _lts if _lts is not None else 0
+                        logger.info(f"[KDA-DONATE-CHECK] rid={_rid} olen={_olen} mpi={_mpi_val} lts={_lts_val}")
+                        if _lts_val > 0:
+                            _kda_diag['donate_count'] += 1
+                            _kda_diag['commit_count'] += 1
+                            logger.info(f"[KDA-DONATE] rid={_rid} slot={_mpi_val} track_seqlen={_lts_val}")
+            # --- Logging point 3: Cache Commit — verify Radix Tree has MAMBA value ---
+            _tc = getattr(self, 'tree_cache', None)
+            if _tc is not None and batch is not None and hasattr(batch, 'reqs'):
+                _tree_core = getattr(_tc, 'tree_core', None)
+                if _tree_core is not None:
+                    for _r in batch.reqs:
+                        _prefix_indices = getattr(_r, 'prefix_indices', None)
+                        _token_ids = getattr(_r, 'input_ids', None) or getattr(_r, 'all_token_ids', None)
+                        if _token_ids is None:
+                            continue
+                        _token_len = len(_token_ids)
+                        if _token_len == 0:
+                            continue
+                        try:
+                            # match_prefix to find the node that should hold this req's checkpoint
+                            _match = _tc.match_prefix(_token_ids[:1].tolist() if hasattr(_token_ids, 'tolist') else [_token_ids[0]])
+                            _best = getattr(_match, 'best_match_node', None) if _match else None
+                            if _best is not None:
+                                _node = _tree_core._node_arena.get(_best)
+                                if _node is not None:
+                                    _cd_mamba = _node.component_data[2] if len(_node.component_data) > 2 else None
+                                    _mamba_val = getattr(_cd_mamba, 'value', None) if _cd_mamba else None
+                                    _mamba_exist = _mamba_val is not None and (
+                                        int(_mamba_val.item()) if hasattr(_mamba_val, 'item') else int(_mamba_val)
+                                    ) != -1 if _mamba_val is not None else False
+                                    logger.info(
+                                        f"[CACHE-COMMIT] rid={_r.rid} node={_best} "
+                                        f"mamba_value={_mamba_val} mamba_exist={_mamba_exist} "
+                                        f"token_len={_token_len}"
+                                    )
+                        except Exception as _e:
+                            logger.debug(f"[CACHE-COMMIT] rid={getattr(_r,'rid','?')} match failed: {_e}")
             if batch is not None:
                 if len(batch.reqs) == 0:
                     return ret
@@ -2224,13 +2845,17 @@ class C_SchedulerHook(BaseHook):
                 hicache_l2_load_dur = StateManager.pop_hicache_l2_load_dur()
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
                 hicache_l3_backup_dur = StateManager.pop_hicache_l3_backup_dur()
-                # KDA state durations (parallel to MLA, take max)
+                # KDA state durations
                 kda_l2_load_dur = StateManager.pop_hicache_kda_l2_load_dur()
                 kda_l2_backup_dur = StateManager.pop_hicache_kda_l2_backup_dur()
                 kda_l3_backup_dur = StateManager.pop_hicache_kda_l3_backup_dur()
                 kda_l3_load_dur = StateManager.pop_hicache_kda_l3_load_dur()
-                # MLA and KDA D2H/H2D run in parallel — take max
-                l2_load_dur = max(hicache_l2_load_dur, kda_l2_load_dur, kda_l3_load_dur)
+                # MLA and KDA have independent data paths (different memory regions),
+                # so their H2D/D2H can overlap — take max.
+                # But KDA L3 read (SSD→DRAM) must finish BEFORE KDA H2D (DRAM→HBM):
+                # these are serial, so sum them first, then take max with MLA.
+                kda_load_total = kda_l3_load_dur + kda_l2_load_dur  # Serial: SSD read + H2D
+                l2_load_dur = max(hicache_l2_load_dur, kda_load_total)
                 l2_backup_dur = max(hicache_l2_backup_dur, kda_l2_backup_dur)
                 l3_backup_dur = max(hicache_l3_backup_dur, kda_l3_backup_dur)
                 current_inference_dur = StateManager.get_current_inference_dur()
@@ -2312,11 +2937,12 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_profile(self, req, *args, **kwargs):
+            _phase = kwargs.pop("_phase", None)
             C_SchedulerHook._profile_call_count = getattr(C_SchedulerHook, "_profile_call_count", 0) + 1
             stats: list[RequestStats] = []
             _rs_total = len(C_SchedulerHook.REQUEST_STATS)
             for item in C_SchedulerHook.REQUEST_STATS.values():
-                if item.rid is not None and item.input_length > 0 and len(item.gen_token_latencies) > 0:
+                if item.rid is not None and item.input_length > 0 and (len(item.gen_token_latencies) > 0 or item.queue_end != -1):
                     stats.append(item)
             if _rs_total > 0 and len(stats) == 0:
                 pass
@@ -2333,6 +2959,13 @@ class C_SchedulerHook(BaseHook):
                 else:
                     metrics_stats = stats
 
+                # Ensure gen_token_latencies has at least one entry (TTFT).
+                # Requests that finish after extend without decode batches
+                # (mock forward produces stop tokens) have empty latencies.
+                for item in metrics_stats:
+                    if len(item.gen_token_latencies) == 0:
+                        item.gen_token_latencies.append(0.0)
+
                 min_created_time = metrics_stats[0].created_time
                 # Align timestamps
                 for item in stats:
@@ -2344,15 +2977,124 @@ class C_SchedulerHook(BaseHook):
                 metrics = calc_metrics(metrics_stats)
                 metrics["time_cost"] = time.time() - C_SchedulerHook.LAST_FLUSH_TS
 
+                # --- Add KDA/Unified diagnostics to metrics.json ---
+                # Cumulative counters (reset after each OFFLINE dump)
+                _ud = getattr(C_SchedulerHook, '_unified_diag', None)
+                if _ud is not None:
+                    metrics["unified_alloc"] = _ud.get('alloc', 0)
+                    metrics["unified_free"] = _ud.get('free', 0)
+                    metrics["unified_compact"] = _ud.get('compact', 0)
+                    metrics["unified_compact_pages"] = _ud.get('compact_pages_moved', 0)
+                    metrics["unified_flush_peer"] = _ud.get('flush_peer', 0)
+                    metrics["unified_flush"] = _ud.get('flush', 0)
+                    metrics["unified_flush_pages"] = _ud.get('flush_pages_moved', 0)
+                    metrics["unified_alloc_fail"] = _ud.get('alloc_fail', 0)
+                    metrics["unified_gap_bytes"] = _ud.get('gap_bytes', 0)
+                    metrics["unified_kv_watermark"] = _ud.get('kv_watermark', 0)
+                    metrics["unified_mamba_watermark"] = _ud.get('mamba_watermark', 0)
+                    metrics["unified_mla_live_pages"] = _ud.get('mla_live_pages', 0)
+                    metrics["unified_mamba_live_pages"] = _ud.get('mamba_live_pages', 0)
+                    metrics["peak_mla_live_pages"] = _ud.get('peak_mla_live_pages', 0)
+                    metrics["peak_mamba_live_pages"] = _ud.get('peak_mamba_live_pages', 0)
+                    metrics["peak_mla_watermark"] = _ud.get('peak_mla_watermark', 0)
+                    metrics["peak_mamba_watermark"] = _ud.get('peak_mamba_watermark', 0)
+                # else: Two Pools mode — unified diag not applicable, fields omitted (not zeroed)
+
+                # KDA radix cache interaction (L1 checkpoint donation/hit)
+                _tc = getattr(self, 'tree_cache', None)
+                if _tc is not None:
+                    _dw = getattr(_tc, '_hismim_diag_w', {})
+                    _dl = getattr(_tc, '_hismim_diag_l', {})
+                    metrics["kda_write_calls"] = _dw.get('calls', 0)        # radix tree insert calls
+                    metrics["kda_write_mamba_xfers"] = _dw.get('mamba_pt', 0)  # L1 checkpoint donations (state donated to radix tree)
+                    metrics["kda_load_calls"] = _dl.get('calls', 0)        # radix tree match_prefix calls
+                    metrics["kda_load_mamba_xfers"] = _dl.get('mamba_pt', 0)  # L1 checkpoint hits (state loaded back from radix tree)
+                    # HiCache-specific (L2/L3 backup). When HiCache disabled, these remain 0
+                    # because no backup/load_back occurs. This is genuinely 0, not "missing".
+                    metrics["kda_l3_writes"] = _dw.get('l3_writes', 0)
+                    metrics["kda_l3_hits"] = _dl.get('l3_hits', 0)
+
+                # KDA Checkpoint native diagnostics (from COW simulation)
+                _kda_diag = getattr(C_SchedulerHook, '_kda_checkpoint_diag', None)
+                if _kda_diag is not None:
+                    metrics["kda_checkpoint_donate_count"] = _kda_diag.get('donate_count', 0)
+                    metrics["kda_checkpoint_commit_count"] = _kda_diag.get('commit_count', 0)
+                    metrics["kda_cached_checkpoint_slots"] = _kda_diag.get('cached_checkpoint_slots', 0)
+                    metrics["kda_checkpoint_hit_count"] = _kda_diag.get('hit_count', 0)
+                    metrics["kda_cow_exec_count"] = _kda_diag.get('cow_exec_count', 0)
+                    metrics["kda_checkpoint_position"] = _kda_diag.get('checkpoint_position', 0)
+                    metrics["kda_prefix_length"] = _kda_diag.get('prefix_length', 0)
+                    metrics["kda_historical_replay_tokens"] = _kda_diag.get('historical_replay_tokens', 0)
+                    metrics["kda_new_tokens"] = _kda_diag.get('new_tokens', 0)
+
+                # KDA pool instantaneous stats (snapshot at dump time)
+                _kda_pool = getattr(C_SchedulerHook, '_kda_pool', None)
+                if _kda_pool is not None and _kda_pool and hasattr(_kda_pool, 'get_stats'):
+                    _kps = _kda_pool.get_stats()
+                    metrics["kda_active_slots"] = _kps.get('used', 0)
+                    metrics["kda_alloc_count"] = _kps.get('alloc', 0)
+                    metrics["kda_evict_count"] = _kps.get('evict', 0)
+                    metrics["kda_free_slots"] = _kps.get('free', 0)
+                _kda_host_pool = getattr(C_SchedulerHook, '_kda_host_pool', None)
+                if _kda_host_pool is not None and _kda_host_pool and hasattr(_kda_host_pool, 'get_stats'):
+                    _khs = _kda_host_pool.get_stats()
+                    metrics["kda_l2_cached_slots"] = _khs.get('cached_slots', 0)
+                    metrics["kda_l2_capacity"] = _khs.get('capacity', 0)
+
+                # MLA instantaneous: capture current KV usage from server log context
+                _kv_pool = getattr(self, 'token_to_kv_pool', None) or getattr(
+                    getattr(self, 'model_runner', None), 'token_to_kv_pool', None)
+                if _kv_pool is not None and hasattr(_kv_pool, 'size'):
+                    metrics["mla_pool_size"] = _kv_pool.size
+                    if hasattr(_kv_pool, 'available_size'):
+                        metrics["mla_available_tokens"] = _kv_pool.available_size()
+                        metrics["mla_resident_tokens"] = _kv_pool.size - _kv_pool.available_size()
+
+                # Budget and resident bytes
+                _MLA_ENTRY = 5760
+                _KDA_ENTRY = 14653440
+                _TOTAL_BUDGET = 2324275200
+                metrics["budget_total_bytes"] = _TOTAL_BUDGET
+                metrics["budget_mla_bytes"] = metrics.get("mla_pool_size", 0) * _MLA_ENTRY
+                metrics["budget_kda_bytes"] = metrics.get("kda_free_slots", -1)
+                # For Two Pools: kda capacity = active + free
+                if "kda_active_slots" in metrics and "kda_free_slots" in metrics:
+                    _kda_cap = metrics["kda_active_slots"] + metrics["kda_free_slots"]
+                    metrics["kda_capacity_slots"] = _kda_cap
+                    metrics["budget_kda_bytes"] = _kda_cap * _KDA_ENTRY
+                    metrics["kda_resident_bytes"] = metrics["kda_active_slots"] * _KDA_ENTRY
+                    metrics["mla_resident_bytes"] = metrics.get("mla_resident_tokens", 0) * _MLA_ENTRY
+                    metrics["peak_resident_bytes"] = max(
+                        metrics["kda_resident_bytes"], metrics["mla_resident_bytes"]
+                    ) + min(
+                        metrics["kda_resident_bytes"], metrics["mla_resident_bytes"]
+                    )
+                # For One Pool: resident from live_pages
+                if _ud is not None:
+                    _mla_pages = _ud.get('mla_live_pages', 0)
+                    _mamba_pages = _ud.get('mamba_live_pages', 0)
+                    _peak_mla = _ud.get('peak_mla_live_pages', 0)
+                    _peak_mamba = _ud.get('peak_mamba_live_pages', 0)
+                    metrics["kda_active_slots"] = _mamba_pages  # page_size=1 for Mamba
+                    metrics["mla_resident_tokens"] = _mla_pages  # page_size=1 for our mock
+                    metrics["kda_resident_bytes"] = _mamba_pages * _KDA_ENTRY
+                    metrics["mla_resident_bytes"] = _mla_pages * _MLA_ENTRY
+                    metrics["peak_kda_resident_bytes"] = _peak_mamba * _KDA_ENTRY
+                    metrics["peak_mla_resident_bytes"] = _peak_mla * _MLA_ENTRY
+                    metrics["peak_total_resident_bytes"] = (
+                        _peak_mamba * _KDA_ENTRY + _peak_mla * _MLA_ENTRY
+                    )
+
                 try:
-                    with open(f"{output_dir}/metrics.json", "w") as f:
+                    _suffix = f"_phase{_phase}" if _phase is not None else ""
+                    with open(f"{output_dir}/metrics{_suffix}.json", "w") as f:
                         f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
 
-                    with open(f"{output_dir}/iteration.jsonl", "w") as f:
+                    with open(f"{output_dir}/iteration{_suffix}.jsonl", "w") as f:
                         for item in C_SchedulerHook.ITERATION_STATS:
                             f.write(json.dumps(item) + "\n")
 
-                    with open(f"{output_dir}/request.jsonl", "w") as f:
+                    with open(f"{output_dir}/request{_suffix}.jsonl", "w") as f:
                         for item in stats:
                             f.write(json.dumps(asdict(item)) + "\n")
 
@@ -2392,19 +3134,43 @@ class C_SchedulerHook(BaseHook):
                                 f"full_only_loads={_dl.get('full_only',0)} "
                                 f"l3_hits={_dl.get('l3_hits',0)}"
                             )
+                    # Log unified memory diagnostics
+                    _ud = getattr(C_SchedulerHook, '_unified_diag', None)
+                    if _ud is not None:
+                        logger.info(
+                            f"Unified memory diag: alloc={_ud['alloc']} "
+                            f"alloc_extend={_ud['alloc_extend']} "
+                            f"alloc_decode={_ud['alloc_decode']} "
+                            f"free={_ud['free']} compact={_ud['compact']} "
+                            f"compact_pages={_ud.get('compact_pages_moved',0)} "
+                            f"flush_peer={_ud['flush_peer']} "
+                            f"flush={_ud.get('flush',0)} "
+                            f"flush_pages={_ud.get('flush_pages_moved',0)} "
+                            f"alloc_fail={_ud['alloc_fail']} "
+                            f"gap_bytes={_ud['gap_bytes']} "
+                            f"kv_wm={_ud.get('kv_watermark',0)} "
+                            f"v2p_valid={_ud.get('v2p_valid_ratio',0):.2f}"
+                        )
                     # Log per-request L1/L2/L3 hit breakdown
+                    # Also compute aggregated MLA prefill/prefix-hit metrics
+                    _agg_prefix_hit = 0
+                    _agg_prefix_hit_l1 = 0
+                    _agg_prefill_new = 0
                     for item in metrics_stats:
-                        # final_reused_tokens (cached_tokens) includes both L1 prefix match
-                        # AND L2 load_back (init_load_back extends prefix_indices).
-                        # Subtract L2 to get L1-only.
                         l2 = item.l2_hit_tokens
                         l1 = item.final_reused_tokens - l2
                         l3 = item.l3_hit_tokens
                         new_tok = item.input_length - l1 - l2 - l3
+                        _agg_prefix_hit += (l1 + l2 + l3)
+                        _agg_prefix_hit_l1 += l1
+                        _agg_prefill_new += max(0, new_tok)
                         logger.info(
                             f"Req #{item.rid}: input={item.input_length} "
                             f"L1={l1} L2={l2} L3={l3} New={new_tok}"
                         )
+                    metrics["mla_prefix_hit_tokens_agg"] = _agg_prefix_hit
+                    metrics["mla_prefix_hit_l1_tokens_agg"] = _agg_prefix_hit_l1
+                    metrics["mla_prefill_new_tokens_agg"] = _agg_prefill_new
 
                 except Exception as e:
                     logger.error(f"Failed to dump results. Error: {e}")
@@ -2417,6 +3183,7 @@ class C_SchedulerHook(BaseHook):
             C_SchedulerHook.LAST_CPU_TS = 0
             C_SchedulerHook.LAST_FLUSH_TS = time.time()
             C_SchedulerHook.OFFLINE_RECV_ALL_REQUEST = False
+            C_SchedulerHook._kda_checkpoint_diag = None
             C_SchedulerHook._L3_HIT_STATS = {}
             C_SchedulerHook._L3_QUERY_COUNT = 0
             C_SchedulerHook._L3_TOTAL_HITS = 0
@@ -2460,18 +3227,16 @@ class C_SchedulerHook(BaseHook):
                     _orig_pm_profile = self.profiler_manager._profile
 
                     def wrapped_pm_profile(recv_req, *a, **kw):
-                        result = _orig_pm_profile(recv_req, *a, **kw)
-                        # In OFFLINE mode the metrics dump is owned by the
-                        # auto-trigger in wrapped_get_new_batch_prefill (fires
-                        # only when the simulation is truly complete). An
-                        # early /start_profile here would dump partial stats
-                        # and clear REQUEST_STATS mid-simulation, losing all
-                        # subsequent request latencies.
                         if C_SchedulerHook.SIM_MODE == MockSimulationMode.OFFLINE:
-                            logger.debug(
-                                "OFFLINE mode: skipping profile-request dump"
-                            )
-                            return result
+                            logger.info("OFFLINE mode: skipping _orig_pm_profile, running HiSim dump only")
+                            try:
+                                _phase = getattr(C_SchedulerHook, "_offline_phase", 0) + 1
+                                C_SchedulerHook._offline_phase = _phase
+                                wrapped_profile(self, recv_req, _phase=_phase)
+                            except Exception as e:
+                                logger.error(f"HiSim profile dump failed: {e}")
+                            return None
+                        result = _orig_pm_profile(recv_req, *a, **kw)
                         try:
                             wrapped_profile(self, recv_req, *a, **kw)
                         except Exception as e:

@@ -1,7 +1,7 @@
 # Kimi-K3 多层级缓存功能验证报告
 
-> 日期：2026-09-15（最终版）
-> 状态：**全部通过** — L1↔L2、L2↔L3、L3→L1 直通链路（FULL + KDA）全部验证通过；ack 链正常工作；回归无副作用
+> 日期：2026-09-21（第二版）
+> 状态：**两种部署模式全部通过** — ① Two Pools：L1↔L2、L2↔L3、L3→L1 直通链路（FULL + KDA）全部验证通过，ack 链正常，回归无副作用；② One Pool Unified Memory：真实 `UnifiedHybridReqToTokenPool` + `MultiEndedAllocator` 动态分配跑通并验证（Phase 1）
 
 ---
 
@@ -12,8 +12,9 @@
 - [3. 验证流程](#3-验证流程)
 - [4. 验证结果](#4-验证结果)
 - [5. 方案 B 调查：ack 链](#5-方案-b-调查ack-链)
-- [6. 总结](#6-总结)
-- [7. 修改的文件](#7-修改的文件)
+- [6. One Pool Unified Memory 适配](#6-one-pool-unified-memory-适配)
+- [7. 总结](#7-总结)
+- [8. 修改的文件](#8-修改的文件)
 
 ---
 
@@ -264,9 +265,77 @@
 
 ---
 
-## 6. 总结
+## 6. One Pool Unified Memory 适配
 
-### 6.1 已验证正常的功能
+> 日期：2026-09-21
+> 目标：在 Two Pools 支持基础上，让 K3 以 `--enable-unified-memory` 模式（sglang 真实 Unified Memory 实现：KV 与 KDA 共享单一动态字节缓冲区 + 虚拟 slot 映射）在 HiSim 中跑通并验证。
+
+### 6.1 架构：从 mock pool 到真实 unified pool
+
+HiSim 的 `C_ModelRunnerHook.override_initialize` 原本**无条件**创建 `MockReqToTokenPool`/`MockTokenToKVPool`，导致 sglang 的 `kv_cache_configurator` 看到 pool 已存在就跳过真实 unified pool 创建。修复为分支化：
+
+```
+if enable_unified_memory:
+    补齐 configurator 所需属性（layer_info/spec_aux_config/use_mla_backend 等）
+    → init_kv_cache_configurator() + kv_cache_configurator.configure()
+    → 接收真实 UnifiedPoolBundle（UnifiedHybridReqToTokenPool + UnifiedHybridLinearKVPool
+       + UnifiedMambaSlotAllocator + MultiEndedAllocator×2）
+else:
+    原 mock pool 路径（Two Pools 行为零改动）
+```
+
+### 6.2 修复链（9 个依次暴露的问题）
+
+| # | 问题 | 根因 | 修复 |
+|---|------|------|------|
+| 1 | page-major 断言 | unified memory 强制 `enable_page_major_kv_layout`，要求 Triton attention 后端 | 启动加 `--attention-backend triton` |
+| 2 | NPU AIVEC 硬件崩溃 | `write_req_to_token_pool_triton` Triton kernel 直接在 NPU 上执行，sgl_kernel mock 不覆盖 | patch `support_triton()→False`，走 allocation.py 纯 Python fallback |
+| 3 | `MultiEndedAllocator` 观测点全 0 | HiSim 无条件建 mock pool，真实 unified pool 未创建 | `override_initialize` 分支化（见 6.1） |
+| 4 | `'NoneType' has no attribute 'num_effective_layers'` | configurator 需要 `layer_info` | 用 HiSim 已有值构造 `ModelLayerInfo` |
+| 5 | `unified-memory only supports hybrid Mamba...current model is neither` | `kv_cache_configurator` 从 `hybrid_arch` 直接 import `kimi_linear_config`/`mambaish_config`，HiSim 只 patch 了 `kv_cache_builder` 的引用 | 在源头 `hybrid_arch` 模块 patch 两个函数 |
+| 6 | `'bool' object has no attribute 'mamba2_cache_params'` | `kimi_linear_config` patch 返回 `True`，被 `mambaish_config` 透传 | 过滤 bool 返回值；用 K3 真实参数构造 `KimiLinearCacheParams` |
+| 7 | 申请 172TB 内存 | 假 conv/temporal shape 计算 `entry_bytes` 爆炸 | 弃用假 shape，用真实 `KimiLinearStateShape.create(tp=1, num_heads=96, head_dim=128, conv_kernel=4)` |
+| 8 | `'NoneType' has no attribute 'eagle_use_aux_hidden_state'` | attention backend init 需要 `spec_aux_config` | 调 `resolve_spec_aux_hidden_state_config()` 正常解析 |
+| 9 | DType 不匹配（Long ← Int） | HiSim 预建 `mamba_ping_pong_track_buffer` 为 int32，sglang mapping 为 int64 | 改 `dtype=torch.int64` |
+
+### 6.3 验证结果（Phase 1）
+
+**启动**：`--enable-unified-memory --attention-backend triton --max-total-tokens 200000`，端口 30001（避开生产服务）。
+
+| 断言项 | 值 | 标准 | 结果 |
+|--------|-----|------|------|
+| completed | 10 | == 10 && failed == 0 | ✅ |
+| prefix_reuse | 0.8975 | > 0（trace 有共享 prefix） | ✅ |
+| TPOT | 168.05 | > 0 | ✅ |
+| req_to_token_pool 类型 | `UnifiedHybridReqToTokenPool` | 真实 sglang 类 | ✅ |
+| token_to_kv_pool 类型 | `UnifiedHybridLinearKVPool` | 真实 sglang 类 | ✅ |
+| MultiEndedAllocator alloc | **17** | > 0（unified 分配真实生效） | ✅ |
+| MultiEndedAllocator free | **24** | > 0 | ✅ |
+| gap_bytes | 124.7GB | 双端分配器空闲带可观测 | ✅ |
+
+注：`compact=0/flush_peer=0` 属预期——10 请求轻负载未触发压缩；Phase 2 用重负载验证。
+
+### 6.4 三种部署模式总览
+
+| 模式 | 参数 | 状态 |
+|------|------|------|
+| Two Pools + Hierarchical Cache | `--enable-hierarchical-cache` | ✅ 全链路验证（§4） |
+| Two Pools Plain | （无） | ✅ completed=10, TPOT=168.05 |
+| One Pool Unified Memory | `--enable-unified-memory --attention-backend triton` | ✅ Phase 1（§6.3） |
+
+### 6.5 遗留问题（容器环境相关）
+
+| 问题 | 状态 |
+|------|------|
+| 容器重建需按 `setup_container.sh` 完整挂载（NPU 设备/驱动/firmware/privileged） | ✅ 已文档化（`CONTAINER_DEPLOYMENT_FIX.md`） |
+| sglang 源码 3 处补丁（MambaComponent 断言、KDA dtype、model_runner 断言）在容器重建后丢失 | ⚠️ 补丁在容器内非持久化，建议并入 setup_container.sh 的 patch 步骤 |
+| 生产 K3 服务与 HiSim 抢占 30000 端口 | ⚠️ HiSim 改用 30001；如需长期使用建议固定端口约定 |
+
+---
+
+## 7. 总结
+
+### 7.1 已验证正常的功能
 
 | 功能 | FULL/MLA | KDA/MAMBA | 证据 |
 |------|----------|-----------|------|
@@ -279,14 +348,14 @@
 | ack 链（方案 B） | ✅ | ✅ | wq=1→0, owt=1→0, 无异常 |
 | 回归无副作用 | ✅ | ✅ | Case 1/3 所有指标完全一致 |
 
-### 6.2 已修复的次级问题
+### 7.2 已修复的次级问题
 
 | 问题 | 修复 |
 |------|------|
 | proactive evict 节流读错对象 | `getattr(self, '_hicache_cn', 0)` → `getattr(_tc, '_hicache_cn', 0)`（读 tree_cache 而非 Scheduler） |
 | `final_reused_tokens` 兜底双重计数 | 兜底分支去掉 `+ host_hit_length`（`prefix_indices` 已含 L2 tokens） |
 
-### 6.3 仍然存在的问题
+### 7.3 仍然存在的问题
 
 | 优先级 | 问题 | 影响 |
 |--------|------|------|
@@ -295,10 +364,21 @@
 
 ---
 
-## 7. 修改的文件
+## 8. 修改的文件
+
+### 8.1 Phase 1（Two Pools 多层级缓存验证）修改
 
 | 文件 | 修改 |
 |------|------|
-| `src/hisim/simulation/sglang/sglang_hook.py` | `_apply_mock_start_overrides` 新增 `mamba_host` + `storage` 参数；`_mock_start_writing`/`_mock_start_loading` 遍历 `pool_transfers` 处理 MAMBA 池 + 直接触发 L3 读写 + L3 直通计数；iteration stats 修复 `l2_load_latency` 存储 + 新增 `l3_direct_load_latency` + `l3_direct_dur` 初始化；KDA 诊断计数器 + 日志输出 |
+| `src/hisim/simulation/sglang/sglang_hook.py` | `_apply_mock_start_overrides` 新增 `mamba_host` + `storage` 参数；`_mock_start_writing`/`_mock_start_loading` 遍历 `pool_transfers` 处理 MAMBA 池 + 直接触发 L3 读写 + L3 直通计数；iteration stats 修复 `l2_load_latency` 存储 + 新增 `l3_direct_load_latency` + `l3_direct_dur` 初始化；KDA 诊断计数器 + 日志输出；proactive evict 节流修复；`final_reused_tokens` 双重计数修复 |
+| `src/hisim/simulation/sglang/sglang_mock_class.py` | `_alloc_func`/`_free_func` version dispatcher 从 `register_layer_transfer_counter` 移到 `__init__`（修 Two Pools Plain 崩溃） |
 | `sglang-k3_docker/gen_verify_traces.py` | 新增：生成 `trace_evict_l1l2.jsonl` 和 `trace_l3_overflow.jsonl` |
 | `test/assets/mock/config_910c_k3.json` | `enable_l3_direct_to_l1` 测试时改为 `true`，测试后恢复为 `false` |
+
+### 8.2 Phase 1（One Pool Unified Memory 适配）修改
+
+| 文件 | 修改 |
+|------|------|
+| `src/hisim/simulation/sglang/sglang_hook.py` | `override_initialize` 分支化：unified memory 模式跳过 mock pool → 补齐 configurator 属性（`layer_info`/`spec_aux_config`/`use_mla_backend` 等）→ 调 `init_kv_cache_configurator()` + `configure()` → 接收真实 `UnifiedPoolBundle`；`mamba_ping_pong_track_buffer` dtype int32→int64；metrics dump 新增 `Unified memory diag` 日志 |
+| `src/hisim/simulation/sglang/launch_server.py` | `MultiEndedAllocator` 观测点（alloc/alloc_extend/alloc_decode/free/compact/flush_peer/gap_bytes/alloc_fail）；`support_triton()→False` patch（走 Python fallback）；`kimi_linear_config` + `mambaish_config` 源头 patch（`hybrid_arch` 模块）；真实 `KimiLinearCacheParams` 构造（K3 参数：num_heads=96, head_dim=128, 18 KDA 层） |
+| `CONTAINER_DEPLOYMENT_FIX.md` | 新增：容器部署问题与修复记录（NPU 挂载、CANN 版本、sglang 源码补丁） |
