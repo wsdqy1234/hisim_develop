@@ -280,6 +280,16 @@ if (not _is_cuda and not _is_npu) or _force_cpu:
     # its MockReqToTokenPool. Rebind the memory_pool attribute to a subclass
     # whose metaclass accepts the mock in isinstance checks (real pools still
     # pass; the class remains constructible).
+    #
+    # IMPORTANT: several sglang modules do a *top-level*
+    # `from ...memory_pool import HybridReqToTokenPool`, which binds the
+    # ORIGINAL class object at import time. Rebinding only memory_pool is not
+    # enough: e.g. allocation.alloc_req_slots does
+    # `isinstance(req_to_token_pool, HybridReqToTokenPool)` against its own
+    # stale binding, that check fails for the mock, and the native mamba
+    # pre-eviction is silently skipped -> `alloc` returns None ->
+    # "alloc_req_slots runs out of memory" as soon as mamba is under pressure.
+    # Rebind every module that already captured the original.
     try:
         import sglang.srt.mem_cache.memory_pool as _mp
         _OrigHybridPool = _mp.HybridReqToTokenPool
@@ -288,14 +298,34 @@ if (not _is_cuda and not _is_npu) or _force_cpu:
             def __instancecheck__(cls, instance):
                 if type(instance).__name__ == "MockReqToTokenPool":
                     return True
-                return super().__instancecheck__(instance)
+                # Any genuine HybridReqToTokenPool (or subclass) instance.
+                return isinstance(instance, _OrigHybridPool)
 
         _HybridPoolAlias = _HybridPoolMeta(
             "HybridReqToTokenPool", (_OrigHybridPool,), {}
         )
         _mp.HybridReqToTokenPool = _HybridPoolAlias
+
+        # Sweep all *already-loaded* modules for stale top-level bindings.
+        # NOTE: do NOT force-import extra sglang modules here. Doing so during
+        # launch_server's module body changes import ordering for the scheduler
+        # process and corrupts later device/host pool construction (observed:
+        # MockTokenToKVPoolHost sized the host KV buffer from mock 1x1 head dims
+        # -> a 1.47 PB allocation). Only touch what is already imported; the
+        # scheduler imports allocation/common well before it builds the cache.
+        import sys as _sys
+
+        _rebound = []
+        for _mname, _m in list(_sys.modules.items()):
+            try:
+                if getattr(_m, "HybridReqToTokenPool", None) is _OrigHybridPool:
+                    setattr(_m, "HybridReqToTokenPool", _HybridPoolAlias)
+                    _rebound.append(_mname)
+            except Exception:
+                pass
         logger.info(
-            "Patched HybridReqToTokenPool isinstance to accept MockReqToTokenPool"
+            "Patched HybridReqToTokenPool isinstance to accept MockReqToTokenPool "
+            f"(rebound: {_rebound})"
         )
     except Exception as e:
         logger.warning(f"Failed to patch HybridReqToTokenPool: {e}")
