@@ -1117,3 +1117,29 @@ pop_l3_direct_load_count()  # 复位
 **关键文件**：`src/hisim/simulation/sglang/launch_server.py`（isinstance 别名 + K3 策略强制）、`sglang_hook.py`（metrics 聚合、req.kv 对齐、OFFLINE 控制消息透传、KDA L3）、`sglang_mock_class.py`（`_alloc_v3` mamba、`copy_from`、KVCM set/exists、`_alloc_ping_pong_buffer`）。
 
 **遗留（P2，未做）**：`mamba_num`/`budget_kda_bytes` 语义、`peak_resident` 公式、traceback 恢复、INFO 日志门控、launch_server 0.5.19 失效补丁（`_handle_page_major_kv_layout`/`_handle_unified_memory_pool`/`MultiEndedAllocator`）、layer map 运行时从 model_config 派生、`get_num_kv_heads` 补丁；One Pool 本地 bring-up；KDA-heavy / MLA-heavy / dynamic 实验重跑与 `docs/k3_onepool_vs_twopools_0519_rerun.md`。
+
+## 2026-10-15 — One Pool 在 0.5.19 上跑通 + P5.1/5.2/5.3 全量复跑与差异归因
+
+**背景**：接昨日 P2 清单。分支 `develop_dqy`（`f8985f4` → `c142441` → `606c9cb`，均未 push）。
+
+**修复**：
+1. **`c142441` — `alloc_req_slots` 的 mamba 预驱逐失效**：`mem_cache/allocation.py:28` 顶层 `from ...memory_pool import HybridReqToTokenPool` 持有原类，只重绑 `memory_pool` 模块没用 → `alloc_req_slots` 的 `isinstance` 判 False → 原生 mamba 预驱逐被跳过 → mamba 压力下 `alloc_req_slots runs out of memory`。修复：遍历 `sys.modules` 把别名重绑到所有已加载模块（common/allocation/schedule_batch/kv_cache_configurator）。**不可 force-import**：在 launch_server 模块体里 import sglang 模块会改变 scheduler 导入顺序 → host pool 用 mock 1×1 head dims 定容 → 1.47 PB 分配。
+2. **`606c9cb` — One Pool（`--enable-unified-memory`）bring-up**，三个 0.5.18→0.5.19 API 断点：
+   - `handle_unified_memory_pool`：0.5.19 是 `arg_groups.kv_cache_hook` 模块函数（0.5.18 是 ServerArgs 方法），旧补丁静默 no-op → unified+hierarchical 互斥断言炸。按模块函数形式补丁 + 重绑定 `arg_groups.pipeline`（又一处 stale-binding）。
+   - `handle_page_major_kv_layout`：同上方法→函数；wrap 并只放行 backend 白名单断言（torch_native 被拒）。HiSim forward 全 mock，backend 永不执行 kernel；其余断言照常。
+   - `HybridCacheController(mem_pool_host=...)`：0.5.19 要求传 `HostPoolGroup`（读 `.anchor_entry.host_pool`/`.entries`），传普通 mock host pool → `'NoneType' object has no attribute 'host_pool'`。
+   验证：`UNIFIED MEMORY POOL ENABLED -- path=Mamba hybrid`、`MultiEndedAllocator('full') grow=down / ('mamba') grow=up`、`Components (FULL, MAMBA)`、`UnifiedTreeCore`。
+
+**复跑结果**（vs docker fork 报告 `k3_onepool_vs_twopools_experiment_report.md`，详见 `docs/k3_onepool_vs_twopools_0519_rerun.md`）：
+- **P5.1 KDA-heavy（Two Pools）逐格一致**：KDA 40/60/80/100/120 → COW 2/3/4/6/5、prefix_ratio 0.333/0.500/0.666/0.999/0.833。TP-120 需按 docker 共享预算 `MLA=403520−2544×KDA` 设 MLA=98,240（本地 Two Pools 是独立池，不挤占；归因 cell `p51_tp120_b98k` 证实 5/6）。
+- **P5.2 MLA-heavy 3/4 格一致**；TP-80 复跑 3/3（docker 2/3）：归因于 docker 的 KDA L2/L3 回收链路损坏（`f8985f4` 修复的 `self.storage` / 任意前 N LRU）。对照实验：NOL3（关 storage backend）仍 3/3（L2 host mamba pool 恢复）、串行化 trace 仍 3/3（排除到达次序）。
+- **P5.3 dynamic（Two Pools）与 docker §5.5 逐阶段表完全一致**：KDA=80 总 COW 9/15（B/C-B 划分 3/3+2/3 vs docker 2/3+3/3，总数同）；KDA=40 = 11/15 = 2/6+3/3+3/3+3/3。**docker §6.2 的 "KDA=40 → 14/15" 与其 §5.5 自身矛盾（求和 11），复跑证实 11**。
+- **One Pool 三组全部复现 docker 结论**：P5.1 6/6（`checkpoint_pos=1024, replay_tokens=0`）、P5.2 3/3、P5.3 **15/15 + kda_new_tokens=1,545（理想）+ 205,824 复用 token 全 L1 命中（0 回载）**。
+- **重新评估**：L2/L3 修复后 Two Pools 的复用计算量也到理想 1,545（docker 里 39,433/5,641 是链路损坏），One Pool 剩余优势 = KDA COW 命中率（15/15 vs 9/15、11/15）+ 零 L2→L1 回载流量（0 vs 37,888/4,096 token）。
+- **语义差异记录**：0.5.19 统一池 mamba 预算由内存推导（CPU 模拟 772 GB → 6,589 slots），无 docker 的 "初始 80 + 水位线 flush 扩容 97" 轨迹；原生借还是 grow=down/up（P5.2 MLA 262K>200K 反向借用生效）。`kda_historical_replay_tokens` 聚合所有 KDA-REPLAY 日志（含 chunk 自重放），与 docker 口径不可比（One Pool 也有 107,520）。
+
+**工具链**（已入库 `benchmark/collection/k3_onepool_twopools/`，复跑可重放）：`gen_k3_exp_traces.py`（P5.1/5.2/5.3 + seq 归因变体，与实测 trace 字节一致）、`run_exp.sh`（单 cell：kill→launch→health→bench→metrics；`NOL3=1` 关 L3）、`run_all_exp.sh`（批量，含归因 cell 与 One Pool 格）、`analyze_exp.py`（汇总表）、`README.md`；17 份 cell 快照在 `$WORKDIR/exp_results/`。
+
+**注意**：pkill 自匹配坑 —— 任何命令行文本含 `launch_server`（如 py_compile 路径）的 shell 会触发 run_exp.sh 内 pkill 自杀，输出截断。用 `launch[_]serv` 模式或脚本文件跑。
+
+**遗留（P2）**：`MultiEndedAllocator._flush_peer_for_alloc` 观测计数补丁（0.5.19 失效 → peak/flush 指标缺失）、`mamba_num`/`budget_kda_bytes` 语义、`peak_resident` 公式、INFO 日志门控、layer map 运行时从 model_config 派生、`get_num_kv_heads` 补丁、统一池 mamba 初始容量对齐 docker 80（需约束内存预算，`--mem-fraction-static` 路线未试）。
