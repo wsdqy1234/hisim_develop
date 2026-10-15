@@ -1782,11 +1782,15 @@ class C_HiRadixCacheHook(BaseHook):
                     ),
                 ])
 
-                # Create HybridCacheController (uses mem_pool_host, not host_pool_group)
+                # Create HybridCacheController.
+                # 0.5.19: the controller expects a HostPoolGroup as mem_pool_host
+                # (it reads mem_pool_host.anchor_entry.host_pool and .entries);
+                # passing the plain mock host pool crashes with
+                # "'NoneType' object has no attribute 'host_pool'".
                 self.load_cache_event = threading.Event()
                 self.cache_controller = HybridCacheController(
                     token_to_kv_pool_allocator=params.token_to_kv_pool_allocator,
-                    mem_pool_host=_full_host,
+                    mem_pool_host=self.host_pool_group,
                     page_size=_page_size,
                     tp_group=params.tp_cache_group,
                     load_cache_event=self.load_cache_event,

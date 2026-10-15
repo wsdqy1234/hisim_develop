@@ -633,58 +633,97 @@ if (not _is_cuda and not _is_npu) or _force_cpu:
     except Exception as e:
         logger.warning(f"Failed to patch MambaPool: {e}")
 
-    # Patch _handle_page_major_kv_layout to allow torch_native backend.
-    # sglang requires Triton for page-major-kv-layout (unified memory),
-    # but HiSim mocks the forward pass — Triton attention backend
-    # executes real NPU kernels (compute_position_kernel) that crash.
-    # Allowing torch_native lets HiSim skip Triton kernel execution.
+    # Patch handle_page_major_kv_layout to allow the torch_native backend.
+    # sglang requires stride-audited backends (Triton/FA3/...) for
+    # page-major-kv-layout (implied by --enable-unified-memory), but HiSim
+    # mocks the forward pass — the attention backend is never used for
+    # computation. On 0.5.18 this was a ServerArgs method
+    # (`ServerArgs._handle_page_major_kv_layout`); on 0.5.19 it is a
+    # module-level function in `sglang.srt.arg_groups.kv_cache_hook`, bound
+    # by name into `arg_groups.pipeline`. Wrap it and bypass ONLY the
+    # backend allow-list AssertionError; all other asserts still apply.
     try:
-        import sglang.srt.server_args as _sa_mod
-        _orig_handle_pml = _sa_mod.ServerArgs._handle_page_major_kv_layout
-        def _patched_handle_pml(self):
-            if getattr(self, 'enable_page_major_kv_layout', False):
-                # Relax: allow torch_native alongside triton
-                # The original asserts backends <= allowed_full;
-                # we add torch_native to allowed_full.
-                _orig_handle_pml(self)
-            # If not page_major, original is a no-op
-        # Instead of wrapping, just monkey-patch the assert by adding torch_native
-        # to the allowed set. The simplest approach: override the whole method.
-        def _relaxed_handle_pml(self):
-            if not getattr(self, 'enable_page_major_kv_layout', False):
-                return
-            # Original logic but with relaxed backend checks — skip the
-            # assertion that requires Triton. HiSim's forward is mocked,
-            # so the attention backend is never actually used for computation.
-            # Just ensure the mamba_backend is set.
-            if self.mamba_backend is None:
-                self.mamba_backend = "triton"
-        _sa_mod.ServerArgs._handle_page_major_kv_layout = _relaxed_handle_pml
-        logger.info("Patched _handle_page_major_kv_layout to allow torch_native (skip Triton assertion)")
-    except Exception as e:
-        logger.warning(f"Failed to patch _handle_page_major_kv_layout: {e}")
+        import sys as _sys
+        import sglang.srt.arg_groups.kv_cache_hook as _kch
+        import sglang.srt.arg_groups.pipeline as _pl  # noqa: F401 (ensure loaded)
 
-    # Patch _handle_unified_memory_pool to bypass the mutual-exclusion assert
+        _orig_pml = _kch.handle_page_major_kv_layout
+
+        def _patched_handle_pml(server_args):
+            try:
+                return _orig_pml(server_args)
+            except AssertionError as e:
+                _msg = str(e)
+                if (
+                    "are not in the allowed set" in _msg
+                    and "enable-page-major-kv-layout" in _msg
+                ):
+                    return None  # HiSim: forward mocked, backend never runs
+                raise
+
+        _kch.handle_page_major_kv_layout = _patched_handle_pml
+        _rebound_pml = ["sglang.srt.arg_groups.kv_cache_hook"]
+        for _mname, _m in list(_sys.modules.items()):
+            try:
+                if getattr(_m, 'handle_page_major_kv_layout', None) is _orig_pml:
+                    setattr(_m, 'handle_page_major_kv_layout', _patched_handle_pml)
+                    _rebound_pml.append(_mname)
+            except Exception:
+                pass
+        logger.info(
+            "Patched handle_page_major_kv_layout (0.5.19 module form): "
+            f"allow torch_native for unified memory (rebound: {_rebound_pml})"
+        )
+    except Exception as e:
+        logger.warning(f"Failed to patch handle_page_major_kv_layout: {e}")
+
+    # Patch handle_unified_memory_pool to bypass the mutual-exclusion assert
     # that prevents enable_unified_memory + enable_hierarchical_cache together.
     # We temporarily disable hierarchical_cache to pass the assert, then restore.
+    #
+    # On 0.5.18 this was a ServerArgs method (`ServerArgs._handle_unified_memory_pool`)
+    # and the old patch below targeted that name. On 0.5.19 it is a *module-level
+    # function* in `sglang.srt.arg_groups.kv_cache_hook`, bound by name into
+    # `arg_groups.pipeline` (top-level `from ... import handle_unified_memory_pool`),
+    # so patching ServerArgs silently no-ops. Rebind both the hook module and any
+    # module that captured the original function object.
     try:
-        _orig_handle_ump = _sa_mod.ServerArgs._handle_unified_memory_pool
-        def _patched_handle_ump(self):
-            _hier = getattr(self, 'enable_hierarchical_cache', False)
-            _lmc = getattr(self, 'enable_lmcache', False)
+        import sys as _sys
+        import sglang.srt.arg_groups.kv_cache_hook as _kch
+        import sglang.srt.arg_groups.pipeline as _pl  # noqa: F401 (ensure loaded)
+
+        _orig_hump = _kch.handle_unified_memory_pool
+
+        def _patched_hump(server_args):
+            _hier = getattr(server_args, 'enable_hierarchical_cache', False)
+            _lmc = getattr(server_args, 'enable_lmcache', False)
             if _hier:
-                self.enable_hierarchical_cache = False
+                server_args.enable_hierarchical_cache = False
             if _lmc:
-                self.enable_lmcache = False
-            _orig_handle_ump(self)
-            if _hier:
-                self.enable_hierarchical_cache = _hier
-            if _lmc:
-                self.enable_lmcache = _lmc
-        _sa_mod.ServerArgs._handle_unified_memory_pool = _patched_handle_ump
-        logger.info("Patched _handle_unified_memory_pool: bypass unified+hierarchical mutual exclusion")
+                server_args.enable_lmcache = False
+            try:
+                return _orig_hump(server_args)
+            finally:
+                if _hier:
+                    server_args.enable_hierarchical_cache = _hier
+                if _lmc:
+                    server_args.enable_lmcache = _lmc
+
+        _kch.handle_unified_memory_pool = _patched_hump
+        _rebound_hump = ["sglang.srt.arg_groups.kv_cache_hook"]
+        for _mname, _m in list(_sys.modules.items()):
+            try:
+                if getattr(_m, 'handle_unified_memory_pool', None) is _orig_hump:
+                    setattr(_m, 'handle_unified_memory_pool', _patched_hump)
+                    _rebound_hump.append(_mname)
+            except Exception:
+                pass
+        logger.info(
+            "Patched handle_unified_memory_pool (0.5.19 module form): "
+            f"bypass unified+hierarchical mutual exclusion (rebound: {_rebound_hump})"
+        )
     except Exception as e:
-        logger.warning(f"Failed to patch _handle_unified_memory_pool: {e}")
+        logger.warning(f"Failed to patch handle_unified_memory_pool: {e}")
 
     # Patch HybridCacheController backup/prefetch thread funcs to no-op.
     # C_HiCacheController.hook overrides these on HiCacheController class,
