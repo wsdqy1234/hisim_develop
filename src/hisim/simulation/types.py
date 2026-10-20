@@ -66,6 +66,53 @@ class RequestStats:
     created_time: float = -1
     gen_token_latencies: list[float] = field(default_factory=list)
 
+    # [v2 Phase 1] KDA/MLA per-request diagnostic metrics (revised per审查意见3).
+    # All default to 0/False so existing baseline behavior is unchanged.
+    # Populated only when HISIM_KDA_OBS=1 is set.
+    # Recorded at different stages: match前, match后, load-back后, COW后, scheduler最终决策.
+
+    # --- MLA dimension (from match_prefix result) ---
+    mla_potential_hit_tokens: int = 0       # full_kv_hit_length: MLA available potential (含 device+host+evicted-backed)
+
+    # --- KDA dimension: recoverable position at each layer ---
+    kda_l1_recoverable_position: int = 0    # token position at best_match if MAMBA.value is not None (COW available)
+    kda_l2_recoverable_position: int = 0    # token position at best_match if MAMBA.host_value is not None (L2 hit)
+    kda_l3_key_hit: bool = False            # L3 batch_exists_mamba returned hit (set in _mock_start_loading)
+    kda_restored_position: int = 0          # position after load-back completes (set in _mock_start_loading)
+
+    # --- COW / execution ---
+    kda_cow_src_slot: int = -1             # COW source slot id (from mamba_cow_src_index), -1 if no COW
+
+    # --- Derived: effective prefix and gaps ---
+    effective_prefix_hit_tokens: int = 0   # min(mla_potential, max(kda_l1, kda_l2, kda_l3)) — actual usable prefix
+    retreat_gap_tokens: int = 0           # max(0, mla_potential - max(kda_l1, kda_l2, kda_l3)) — structural KDA gap
+
+    # --- Scheduler / predictor ---
+    scheduled_extend_tokens: int = 0       # extend_range.length as set by scheduler (what predictor receives)
+    unavoidable_new_tokens: int = 0        # total_input - mla_potential (actual new input beyond MLA)
+    actual_extra_recompute_tokens: int = 0 # KDA tokens needing recompute (0 if COW, prefix_len if non-COW with prefix, in predictor if true retreat)
+    predictor_input_tokens: int = 0        # FakeRequest.input_length passed to K3ProfilePredictor
+
+    # [A2] New metrics: clear statistical semantics
+    scheduler_effective_hit_tokens: int = 0  # req.cached_tokens (post-load-back, includes restored)
+    verified_logical_reuse: bool = False      # shadow_verify identity_ok AND ready AND consumed
+    historical_tokens_actually_scheduled: int = 0  # actual replay path tokens (extend - new_tokens, 0 if restored)
+    kda_restore_tier: str = ""                # "L1" / "L2" / "L3" / "miss" / "unknown"
+    kda_restore_latency_ms: float = 0.0       # KDA L2/L3 load duration (from StateManager, per-req delta)
+    mla_restore_latency_ms: float = 0.0       # MLA L2/L3 load duration (from StateManager, per-req delta)
+
+    # --- Legacy fields (kept for backward compat, will be removed) ---
+    kda_replay_tokens: int = 0            # alias for actual_extra_recompute_tokens
+    kda_new_tokens: int = 0              # alias for unavoidable_new_tokens
+    kda_l1_hit: bool = False             # alias for kda_cow_src_slot >= 0
+    kda_l2_hit: bool = False             # alias for kda_l2_recoverable_position > 0
+    kda_l3_hit: bool = False             # alias for kda_l3_key_hit
+    kda_recoverable_position: int = 0     # alias for max(kda_l1, kda_l2, kda_l3)
+    kda_checkpoint_pos: int = 0           # track_boundary of matched checkpoint
+    kda_loadback_bytes: int = 0           # KDA bytes loaded back from L2/L3
+    mla_l2_hit_tokens: int = 0            # MLA L2 hit tokens (host_hit_length)
+    mla_loadback_bytes: int = 0           # MLA bytes loaded back from L2/L3
+
     def is_complete(self) -> bool:
         return True
 

@@ -565,6 +565,8 @@ class MockReqToTokenPool:
                     self.free_slots = list(range(1, capacity + 1))
                     self._alloc_count = 0
                     self._free_count = 0
+                    # [A2] Slot ownership ledger: {slot_id: {owner, gen, state}}
+                    self._ledger = {}
                     _ma_l.info("[MA-INIT] capacity=%d device=%s free_slots=%s", capacity, device, self.free_slots)
                 def available_size(self):
                     return len(self.free_slots)
@@ -582,6 +584,8 @@ class MockReqToTokenPool:
                     slots = self.free_slots[:n]
                     self.free_slots = self.free_slots[n:]
                     self._alloc_count += n
+                    for s in slots:
+                        self._ledger[s] = {"owner": "alloc", "gen": self._alloc_count, "state": "allocated"}
                     _ma_l.info("[MA-ALLOC] n=%d slots=%s remaining=%d free=%s alloc_count=%d",
                                 n, slots, len(self.free_slots), self.free_slots, self._alloc_count)
                     return _torch.tensor(slots, dtype=_torch.int64, device=self.device)
@@ -593,9 +597,11 @@ class MockReqToTokenPool:
                         assert v not in self.free_slots, (
                             f"double free of mamba slot {v} "
                             f"(alloc_count={self._alloc_count}, "
-                            f"free_count={self._free_count}, capacity={self.capacity})"
-                        )
+                            f"free_count={self._free_count}, capacity={self.capacity})")
                         self.free_slots.append(v)
+                        if v in self._ledger:
+                            self._ledger[v]["state"] = "freed"
+                            self._ledger[v]["free_gen"] = self._free_count
                     self._free_count += len(_vals)
                     _ma_l.info("[MA-FREE] slots=%s remaining=%d free=%s alloc_count=%d free_count=%d",
                                 _vals, len(self.free_slots), self.free_slots, self._alloc_count, self._free_count)
@@ -606,6 +612,21 @@ class MockReqToTokenPool:
                         "alloc_count": self._alloc_count,
                         "free_count": self._free_count,
                         "free_slots": list(self.free_slots),
+                    }
+                def get_ledger(self):
+                    """Return slot ownership ledger for diagnostics."""
+                    allocated = [s for s, v in self._ledger.items() if v["state"] == "allocated"]
+                    freed = [s for s, v in self._ledger.items() if v["state"] == "freed"]
+                    return {
+                        "allocated_slots": sorted(allocated),
+                        "freed_slots": sorted(freed),
+                        "total_seen": len(self._ledger),
+                        "currently_allocated": len(allocated),
+                        "currently_free": len(self.free_slots),
+                        "capacity": self.capacity,
+                        "alloc_count": self._alloc_count,
+                        "free_count": self._free_count,
+                        "invariant": len(allocated) + len(self.free_slots) == self.capacity,
                     }
                 def clear(self):
                     self.free_slots = list(range(1, self.capacity + 1))

@@ -28,6 +28,7 @@ class StateManager:
         cls._hicache_l2_backup_dur = 0
         cls._hicache_l2_load_dur = 0
         cls._hicache_l3_backup_dur = 0
+        cls._hicache_l3_load_dur = 0  # [v2-fix F4] MLA L3 read latency (separate from KDA)
         cls._last_l2_load_dur = 0
         cls._last_l2_backup_dur = 0
         cls._last_l3_write_overflow = 0
@@ -59,6 +60,17 @@ class StateManager:
     @classmethod
     def inc_hicache_l3_backup_dur(cls, dur: float) -> None:
         cls._hicache_l3_backup_dur += dur
+
+    # [v2-fix F4] MLA L3 read latency — separate from KDA to avoid counter pollution
+    @classmethod
+    def inc_hicache_l3_load_dur(cls, dur: float) -> None:
+        cls._hicache_l3_load_dur += dur
+
+    @classmethod
+    def pop_hicache_l3_load_dur(cls) -> float:
+        dur = cls._hicache_l3_load_dur
+        cls._hicache_l3_load_dur = 0
+        return dur
 
     @classmethod
     def pop_hicache_l2_load_dur(cls) -> float:

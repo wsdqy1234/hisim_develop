@@ -20,7 +20,9 @@ from hisim.simulation.types import (
 from hisim.hook.utils import get_obj_from_args
 from hisim.utils.json import CustomJsonEncoder
 from hisim.simulation.manager import StateManager, ConfigManager, Envs
+from hisim.simulation import kda_obs
 from hisim.time_predictor import (
+
     InferTimePredictor,
     FakeRequest,
     ScheduleBatch as HisimScheduleBatch,
@@ -1490,6 +1492,75 @@ class C_HiRadixCacheHook(BaseHook):
                                     _slot_hash = f"kda_{_nid}_{_i}"
                                     mh.backup_from_device(_slot_idx, _slot_hash)
                                     _mamba_slot_hashes.append(_slot_hash)
+                                    # [A2] Shadow: register + backup_l2
+                                    if kda_obs.is_obs_enabled():
+                                        if _slot_hash not in kda_obs._SHADOW:
+                                            kda_obs.shadow_register_checkpoint(
+                                                _slot_hash, node_id=_nid,
+                                                device_slot=_slot_idx)
+                                        kda_obs.shadow_backup_l2(_slot_hash, _slot_idx)
+                                    # [A2-fix] Manually update tree_core's
+                                    # component_evictable_size_[MAMBA] and LRU
+                                    # list, because commit_hicache_transfer
+                                    # (BACKUP_HOST) doesn't update them.
+                                    try:
+                                        _tcore = getattr(c, 'tree_core', None)
+                                        _has_lru = hasattr(_tcore, 'lru_lists') if _tcore else False
+                                        if _tcore is not None and _has_lru:
+                                            from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _ACT
+                                            _mnode = _tcore.node_by_id(_nid)
+                                            if _mnode is not None:
+                                                _mcd = _mnode.component_data[_ACT.MAMBA]
+                                                _mval = _mcd.value
+                                                if _mval is not None:
+                                                    _mlru = _tcore.lru_lists.get(_ACT.MAMBA)
+                                                    if _mlru is not None:
+                                                        _in_list = _mlru.in_list(_mnode)
+                                                        # Force-update counter: node is in LRU but
+                                                        # counter may be 0 due to init mismatch
+                                                        _cur = _tcore.component_evictable_size_.get(_ACT.MAMBA, 0)
+                                                        _needed = len(_mval)
+                                                        if _cur < _needed:
+                                                            _tcore.component_evictable_size_[_ACT.MAMBA] = _needed
+                                                        if not _in_list:
+                                                            _mlru.insert_mru(_mnode)
+                                                        # [A2-root-cause-fix] store_component_device_value
+                                                        # doesn't call _update_evictable_leaf_sets, so the
+                                                        # node is NOT in evictable_device_leaves and the
+                                                        # MambaComponent eviction can't find it.
+                                                        # Manually add it here.
+                                                        try:
+                                                            _tcore._update_evictable_leaf_sets(_mnode)
+                                                            if _mnode.parent is not None:
+                                                                _tcore._update_evictable_leaf_sets(_mnode.parent)
+                                                        except Exception:
+                                                            pass
+                                                        # [A2] Also increment HiSim-managed counter
+                                                        kda_obs.inc_mamba_evictable(len(_mval))
+                                                        if kda_obs.is_obs_enabled():
+                                                            _in_edl = _mnode in _tcore.evictable_device_leaves
+                                                            kda_obs.log_event("lru_update", node_id=_nid,
+                                                                extra={"old": _cur, "new": max(_cur, _needed),
+                                                                       "in_list": _in_list, "in_edl": _in_edl,
+                                                                       "hism_cnt": kda_obs.get_mamba_evictable()})
+                                            if kda_obs.is_obs_enabled():
+                                                _vm = "set" if (_mnode is not None and _mnode.component_data[_ACT.MAMBA].value is not None) else "None"
+                                                _mlru_check = _tcore.lru_lists.get(_ACT.MAMBA) if _tcore else None
+                                                _in_list_check = _mlru_check.in_list(_mnode) if (_mlru_check is not None and _mnode is not None) else None
+                                                kda_obs.log_event("lru_update_attempt", node_id=_nid,
+                                                    extra={"tcore_ok": True, "has_lru": True,
+                                                           "node_found": _mnode is not None,
+                                                           "mamba_val": _vm,
+                                                           "mlru_ok": _mlru_check is not None,
+                                                           "in_list": _in_list_check})
+                                        elif kda_obs.is_obs_enabled():
+                                            kda_obs.log_event("lru_update_attempt", node_id=_nid,
+                                                extra={"tcore_ok": _tcore is not None, "has_lru": False})
+                                    except Exception as _me:
+                                        if kda_obs.is_obs_enabled():
+                                            kda_obs.log_event("lru_update_error", node_id=_nid,
+                                                extra={"error": str(_me)[:200]})
+                                        logger.debug(f"mamba LRU update failed: {_me}")
                             except Exception as e:
                                 logger.debug(f"mamba backup_from_device failed: {e}")
                         logger.debug(
@@ -1546,6 +1617,10 @@ class C_HiRadixCacheHook(BaseHook):
                                 _slot_bytes = getattr(mh, 'slot_bytes', 14653440) if mh else 14653440
                                 _kda_l3_dur = (_slot_bytes * len(_l3_mamba)) / _disk_write_bw
                                 StateManager.inc_hicache_kda_l3_backup_dur(_kda_l3_dur)
+                                # [A2] Shadow: backup_l3 for each evicted hash
+                                if kda_obs.is_obs_enabled():
+                                    for _sh in _l3_mamba:
+                                        kda_obs.shadow_backup_l3(_sh)
                             except Exception as e:
                                 logger.debug(f"KDA L3 write failed: {e}")
                     # Set host_value on components (FULL + MAMBA)
@@ -1572,15 +1647,31 @@ class C_HiRadixCacheHook(BaseHook):
                                         _mv.host_value = _mv.value.clone() if hasattr(_mv.value, 'clone') else _mv.value
                             except Exception as e:
                                 logger.debug(f"set host_value failed node {nid}: {e}")
+                    _ack_wq_before = len(cc.ack_write_queue) if hasattr(cc, 'ack_write_queue') else -1
+                    _cc_id = id(cc)
+                    _cc_wq_id = id(cc.ack_write_queue) if hasattr(cc, 'ack_write_queue') else -1
                     try:
                         _evt = torch.Event(); _evt.record()
                         cc.ack_write_queue.append(_HA_CKACK(
-                            start_event=_evt, finish_event=_evt, node_ids=_ni,
+                            start_event=_evt, finish_event=_evt, node_ids=list(_ni) if _ni else [],
                             num_tokens=len(_di) if _di is not None else 0,
                             timing_enabled=False, num_bytes=0,
                         ))
                     except Exception as e:
                         logger.warning(f"fake write ack failed: {e}")
+                    _ack_wq_after = len(cc.ack_write_queue) if hasattr(cc, 'ack_write_queue') else -1
+                    # [ACK-LIFECYCLE] Log ACK creation with node_ids for matching
+                    # against _track_write_through_node and _finish_write_through_ack.
+                    if kda_obs.is_obs_enabled():
+                        kda_obs.log_event("ack_create",
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"node_ids": list(_ni) if _ni else [],
+                                   "wq_before": _ack_wq_before,
+                                   "wq_after": _ack_wq_after,
+                                   "owt_size": len(getattr(c, 'ongoing_write_through', {})),
+                                   "cc_id": _cc_id,
+                                   "wq_list_id": _cc_wq_id,
+                                   "self_cc_id": id(getattr(c, 'cache_controller', None))})
                 cache.cache_controller.start_writing = _mock_start_writing
 
                 def _mock_start_loading(cc=cache.cache_controller, host=full_host, c=cache, mh=mamba_host, st=_storage):
@@ -1624,7 +1715,8 @@ class C_HiRadixCacheHook(BaseHook):
                                 if _hit_count > 0:
                                     _diag_l["l3_hits"] += 1
                                     _l3_dur = _kv_bytes / _disk_read_bw if _di is not None else 0
-                                    StateManager.inc_hicache_kda_l3_load_dur(_l3_dur)
+                                    # [v2-fix F4] Use MLA L3 counter, not KDA counter
+                                    StateManager.inc_hicache_l3_load_dur(_l3_dur)
                                     # Set L3 direct load count so load_to_device_per_layer
                                     # splits the H2D timing between L2 and L3 direct path
                                     _ntok = len(_di) if _di is not None else 0
@@ -1659,6 +1751,8 @@ class C_HiRadixCacheHook(BaseHook):
                                     _l2_hit = mh.has(_slot_hash)
                                     if _l2_hit:
                                         mh.load_to_device(_slot_hash)
+                                        if kda_obs.is_obs_enabled():
+                                            kda_obs.shadow_restore_l2(_slot_hash, _slot_idx)
                                     elif st is not None:
                                         _m_hits = st.batch_exists_mamba([_slot_hash])
                                         if any(_m_hits.values()):
@@ -1667,6 +1761,8 @@ class C_HiRadixCacheHook(BaseHook):
                                             StateManager.inc_hicache_kda_l3_load_dur(_kda_l3_dur)
                                             mh.backup_from_device(-1, _slot_hash, from_l3=True)
                                             mh.load_to_device(_slot_hash)
+                                            if kda_obs.is_obs_enabled():
+                                                kda_obs.shadow_restore_l3(_slot_hash, _slot_idx)
                             except Exception as e:
                                 logger.debug(f"mamba load_to_device failed: {e}")
                     elif _pt:
@@ -1720,6 +1816,21 @@ class C_HiRadixCacheHook(BaseHook):
                 if not hasattr(cache, 'buffer_pipeline'):
                     cache.buffer_pipeline = None
                 logger.debug("Applied mock start_writing/start_loading overrides")
+
+                # [A2-root-cause-fix] Add MAMBA to tree_components if missing.
+                # Without this, _evict_components skips MAMBA entirely,
+                # causing mamba slot exhaustion.
+                _tc_m = getattr(cache, 'tree_core', None)
+                if _tc_m is not None:
+                    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _MCT
+                    _mtcs = getattr(_tc_m, 'tree_components', None)
+                    if _mtcs is not None and _MCT.MAMBA not in _mtcs:
+                        _mtcs.append(_MCT.MAMBA)
+                        logger.info(f"[A2-fix] Added MAMBA to tree_components: now {[getattr(c, chr(118)+chr(97)+chr(108)+chr(117)+chr(101), str(c)) for c in _mtcs]}")
+                    if kda_obs.is_obs_enabled():
+                        kda_obs.log_event("tree_components_fix",
+                            extra={"tree_components": [getattr(c, chr(118)+chr(97)+chr(108)+chr(117)+chr(101), str(c)) for c in (_mtcs or [])],
+                                   "mamba_in": _MCT.MAMBA in (_mtcs or [])})
 
             try:
                 _is_unified = getattr(server_args, 'enable_unified_memory', False)
@@ -1880,6 +1991,242 @@ class C_HiRadixCacheHook(BaseHook):
                 f"write_through_threshold={getattr(self, 'write_through_threshold', 'N/A')}"
             )
 
+            # [ACK-LIFECYCLE] Wrap ack_write_queue with a logging list to
+            # catch ALL modifications (append, pop, clear, __init__).
+            _cc_for_wq = getattr(self, 'cache_controller', None)
+            if _cc_for_wq is not None and hasattr(_cc_for_wq, 'ack_write_queue'):
+                _orig_wq = _cc_for_wq.ack_write_queue
+                _cc_ref = _cc_for_wq
+                class _LoggingAckQueue(list):
+                    def append(self, item):
+                        r = super().append(item)
+                        if kda_obs.is_obs_enabled():
+                            kda_obs.log_event("wq_append",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"len": len(self),
+                                       "node_ids": list(getattr(item, 'node_ids', [])),
+                                       "cc_id": id(_cc_ref)})
+                        return r
+                    def pop(self, idx=0):
+                        if kda_obs.is_obs_enabled():
+                            kda_obs.log_event("wq_pop",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"len_before": len(self), "idx": idx,
+                                       "cc_id": id(_cc_ref)})
+                        return super().pop(idx)
+                    def clear(self):
+                        if kda_obs.is_obs_enabled():
+                            kda_obs.log_event("wq_clear",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"len_before": len(self),
+                                       "cc_id": id(_cc_ref)})
+                        return super().clear()
+                _logging_wq = _LoggingAckQueue(_orig_wq)
+                _cc_for_wq.ack_write_queue = _logging_wq
+
+            # [A2] Install ednn_trace hook AND inc/dec_lock_ref hooks on tree_core
+            _tc_ednn = getattr(self, 'tree_core', None)
+            if _tc_ednn is not None and kda_obs.is_obs_enabled():
+                _orig_ednn_inst = getattr(_tc_ednn, 'evict_device_next_node', None)
+                if _orig_ednn_inst is not None:
+                    def _wrapped_ednn(ct, tracker, orig=_orig_ednn_inst):
+                        result = orig(ct, tracker)
+                        _lru_info = {}
+                        try:
+                            from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _ECT
+                            if ct == _ECT.MAMBA:
+                                _lru = _tc_ednn.lru_lists.get(_ECT.MAMBA)
+                                _comp = _tc_ednn.components_by_type.get(_ECT.MAMBA)
+                                _cursor = getattr(_comp, '_evict_device_cursor', None)
+                                _session = getattr(_tc_ednn, 'enable_session_radix_cache', None)
+                                _nodes_info = []
+                                if _lru is not None:
+                                    _tail = getattr(_lru, 'tail', None)
+                                    _x = _tail.lru_prev[_lru._pt] if _tail else None
+                                    _count = 0
+                                    while _x is not None and _x != getattr(_lru, 'head', None) and _count < 10:
+                                        _cd = _x.component_data[_ECT.MAMBA]
+                                        _nodes_info.append({"id": getattr(_x, 'id', -1), "lock_ref": _cd.lock_ref})
+                                        _x = _x.lru_prev[_lru._pt]
+                                        _count += 1
+                                _lru_info = {"session": _session, "cursor_none": _cursor is None, "lru_nodes": _nodes_info}
+                        except Exception as _e:
+                            _lru_info = {"error": str(_e)[:150]}
+                        kda_obs.log_event("ednn_trace",
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"ct": getattr(ct, 'value', str(ct)),
+                                   "node_id": result.node_id if result.node_id else -1,
+                                   "made_progress": result.made_progress,
+                                   **_lru_info})
+                        return result
+                    _tc_ednn.evict_device_next_node = _wrapped_ednn
+                # Hook inc_lock_ref and dec_lock_ref
+                _orig_inc = getattr(_tc_ednn, 'inc_lock_ref', None)
+                _orig_dec = getattr(_tc_ednn, 'dec_lock_ref', None)
+                if _orig_inc is not None:
+                    def _wrapped_inc(node_id, *a, **kw):
+                        r = _orig_inc(node_id, *a, **kw)
+                        kda_obs.log_event("inc_lock_ref", node_id=node_id,
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"lock_ref": r.lock_ref if hasattr(r, 'lock_ref') else '?'})
+                        return r
+                    _tc_ednn.inc_lock_ref = _wrapped_inc
+                if _orig_dec is not None:
+                    def _wrapped_dec(node_id, *a, **kw):
+                        r = _orig_dec(node_id, *a, **kw)
+                        kda_obs.log_event("dec_lock_ref", node_id=node_id,
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"lock_ref": r.lock_ref if hasattr(r, 'lock_ref') else '?'})
+                        return r
+                    _tc_ednn.dec_lock_ref = _wrapped_dec
+                # Hook _finish_write_through_ack on the cache instance
+                _orig_fwt = getattr(self, '_finish_write_through_ack', None)
+                if _orig_fwt is not None:
+                    def _wrapped_fwt(ack_id, orig=_orig_fwt):
+                        _owt = getattr(self, 'ongoing_write_through', {})
+                        _has = ack_id in _owt
+                        kda_obs.log_event("fwt_ack_call",
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"ack_id": ack_id, "in_owt": _has,
+                                   "owt_size": len(_owt)})
+                        try:
+                            orig(ack_id)
+                            kda_obs.log_event("fwt_ack_done",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"ack_id": ack_id})
+                        except Exception as e:
+                            kda_obs.log_event("fwt_ack_error",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"ack_id": ack_id, "error": repr(e)[:200]})
+                            raise
+                    self._finish_write_through_ack = _wrapped_fwt
+                # [A2] Hook cache_finished_req to verify it's called
+                _orig_cfr = getattr(self, 'cache_finished_req', None)
+                if _orig_cfr is not None:
+                    def _wrapped_cfr(req, *a, **kw):
+                        _ln = getattr(req, 'last_node', None)
+                        _skip = getattr(req, 'skip_lock_node_ids', None)
+                        kda_obs.log_event("cache_finished_req",
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"last_node": _ln, "skip_ids": str(_skip)[:100],
+                                   "rid": getattr(req, 'rid', '')[:8]})
+                        try:
+                            r = _orig_cfr(req, *a, **kw)
+                            kda_obs.log_event("cache_finished_done",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"last_node": _ln})
+                            return r
+                        except Exception as e:
+                            kda_obs.log_event("cache_finished_error",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"last_node": _ln, "error": repr(e)[:200]})
+                            raise
+                    self.cache_finished_req = _wrapped_cfr
+
+                # [ACK-LIFECYCLE] Hook _execute_and_commit_kv_backup to trace
+                # write_back param, node_id, lock_ref transitions, owt transitions.
+                _orig_eckb = getattr(self, '_execute_and_commit_kv_backup', None)
+                if _orig_eckb is not None:
+                    def _wrapped_eckb(action, write_back=False, orig=_orig_eckb):
+                        _nids = list(getattr(action, 'node_ids', []) or [])
+                        _owt_before = len(getattr(self, 'ongoing_write_through', {}))
+                        _lr_before = {}
+                        _tc_eckb = getattr(self, 'tree_core', None)
+                        if _tc_eckb is not None:
+                            from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _ECKCT
+                            for _nid in _nids:
+                                try:
+                                    _n = _tc_eckb.node_by_id(_nid)
+                                    if _n is not None:
+                                        _cd = _n.component_data.get(_ECKCT.MAMBA)
+                                        _lr_before[_nid] = _cd.lock_ref if _cd else -1
+                                except Exception:
+                                    _lr_before[_nid] = -2
+                        if kda_obs.is_obs_enabled():
+                            kda_obs.log_event("eckb_call",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"node_ids": _nids, "write_back": write_back,
+                                       "owt_before": _owt_before,
+                                       "lr_before": str(_lr_before)})
+                        _r = orig(action, write_back=write_back)
+                        _owt_after = len(getattr(self, 'ongoing_write_through', {}))
+                        _lr_after = {}
+                        if _tc_eckb is not None:
+                            for _nid in _nids:
+                                try:
+                                    _n = _tc_eckb.node_by_id(_nid)
+                                    if _n is not None:
+                                        _cd = _n.component_data.get(_ECKCT.MAMBA)
+                                        _lr_after[_nid] = _cd.lock_ref if _cd else -1
+                                except Exception:
+                                    _lr_after[_nid] = -2
+                        if kda_obs.is_obs_enabled():
+                            kda_obs.log_event("eckb_done",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"node_ids": _nids, "write_back": write_back,
+                                       "owt_after": _owt_after,
+                                       "lr_after": str(_lr_after),
+                                       "written": _r})
+                        return _r
+                    self._execute_and_commit_kv_backup = _wrapped_eckb
+
+                # [ACK-LIFECYCLE] Hook _track_write_through_node to confirm
+                # pending registration (ack_id == node_id).
+                _orig_twt = getattr(self, '_track_write_through_node', None)
+                if _orig_twt is not None:
+                    def _wrapped_twt(node_id, lock_params=None, orig=_orig_twt):
+                        _owt_before = len(getattr(self, 'ongoing_write_through', {}))
+                        orig(node_id, lock_params)
+                        _owt_after = len(getattr(self, 'ongoing_write_through', {}))
+                        _has = node_id in getattr(self, 'ongoing_write_through', {})
+                        if kda_obs.is_obs_enabled():
+                            kda_obs.log_event("track_wt",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"node_id": node_id,
+                                       "lock_params": lock_params is not None,
+                                       "owt_before": _owt_before,
+                                       "owt_after": _owt_after,
+                                       "registered": _has})
+                    self._track_write_through_node = _wrapped_twt
+
+                # [ACK-LIFECYCLE] Hook writing_check to see when it runs,
+                # with what params, and ack_wq / owt transitions.
+                _orig_wc = getattr(self, 'writing_check', None)
+                if _orig_wc is not None:
+                    def _wrapped_wc(write_back=False, finish_count=None, orig=_orig_wc):
+                        _cc_wc = getattr(self, 'cache_controller', None)
+                        _wq_before = len(_cc_wc.ack_write_queue) if _cc_wc and hasattr(_cc_wc, 'ack_write_queue') else -1
+                        _owt_before = len(getattr(self, 'ongoing_write_through', {}))
+                        _cc_id_wc = id(_cc_wc) if _cc_wc else -1
+                        _wq_list_id_wc = id(_cc_wc.ack_write_queue) if _cc_wc and hasattr(_cc_wc, 'ack_write_queue') else -1
+                        if kda_obs.is_obs_enabled():
+                            kda_obs.log_event("writing_check_call",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"write_back": write_back,
+                                       "finish_count": finish_count,
+                                       "wq_before": _wq_before,
+                                       "owt_before": _owt_before,
+                                       "cc_id": _cc_id_wc,
+                                       "wq_list_id": _wq_list_id_wc})
+                        try:
+                            _r = orig(write_back=write_back, finish_count=finish_count)
+                        except Exception as _wce:
+                            if kda_obs.is_obs_enabled():
+                                kda_obs.log_event("writing_check_error",
+                                    virtual_time=StateManager.get_global_clock(),
+                                    extra={"error": repr(_wce)[:200]})
+                            raise
+                        _wq_after = len(_cc_wc.ack_write_queue) if _cc_wc and hasattr(_cc_wc, 'ack_write_queue') else -1
+                        _owt_after = len(getattr(self, 'ongoing_write_through', {}))
+                        if kda_obs.is_obs_enabled():
+                            kda_obs.log_event("writing_check_done",
+                                virtual_time=StateManager.get_global_clock(),
+                                extra={"write_back": write_back,
+                                       "wq_after": _wq_after,
+                                       "owt_after": _owt_after})
+                        return _r
+                    self.writing_check = _wrapped_wc
+
             # P0: Check tree_core hicache state and related params
             _tc0 = getattr(self, 'tree_core', None)
             if _tc0 is not None:
@@ -1900,42 +2247,87 @@ class C_HiRadixCacheHook(BaseHook):
 
         def wrapped_count_ready_acks(self, ack_queue):
             try:
-                return len(ack_queue)
+                _n = len(ack_queue)
+                if kda_obs.is_obs_enabled() and _n > 0:
+                    kda_obs.log_event("count_ready_acks",
+                        virtual_time=StateManager.get_global_clock(),
+                        extra={"count": _n, "q_id": id(ack_queue),
+                               "cc_id": id(getattr(self, 'cache_controller', None)),
+                               "q_type": type(ack_queue).__name__})
+                return _n
             except TypeError:
                 return 0
 
         def wrapped_check_hicache_events(self, *args, **kwargs):
             _cn = getattr(self, '_hicache_cn', 0) + 1
             self._hicache_cn = _cn
+            # [ACK-LIFECYCLE-FIX] Always run original_check_hicache_events
+            # (native SGLang runs it every iteration). The previous cn%10 gate
+            # delayed writing_check (which processes ACKs and releases backup
+            # locks). When slots are full, the scheduler can't schedule new
+            # requests, and the delayed ACK processing causes a deadlock:
+            # slots full → can't schedule → ACKs not processed → locks not
+            # released → slots stay full.
+            # Logging is gated to cn%100 to reduce output volume.
+            _log_diag = (_cn % 100 == 0)
+            try:
+                if _log_diag:
+                    _cc_diag = getattr(self, 'cache_controller', None)
+                    _wq_size = len(_cc_diag.ack_write_queue) if _cc_diag and hasattr(_cc_diag, 'ack_write_queue') else -1
+                    _owt_size = len(getattr(self, 'ongoing_write_through', {}))
+                    if kda_obs.is_obs_enabled():
+                        kda_obs.log_event("pre_check_hicache",
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"ack_wq": _wq_size, "owt": _owt_size, "cn": _cn})
+                original_check_hicache_events(self, *args, **kwargs)
+                if _log_diag:
+                    _cc_diag = getattr(self, 'cache_controller', None)
+                    _wq_after = len(_cc_diag.ack_write_queue) if _cc_diag and hasattr(_cc_diag, 'ack_write_queue') else -1
+                    _owt_after = len(getattr(self, 'ongoing_write_through', {}))
+                    if kda_obs.is_obs_enabled():
+                        kda_obs.log_event("post_check_hicache",
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"ack_wq": _wq_after, "owt": _owt_after, "cn": _cn})
+            except Exception as e:
+                    import traceback as _tb
+                    if kda_obs.is_obs_enabled():
+                        kda_obs.log_event("check_hicache_error",
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"error": repr(e)[:200], "tb": _tb.format_exc()[-400:]})
+                    logger.debug(f"check_hicache_events partial failure: {e}")
             # Proactive eviction: self IS the UnifiedRadixCache instance.
-            # Disabled when HISIM_DISABLE_PROACTIVE_EVICT is set (L1-only experiments
-            # where cache retention between Build/Reuse/Churn phases is required).
-            # Capacity-driven LRU eviction still works naturally when KV pool is full.
             _disable_proactive_evict = os.environ.get("HISIM_DISABLE_PROACTIVE_EVICT", "")
             if not _disable_proactive_evict:
                 try:
                     _es = self.evictable_size() if hasattr(self, 'evictable_size') else 0
                 except Exception:
                     _es = 0
-                if _es > 0:
-                    logger.info(f"check_hicache cn={_cn} es={_es}")
-                if _es > 0:
+                _ms = 0
+                try:
+                    _ms = self.mamba_evictable_size() if hasattr(self, 'mamba_evictable_size') else 0
+                except Exception:
+                    _ms = 0
+                # [ACK-LIFECYCLE-FIX] Use native evictable counter as primary
+                # decision source. HiSim counter is diagnostic only.
+                # Previously HiSim counter replaced native due to timing mismatch,
+                # but now that ACK lifecycle is fixed (check_hicache_events runs
+                # every iteration), the native counter is reliable.
+                _hism_ms = kda_obs.get_mamba_evictable()
+                if kda_obs.is_obs_enabled() and _cn % 100 == 0:
+                    kda_obs.log_event("proactive_evict_check",
+                        virtual_time=StateManager.get_global_clock(),
+                        extra={"es": _es, "ms": _ms, "hism_ms": _hism_ms, "cn": _cn})
+                if _es > 0 or _ms > 0:
                     try:
                         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
-                        self.evict(EvictParams(num_tokens=_es, mamba_num=_es))
+                        self.evict(EvictParams(num_tokens=_es, mamba_num=_ms))
                         logger.info(
-                            f"Proactive evict (check_hicache): {_es} tokens+mamba demoted to L2, "
+                            f"Proactive evict (check_hicache): tokens={_es} mamba={_ms}, "
                             f"L1_avail={self.token_to_kv_pool_allocator.available_size() if hasattr(self, 'token_to_kv_pool_allocator') else -1}, "
                             f"cn={_cn}"
                         )
                     except Exception as e:
                         logger.warning(f"Proactive evict failed: {e}")
-            if _cn % 10 != 0:
-                return
-            try:
-                original_check_hicache_events(self, *args, **kwargs)
-            except Exception as e:
-                logger.debug(f"check_hicache_events partial failure: {e}")
 
         target.init_hicache = wrapped_init_hicache
         target.check_hicache_events = wrapped_check_hicache_events
@@ -1944,6 +2336,7 @@ class C_HiRadixCacheHook(BaseHook):
 
         # P2: Observe match_prefix result fields for L2 load-back diagnosis.
         # Do NOT modify host_hit_length — just log for diagnosis.
+        # [v2-fix] Also store per-rid match result for Phase 1 metrics.
         original_match_prefix = target.match_prefix
         def wrapped_match_prefix(self, params, orig=original_match_prefix):
             result = orig(self, params)
@@ -1961,12 +2354,167 @@ class C_HiRadixCacheHook(BaseHook):
                     f"mamba_host={_mhost} last_dev={_ldn} last_host={_lhn} "
                     f"best_match={_bmn}({type(_bmn).__name__})"
                 )
+                # [v2-fix A1] Store per-rid match result for Phase 1 metrics
+                if kda_obs.is_obs_enabled():
+                    _rid = getattr(params, 'rid', None) or str(getattr(params, 'request_id', ''))
+                    if _rid:
+                        kda_obs.store_match_result(
+                            rid=_rid,
+                            full_kv_hit=_full,
+                            device_hit=_dev,
+                            host_hit=_host,
+                            mamba_host_hit=int(_mhost) if _mhost is not None else 0,
+                            best_match_node=int(_bmn) if _bmn is not None else -1,
+                        )
 
             except Exception as e:
                 logger.warning(f"P2 match_prefix error: {e}")
             return result
         target.match_prefix = wrapped_match_prefix
         logger.debug("Wrapped match_prefix to compute host_hit_length")
+
+        # [A2] Hook evict() to trace the full eviction chain
+        original_evict = getattr(target, 'evict', None)
+        if original_evict is not None and kda_obs.is_obs_enabled():
+            def wrapped_evict(self, params, orig=original_evict):
+                _nt = getattr(params, 'num_tokens', 0)
+                _mn = getattr(params, 'mamba_num', 0)
+                _rtp = getattr(self, 'req_to_token_pool', None)
+                _ma = getattr(_rtp, 'mamba_allocator', None) if _rtp else None
+                _before_avail = _ma.available_size() if _ma else -1
+                # [A2] Log tree_components to check if MAMBA is included
+                _tc_ev = getattr(self, 'tree_core', None)
+                _tcs = []
+                if _tc_ev is not None:
+                    try:
+                        _tcs = [getattr(ct, 'value', str(ct)) for ct in _tc_ev.component_types]
+                    except Exception:
+                        pass
+                kda_obs.log_event("evict_call",
+                    virtual_time=StateManager.get_global_clock(),
+                    extra={"num_tokens": _nt, "mamba_num": _mn,
+                           "mamba_avail_before": _before_avail,
+                           "tree_components": _tcs})
+                result = orig(self, params)
+                _after_avail = _ma.available_size() if _ma else -1
+                _evicted_mamba = getattr(result, 'mamba_num_evicted', 0)
+                _evicted_tokens = getattr(result, 'num_tokens_evicted', 0)
+                kda_obs.log_event("evict_done",
+                    virtual_time=StateManager.get_global_clock(),
+                    extra={"mamba_avail_after": _after_avail,
+                           "mamba_evicted": _evicted_mamba,
+                           "tokens_evicted": _evicted_tokens,
+                           "avail_delta": _after_avail - _before_avail})
+                return result
+            target.evict = wrapped_evict
+            logger.debug("Wrapped evict for eviction chain tracing")
+
+            # [A2] Hook tree_core.evict_device_next_node to trace cursor state
+            _orig_ednn = getattr(target.tree_core, 'evict_device_next_node', None) if target.tree_core else None
+            if _orig_ednn is not None and kda_obs.is_obs_enabled():
+                def wrapped_ednn(self_tc, component_type, tracker, orig=_orig_ednn):
+                    _ct_val = getattr(component_type, 'value', str(component_type))
+                    result = orig(self_tc, component_type, tracker)
+                    _nid = result.node_id if result.node_id else -1
+                    _dev_frees = {str(k): len(v) for k, v in result.device_frees.items()} if result.device_frees else {}
+                    _tracker_delta = dict(result.tracker) if result.tracker else {}
+                    kda_obs.log_event("ednn_trace",
+                        virtual_time=StateManager.get_global_clock(),
+                        extra={"ct": _ct_val, "node_id": _nid,
+                               "made_progress": result.made_progress,
+                               "device_frees": _dev_frees,
+                               "tracker_delta": _tracker_delta})
+                    return result
+                target.tree_core.evict_device_next_node = wrapped_ednn
+
+        # [v2-fix A1] Hook init_load_back to verify L2→L1 restoration timing
+        original_init_load_back = getattr(target, 'init_load_back', None)
+        if original_init_load_back is not None:
+            def wrapped_init_load_back(self, params, orig=original_init_load_back):
+                _rid = ""
+                _bmn = -1
+                _hhl = 0
+                _mhl = 0
+                try:
+                    _req = getattr(params, 'req', None)
+                    if _req is not None:
+                        _rid = getattr(_req, 'rid', '')
+                    _bmn = getattr(params, 'best_match_node', -1) or -1
+                    _hhl = getattr(params, 'host_hit_length', 0) or 0
+                    _mhl = getattr(_req, 'mamba_host_hit_length', 0) or 0 if _req is not None else 0
+                except Exception:
+                    pass
+                # Pre-call: check node MAMBA state
+                _pre_mamba_val = None
+                _pre_mamba_hval = None
+                try:
+                    _tc = getattr(self, 'tree_core', None)
+                    if _tc is not None and _bmn >= 0:
+                        _node = _tc.node_by_id(_bmn)
+                        if _node is not None:
+                            _cd = _node.component_data
+                            from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _CT
+                            _mc = _cd[_CT.MAMBA] if len(_cd) > _CT.MAMBA else None
+                            if _mc is not None:
+                                _pre_mamba_val = "set" if _mc.value is not None else "None"
+                                _pre_mamba_hval = "set" if _mc.host_value is not None else "None"
+                except Exception:
+                    pass
+                result = orig(self, params)
+                # Post-call: check node MAMBA state
+                _post_mamba_val = None
+                _post_indices_len = 0
+                try:
+                    _tc = getattr(self, 'tree_core', None)
+                    if _tc is not None and _bmn >= 0:
+                        _node = _tc.node_by_id(_bmn)
+                        if _node is not None:
+                            _cd = _node.component_data
+                            from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _CT
+                            _mc = _cd[_CT.MAMBA] if len(_cd) > _CT.MAMBA else None
+                            if _mc is not None:
+                                _post_mamba_val = "set" if _mc.value is not None else "None"
+                    _post_indices_len = len(result[0]) if result and result[0] is not None else 0
+                except Exception:
+                    pass
+                if kda_obs.is_obs_enabled():
+                    # Determine KDA tier from pre-call state
+                    if _bmn < 0:
+                        _kda_tier = "miss"
+                    elif _pre_mamba_val == "set":
+                        _kda_tier = "L1"
+                    elif _pre_mamba_hval == "set":
+                        _kda_tier = "L2"
+                    else:
+                        _kda_tier = "L3"
+                    # Store match result (init_load_back has rid, unlike match_prefix)
+                    if _bmn >= 0:
+                        kda_obs.store_match_result_minimal(
+                            _rid, _bmn, host_hit=_hhl, mamba_host_hit=_mhl)
+                        # [A2] For L1 hit, mark shadow as ready (no transfer needed)
+                        if _kda_tier == "L1":
+                            kda_obs.shadow_mark_ready(f"kda_{_bmn}_0", tier="L1")
+                    kda_obs.update_match_result(_rid, "init_load_back_tier", _kda_tier)
+                    kda_obs.log_event(
+                        "init_load_back", rid=_rid,
+                        virtual_time=StateManager.get_global_clock(),
+                        node_id=_bmn,
+                        extra={"host_hit": _hhl, "mamba_host_hit": _mhl,
+                               "pre_mamba_value": _pre_mamba_val,
+                               "pre_mamba_host_value": _pre_mamba_hval,
+                               "post_mamba_value": _post_mamba_val,
+                               "restored_indices": _post_indices_len,
+                               "kda_tier": _kda_tier},
+                    )
+                    logger.info(
+                        f"[ILB] rid={_rid[:8]} node={_bmn} tier={_kda_tier} "
+                        f"host_hit={_hhl} mamba_host_hit={_mhl} "
+                        f"pre_val={_pre_mamba_val} pre_hval={_pre_mamba_hval} "
+                        f"post_val={_post_mamba_val} restored={_post_indices_len}"
+                    )
+                return result
+            target.init_load_back = wrapped_init_load_back
+            logger.debug("Wrapped init_load_back for L2 restoration tracking")
 
         # HiSim runs as a single CPU process (TP=1): no cross-rank distributed
         # all_reduce is needed. The real _all_reduce can hang inside
@@ -2388,6 +2936,42 @@ class C_SchedulerHook(BaseHook):
             # No prefill preemption guard: the scheduler's native batching
             # policy (enable_mixed_chunk, etc.) determines concurrency.
 
+            # [A2-fix] Force mamba eviction when pool doesn't have enough slots
+            # for a new request (needs 3: 1 running + 2 pp) and there are
+            # evictable mamba checkpoints in the radix tree.
+            if kda_obs.is_obs_enabled():
+                try:
+                    _rtp = getattr(self, 'req_to_token_pool', None)
+                    _tc = getattr(self, 'tree_cache', None)
+                    _wq = getattr(self, 'waiting_queue', None)
+                    if _rtp is not None and _tc is not None and _wq and len(_wq) > 0:
+                        _ma = getattr(_rtp, 'mamba_allocator', None)
+                        if _ma is not None and _ma.available_size() < 4:
+                            _mes = kda_obs.get_mamba_evictable()  # Use HiSim counter
+                            if kda_obs.is_obs_enabled():
+                                kda_obs.log_event(
+                                    "force_evict_check",
+                                    virtual_time=StateManager.get_global_clock(),
+                                    extra={"mamba_avail": _ma.available_size(),
+                                           "mamba_evictable": _mes,
+                                           "waiting": len(_wq)})
+                            if _mes > 0:
+                                from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+                                _tc.evict(EvictParams(num_tokens=0, mamba_num=_mes))
+                                kda_obs.dec_mamba_evictable(_mes)
+                                logger.info(
+                                    f"[A2-FORCE-EVICT] mamba_avail={_ma.available_size()} "
+                                    f"< 4, evicted {_mes} mamba slots, "
+                                    f"waiting={len(_wq)}"
+                                )
+                                if kda_obs.is_obs_enabled():
+                                    kda_obs.log_event(
+                                        "force_evict", virtual_time=StateManager.get_global_clock(),
+                                        extra={"mamba_avail_before": _ma.available_size() + _mes,
+                                               "evicted": _mes, "waiting": len(_wq)})
+                except Exception as e:
+                    logger.debug(f"[A2-FORCE-EVICT] error: {e}")
+
             new_batch = original_get_new_batch_prefill(self, *args, **kwargs)
             now = time.time()
             # sglang 0.5.18: returns NextBatchPlan with .batch_to_run
@@ -2437,6 +3021,74 @@ class C_SchedulerHook(BaseHook):
                         # (kda_<node>_<i>). Do NOT fish arbitrary LRU keys out
                         # of the L2 pool: that restored unrelated checkpoints
                         # and double-counted the H2D timing.
+                    # [v2-fix A1] Direct node MAMBA state check after match+init_load_back
+                    # This provides runtime evidence (not just source code tracing) that
+                    # init_load_back restored MAMBA value before set_extend_range.
+                    if kda_obs.is_obs_enabled():
+                        _tc = getattr(self, 'tree_cache', None)
+                        _tc_core = getattr(_tc, 'tree_core', None) if _tc is not None else None
+                        for req in actual_batch.reqs:
+                            _mr = kda_obs.get_match_result(req.rid)
+                            _bmn = _mr.get("best_match_node", -1)
+                            if _tc_core is not None and _bmn >= 0:
+                                try:
+                                    _node = _tc_core.node_by_id(_bmn)
+                                    if _node is not None:
+                                        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _CT
+                                        _cd = _node.component_data
+                                        _mc = _cd[_CT.MAMBA] if len(_cd) > _CT.MAMBA else None
+                                        _fv = _cd[_CT.FULL] if len(_cd) > _CT.FULL else None
+                                        _mamba_val = "set" if (_mc is not None and _mc.value is not None) else "None"
+                                        _mamba_hval = "set" if (_mc is not None and _mc.host_value is not None) else "None"
+                                        _full_val = "set" if (_fv is not None and _fv.value is not None) else "None"
+                                        _full_hval = "set" if (_fv is not None and _fv.host_value is not None) else "None"
+                                        _er = getattr(req, 'extend_range', None)
+                                        _ext_len = getattr(_er, 'length', 0) if _er else 0
+                                        _prefix_len = len(getattr(req, 'prefix_indices', []))
+                                        _cow_src = req_mamba_get(req, 'mamba_cow_src_index', None)
+                                        logger.info(
+                                            f"[NODE-STATE] rid={req.rid[:8]} node={_bmn} "
+                                            f"MAMBA val={_mamba_val} hval={_mamba_hval} "
+                                            f"FULL val={_full_val} hval={_full_hval} "
+                                            f"prefix={_prefix_len} extend={_ext_len} "
+                                            f"cow_src={'set' if _cow_src is not None else 'None'}"
+                                        )
+                                        kda_obs.log_event(
+                                            "node_state", rid=req.rid,
+                                            virtual_time=StateManager.get_global_clock(),
+                                            node_id=_bmn,
+                                            extra={"mamba_value": _mamba_val,
+                                                   "mamba_host_value": _mamba_hval,
+                                                   "full_value": _full_val,
+                                                   "full_host_value": _full_hval,
+                                                   "prefix_len": _prefix_len,
+                                                   "extend_len": _ext_len,
+                                                   "cow_src": 'set' if _cow_src is not None else 'None'},
+                                        )
+                                        # [A2] Shadow forward_consume + tier hit
+                                        _slot_hash = f"kda_{_bmn}_0"
+                                        _ver = kda_obs.shadow_verify(req.rid, _slot_hash)
+                                        kda_obs.shadow_mark_forward_consume(req.rid, _slot_hash)
+                                        # Determine KDA tier hit from init_load_back event
+                                        _ilb = kda_obs.get_match_result(req.rid).get("init_load_back_tier", "")
+                                        if _mamba_val == "set" and _mamba_hval == "set" and not _ilb:
+                                            _kda_tier = "L1"
+                                        elif _ilb == "L2":
+                                            _kda_tier = "L2"
+                                        elif _ilb == "L3":
+                                            _kda_tier = "L3"
+                                        elif _prefix_len > 0:
+                                            _kda_tier = "unknown"
+                                        else:
+                                            _kda_tier = "miss"
+                                        logger.info(
+                                            f"[FWD-CONSUME] rid={req.rid[:8]} tier={_kda_tier} "
+                                            f"identity_ok={_ver.get('identity_ok',False)} "
+                                            f"ready={_ver.get('ready',False)} "
+                                            f"shadow_state={_ver.get('state','n/a')}"
+                                        )
+                                except Exception as e:
+                                    logger.debug(f"[NODE-STATE] error: {e}")
                     # KDA COW/Replay diagnostics: check mamba_cow_src_index and
                     # mamba_branching_seqlen set during init_next_round_input→match_prefix
                     for req in actual_batch.reqs:
@@ -2454,19 +3106,24 @@ class C_SchedulerHook(BaseHook):
                                 _kda_diag['cow_exec_count'] += 1
                                 _kda_diag['checkpoint_position'] = _prefix_len
                                 _kda_diag['prefix_length'] = _prefix_len
-                                _rt = max(0, _prefix_len - _prefix_len)  # COW covers full prefix
-                                _kda_diag['historical_replay_tokens'] += _rt
+                                # [v2-fix A1] COW hit: replay=0, no accumulation here
+                                # (actual accumulation done in COW-EXEC-SIM in wrapped_run_batch)
                                 logger.info(f"[KDA-COW-HIT] rid={req.rid} prefix_len={_prefix_len} cow_src={_cow_src} replay_tokens=0")
                             else:
                                 # No COW → replay needed
+                                # [v2-fix A1] Do NOT accumulate historical_replay_tokens here.
+                                # This is a preliminary check; actual accumulation is in
+                                # REPLAY-FALLBACK (wrapped_run_batch) to avoid double-counting.
                                 if _branching is not None:
                                     _replay = max(0, _prefix_len - _branching)
                                 else:
                                     _replay = _prefix_len
-                                _kda_diag['replay_fallback_count'] = (_kda_diag.get('replay_fallback_count', 0)) + 1
-                                _kda_diag['historical_replay_tokens'] += _replay
                                 _kda_diag['no_cow_count'] = (_kda_diag.get('no_cow_count', 0)) + 1
                                 logger.info(f"[KDA-REPLAY] rid={req.rid} prefix_len={_prefix_len} branching={_branching} replay_tokens={_replay} cow_src=None")
+                            # [v2-fix A1] Per-req metrics are now populated in wrapped_run_batch
+                            # (COW-EXEC-SIM or REPLAY-FALLBACK) after the final COW/replay
+                            # decision is made. Populating here is premature because cow_src
+                            # can change between get_new_batch_prefill and run_batch.
                     # Log cache state per prefill batch (L1/L2 pool sizes)
                     tc = getattr(self, 'tree_cache', None)
                     l1_evict = l1_total = l2_avail = 0
@@ -2706,6 +3363,46 @@ class C_SchedulerHook(BaseHook):
                             f"checkpoint_pos={_cp} prefix_len={_pl} "
                             f"replay_tokens={_rt} new_tokens={_nl}"
                         )
+                        # [v2-fix A1] Populate per-req metrics for COW hit
+                        if kda_obs.is_obs_enabled() and _req is not None:
+                            _mr = kda_obs.get_match_result(_req.rid)
+                            _mla_pot = _mr.get("full_kv_hit", _pl)
+                            _mhost = _mr.get("mamba_host_hit", 0)
+                            _total_in = len(getattr(_req, 'origin_input_ids', []))
+                            _kda_l1 = _pl  # COW hit → checkpoint at matched node
+                            _kda_l2 = _pl if _mhost > 0 else 0
+                            _kda_best = max(_kda_l1, _kda_l2)
+                            _req_st = C_SchedulerHook.REQUEST_STATS.get(_req.rid)
+                            if _req_st is not None:
+                                _req_st.mla_potential_hit_tokens = _mla_pot
+                                _req_st.kda_l1_recoverable_position = _kda_l1
+                                _req_st.kda_l2_recoverable_position = _kda_l2
+                                _req_st.kda_cow_src_slot = _ss
+                                _req_st.effective_prefix_hit_tokens = min(_mla_pot, _kda_best)
+                                _req_st.retreat_gap_tokens = max(0, _mla_pot - _kda_best)
+                                _req_st.actual_extra_recompute_tokens = 0  # COW covers, no replay
+                                _req_st.scheduled_extend_tokens = _nl
+                                _req_st.unavoidable_new_tokens = max(0, _total_in - _mla_pot)
+                                _req_st.predictor_input_tokens = _nl
+                                # Legacy aliases
+                                _req_st.kda_replay_tokens = 0
+                                _req_st.kda_new_tokens = _nl
+                                _req_st.kda_l1_hit = True
+                                _req_st.kda_l2_hit = _kda_l2 > 0
+                                _req_st.kda_recoverable_position = _kda_best
+                                # [A2] New metrics
+                                _req_st.scheduler_effective_hit_tokens = int(getattr(_req, 'cached_tokens', 0) or _pl)
+                                _req_st.verified_logical_reuse = True  # COW = device-resident
+                                _req_st.historical_tokens_actually_scheduled = 0
+                                _req_st.kda_restore_tier = "L1"
+                                _req_st.kda_restore_latency_ms = 0.0  # D2D, no H2D
+                            kda_obs.log_event(
+                                "cow_exec", rid=_req.rid,
+                                virtual_time=StateManager.get_global_clock(),
+                                checkpoint_pos=_cp, layer="L1",
+                                extra={"mla_potential": _mla_pot, "retreat_gap": 0,
+                                       "replay_tokens": 0, "extend_tokens": _nl},
+                            )
                     # Clear deferred COW
                     batch.mamba_cow_src_indices = None
                     batch.mamba_cow_dst_indices = None
@@ -2739,18 +3436,126 @@ class C_SchedulerHook(BaseHook):
                             _prefix_len = len(getattr(_req, 'prefix_indices', []))
                             _mpi = req_mamba_get(_req, 'mamba_pool_idx', None)
                             if _prefix_len > 0 and _mpi is not None:
-                                # Prefill with prefix match but no COW → replay needed
-                                if _branching is not None:
-                                    _replay = max(0, _prefix_len - _branching)
+                                # [v2-fix A1] CORRECTED: No COW does NOT mean replay needed.
+                                # sglang 0.5.19 has TWO restoration paths:
+                                #   1. COW: copies device-resident checkpoint to new slot (cow_src set)
+                                #   2. init_load_back → load_back → commit_load_back: restores
+                                #      from L2 host to L1 device BEFORE set_extend_range
+                                #      (schedule_policy.py:L1290 before L1337)
+                                # If init_load_back succeeded, prefix_indices was extended
+                                # and extend_range.length = total - prefix_len (small).
+                                # No replay needed in this case.
+                                #
+                                # The OLD code assumed prefix_len > 0 + cow_src None = replay
+                                # needed, but this is a FALSE POSITIVE when load_back succeeded.
+                                #
+                                # Correct check: if extend_range.length is small (= total - prefix_len),
+                                # the state was restored (either COW or load_back), no replay.
+                                _er = getattr(_req, 'extend_range', None)
+                                _ext_len = getattr(_er, 'length', 0) if _er else 0
+                                _total_in = len(getattr(_req, 'origin_input_ids', []))
+                                _expected_ext_if_restored = _total_in - _prefix_len
+                                _is_restored = (_ext_len <= _expected_ext_if_restored + 1)  # +1 tolerance
+                                if _is_restored:
+                                    _replay = 0  # State restored via load_back, no replay needed
+                                    logger.info(
+                                        f"[REPLAY-FALLBACK] rid={_req.rid} prefix_len={_prefix_len} "
+                                        f"branching={_branching} replay_tokens=0 (load_back restored) "
+                                        f"cow_src={getattr(_req, 'mamba_cow_src_index', None)} "
+                                        f"extend={_ext_len}"
+                                    )
                                 else:
-                                    _replay = _prefix_len
-                                _kda_diag['historical_replay_tokens'] += _replay
+                                    # State NOT restored — extend_range is larger than expected
+                                    # This means init_load_back failed or wasn't called
+                                    if _branching is not None:
+                                        _replay = max(0, _prefix_len - _branching)
+                                    else:
+                                        _replay = _prefix_len
+                                    _kda_diag['historical_replay_tokens'] += _replay
+                                    logger.info(
+                                        f"[REPLAY-FALLBACK] rid={_req.rid} prefix_len={_prefix_len} "
+                                        f"branching={_branching} replay_tokens={_replay} "
+                                        f"cow_src={getattr(_req, 'mamba_cow_src_index', None)} "
+                                        f"extend={_ext_len} (NOT restored)"
+                                    )
                                 _kda_diag['replay_fallback_count'] = (_kda_diag.get('replay_fallback_count', 0)) + 1
-                                logger.info(
-                                    f"[REPLAY-FALLBACK] rid={_req.rid} prefix_len={_prefix_len} "
-                                    f"branching={_branching} replay_tokens={_replay} "
-                                    f"cow_src={getattr(_req, 'mamba_cow_src_index', None)}"
-                                )
+                                # [v2-fix A1] Populate per-req metrics for REPLAY-FALLBACK
+                                if kda_obs.is_obs_enabled():
+                                    _mr = kda_obs.get_match_result(_req.rid)
+                                    _mla_pot = _mr.get("full_kv_hit", _prefix_len)
+                                    _kda_l1 = 0  # No COW → no L1 checkpoint at match time
+                                    # If load_back restored, L2 checkpoint was used (prefix_len > 0)
+                                    _kda_l2 = _prefix_len if _prefix_len > 0 else 0
+                                    _kda_best = max(_kda_l1, _kda_l2)
+                                    _req_st = C_SchedulerHook.REQUEST_STATS.get(_req.rid)
+                                    if _req_st is not None:
+                                        _req_st.mla_potential_hit_tokens = _mla_pot
+                                        _req_st.kda_l1_recoverable_position = _kda_l1
+                                        _req_st.kda_l2_recoverable_position = _kda_l2
+                                        _req_st.kda_cow_src_slot = -1
+                                        _req_st.effective_prefix_hit_tokens = min(_mla_pot, _kda_best)
+                                        _req_st.retreat_gap_tokens = max(0, _mla_pot - _kda_best)
+                                        # [v2-fix] actual_extra_recompute = 0 if restored, _replay if not
+                                        _req_st.actual_extra_recompute_tokens = _replay
+                                        _req_st.scheduled_extend_tokens = _ext_len
+                                        _req_st.unavoidable_new_tokens = max(0, _total_in - _mla_pot)
+                                        _req_st.predictor_input_tokens = _ext_len
+                                        _req_st.kda_replay_tokens = _replay
+                                        _req_st.kda_new_tokens = max(0, _total_in - _mla_pot)
+                                        _req_st.kda_l1_hit = False
+                                        _req_st.kda_l2_hit = _kda_l2 > 0
+                                        _req_st.kda_recoverable_position = _kda_best
+                                        # [A2] New metrics
+                                        _req_st.scheduler_effective_hit_tokens = int(getattr(_req, 'cached_tokens', 0) or _prefix_len)
+                                        _ilb_tier = _mr.get("init_load_back_tier", "L2" if _is_restored else "unknown")
+                                        _req_st.kda_restore_tier = _ilb_tier
+                                        _req_st.historical_tokens_actually_scheduled = _replay
+                                        _slot_hash = f"kda_{_mr.get('best_match_node', -1)}_0"
+                                        _ver = kda_obs.shadow_verify(_req.rid, _slot_hash)
+                                        _req_st.verified_logical_reuse = bool(
+                                            _ver.get("identity_ok", False) and
+                                            _ver.get("ready", False))
+                                    kda_obs.log_event(
+                                        "replay_fallback", rid=_req.rid,
+                                        virtual_time=StateManager.get_global_clock(),
+                                        checkpoint_pos=_kda_best, layer="L2" if _kda_l2 > 0 else "",
+                                        extra={"mla_potential": _mla_pot,
+                                               "retreat_gap": max(0, _mla_pot - _kda_best),
+                                               "replay_tokens": _replay,
+                                               "extend_tokens": _ext_len,
+                                               "predictor_input": _ext_len,
+                                               "restored": _is_restored,
+                                               "kda_tier": _ilb_tier,
+                                               "verified": _req_st.verified_logical_reuse if _req_st else False},
+                                    )
+                            else:
+                                # [A2] All-Miss: no prefix match, full prefill
+                                if kda_obs.is_obs_enabled():
+                                    _total_in = len(getattr(_req, 'origin_input_ids', []))
+                                    _er = getattr(_req, 'extend_range', None)
+                                    _ext_len = getattr(_er, 'length', _total_in) if _er else _total_in
+                                    _req_st = C_SchedulerHook.REQUEST_STATS.get(_req.rid)
+                                    if _req_st is not None:
+                                        _req_st.mla_potential_hit_tokens = 0
+                                        _req_st.kda_l1_recoverable_position = 0
+                                        _req_st.kda_l2_recoverable_position = 0
+                                        _req_st.kda_cow_src_slot = -1
+                                        _req_st.effective_prefix_hit_tokens = 0
+                                        _req_st.retreat_gap_tokens = 0
+                                        _req_st.actual_extra_recompute_tokens = 0
+                                        _req_st.scheduled_extend_tokens = _ext_len
+                                        _req_st.unavoidable_new_tokens = _total_in
+                                        _req_st.predictor_input_tokens = _ext_len
+                                        _req_st.scheduler_effective_hit_tokens = 0
+                                        _req_st.verified_logical_reuse = False
+                                        _req_st.historical_tokens_actually_scheduled = 0
+                                        _req_st.kda_restore_tier = "miss"
+                                    kda_obs.log_event(
+                                        "all_miss", rid=_req.rid,
+                                        virtual_time=StateManager.get_global_clock(),
+                                        extra={"total_input": _total_in,
+                                               "extend_tokens": _ext_len},
+                                    )
 
             ret = original_run_batch(self, *args, **kwargs)
 
@@ -3084,13 +3889,19 @@ class C_SchedulerHook(BaseHook):
                     metrics["kda_new_tokens"] = _kda_diag.get('new_tokens', 0)
 
                 # KDA pool instantaneous stats (snapshot at dump time)
-                _kda_pool = getattr(C_SchedulerHook, '_kda_pool', None)
-                if _kda_pool is not None and _kda_pool and hasattr(_kda_pool, 'get_stats'):
-                    _kps = _kda_pool.get_stats()
-                    metrics["kda_active_slots"] = _kps.get('used', 0)
-                    metrics["kda_alloc_count"] = _kps.get('alloc', 0)
-                    metrics["kda_evict_count"] = _kps.get('evict', 0)
-                    metrics["kda_free_slots"] = _kps.get('free', 0)
+                # [v2-fix F3] Read from active _StrictMambaAllocator, not dead _kda_pool
+                _rtp = getattr(self, 'req_to_token_pool', None)
+                _active_alloc = getattr(_rtp, 'mamba_allocator', None) if _rtp is not None else None
+                if _active_alloc is not None and hasattr(_active_alloc, 'get_stats'):
+                    try:
+                        _aps = _active_alloc.get_stats()
+                        metrics["kda_active_slots"] = _aps.get("capacity", 0) - _aps.get("available", 0)
+                        metrics["kda_alloc_count"] = _aps.get("alloc_count", 0)
+                        metrics["kda_free_count"] = _aps.get("free_count", 0)
+                        metrics["kda_free_slots"] = _aps.get("available", 0)
+                        metrics["kda_pool_capacity"] = _aps.get("capacity", 0)
+                    except Exception:
+                        pass  # allocator not yet initialized
                 _kda_host_pool = getattr(C_SchedulerHook, '_kda_host_pool', None)
                 if _kda_host_pool is not None and _kda_host_pool and hasattr(_kda_host_pool, 'get_stats'):
                     _khs = _kda_host_pool.get_stats()
@@ -3192,6 +4003,16 @@ class C_SchedulerHook(BaseHook):
 
                 try:
                     _suffix = f"_phase{_phase}" if _phase is not None else ""
+                    # [A2] Shadow state snapshot
+                    if kda_obs.is_obs_enabled():
+                        _shadow_snap = kda_obs.shadow_get_all()
+                        metrics["kda_shadow_checkpoints"] = len(_shadow_snap)
+                        metrics["kda_shadow_states"] = {
+                            k: v.get("state", "unknown")
+                            for k, v in _shadow_snap.items()
+                        }
+                        with open(f"{output_dir}/shadow_state{_suffix}.json", "w") as f:
+                            f.write(json.dumps(_shadow_snap, cls=CustomJsonEncoder) + "\n")
                     with open(f"{output_dir}/metrics{_suffix}.json", "w") as f:
                         f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
 
