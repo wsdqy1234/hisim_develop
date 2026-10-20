@@ -1717,6 +1717,9 @@ class C_HiRadixCacheHook(BaseHook):
                                     _l3_dur = _kv_bytes / _disk_read_bw if _di is not None else 0
                                     # [v2-fix F4] Use MLA L3 counter, not KDA counter
                                     StateManager.inc_hicache_l3_load_dur(_l3_dur)
+                                    # [A4] Log MLA L3 load (separate from KDA counter)
+                                    logger.info(f"[A4-MLA-L3-LOAD] node={nid} dur={_l3_dur:.6f}")
+                                    C_SchedulerHook._mla_l3_load_total = getattr(C_SchedulerHook, '_mla_l3_load_total', 0.0) + _l3_dur
                                     # Set L3 direct load count so load_to_device_per_layer
                                     # splits the H2D timing between L2 and L3 direct path
                                     _ntok = len(_di) if _di is not None else 0
@@ -1759,6 +1762,9 @@ class C_HiRadixCacheHook(BaseHook):
                                             _slot_bytes = getattr(mh, 'slot_bytes', 14653440)
                                             _kda_l3_dur = _slot_bytes / _disk_read_bw
                                             StateManager.inc_hicache_kda_l3_load_dur(_kda_l3_dur)
+                                            # [A4] Log KDA L3 load (separate from MLA counter)
+                                            logger.info(f"[A4-KDA-L3-LOAD] hash={_slot_hash} dur={_kda_l3_dur:.6f}")
+                                            C_SchedulerHook._kda_l3_load_total = getattr(C_SchedulerHook, '_kda_l3_load_total', 0.0) + _kda_l3_dur
                                             mh.backup_from_device(-1, _slot_hash, from_l3=True)
                                             mh.load_to_device(_slot_hash)
                                             if kda_obs.is_obs_enabled():
@@ -1976,12 +1982,14 @@ class C_HiRadixCacheHook(BaseHook):
                     self.components[_CT.FULL]._full_kv_pool_host = self.full_kv_pool_host
 
                 if hasattr(self, 'mamba_pool_host') and self.mamba_pool_host is not None and not isinstance(self.mamba_pool_host, MockMambaStatePoolHost):
+                    _l2_mamba_size_orig = int(os.environ.get("HISIM_L2_MAMBA_SIZE", "330"))
                     self.mamba_pool_host = MockMambaStatePoolHost(
-                        size=330,
+                        size=_l2_mamba_size_orig,
                         slot_bytes=14653440,  # K3 KDA slot bytes (TP=8)
                     )
                     if _CT.MAMBA in self.components:
                         self.components[_CT.MAMBA]._mamba_pool_host = self.mamba_pool_host
+                    logger.info(f"Swapped mamba_pool_host to mock (L2 size={_l2_mamba_size_orig})")
 
                 logger.info("Swapped real host pools to mock versions")
                 _apply_mock_start_overrides(self, self.full_kv_pool_host, getattr(self, 'mamba_pool_host', None))
@@ -2936,10 +2944,17 @@ class C_SchedulerHook(BaseHook):
             # No prefill preemption guard: the scheduler's native batching
             # policy (enable_mixed_chunk, etc.) determines concurrency.
 
-            # [A2-fix] Force mamba eviction when pool doesn't have enough slots
-            # for a new request (needs 3: 1 running + 2 pp) and there are
-            # evictable mamba checkpoints in the radix tree.
-            if kda_obs.is_obs_enabled():
+            # [ACK-LIFECYCLE-FIX] force_evict is a HiSim-specific proactive
+            # eviction safety net. It was added as a workaround for the slot
+            # exhaustion deadlock (caused by the cn%10 gate delaying ACK
+            # processing). Now that check_hicache_events runs every iteration,
+            # native capacity-driven eviction (inside alloc() when pool is full)
+            # handles slot pressure. force_evict is gated by
+            # HISIM_DISABLE_PROACTIVE_EVICT so it can be turned off for clean
+            # baselines. It is NOT native scheduler capacity eviction — that
+            # happens inside _tc.evict() / alloc() when the pool is full.
+            _disable_proactive_evict = os.environ.get("HISIM_DISABLE_PROACTIVE_EVICT", "")
+            if not _disable_proactive_evict and kda_obs.is_obs_enabled():
                 try:
                     _rtp = getattr(self, 'req_to_token_pool', None)
                     _tc = getattr(self, 'tree_cache', None)
@@ -2947,22 +2962,26 @@ class C_SchedulerHook(BaseHook):
                     if _rtp is not None and _tc is not None and _wq and len(_wq) > 0:
                         _ma = getattr(_rtp, 'mamba_allocator', None)
                         if _ma is not None and _ma.available_size() < 4:
-                            _mes = kda_obs.get_mamba_evictable()  # Use HiSim counter
+                            # Use native evictable counter as primary (consistent
+                            # with wrapped_check_hicache_events). HiSim counter
+                            # is diagnostic only.
+                            _mes = _tc.mamba_evictable_size() if hasattr(_tc, 'mamba_evictable_size') else 0
+                            _hism_ms = kda_obs.get_mamba_evictable()
                             if kda_obs.is_obs_enabled():
                                 kda_obs.log_event(
                                     "force_evict_check",
                                     virtual_time=StateManager.get_global_clock(),
                                     extra={"mamba_avail": _ma.available_size(),
-                                           "mamba_evictable": _mes,
+                                           "mamba_evictable_native": _mes,
+                                           "mamba_evictable_hism": _hism_ms,
                                            "waiting": len(_wq)})
                             if _mes > 0:
                                 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
                                 _tc.evict(EvictParams(num_tokens=0, mamba_num=_mes))
-                                kda_obs.dec_mamba_evictable(_mes)
                                 logger.info(
                                     f"[A2-FORCE-EVICT] mamba_avail={_ma.available_size()} "
-                                    f"< 4, evicted {_mes} mamba slots, "
-                                    f"waiting={len(_wq)}"
+                                    f"< 4, evicted {_mes} mamba slots (native cnt), "
+                                    f"hism_cnt={_hism_ms}, waiting={len(_wq)}"
                                 )
                                 if kda_obs.is_obs_enabled():
                                     kda_obs.log_event(
@@ -3127,6 +3146,7 @@ class C_SchedulerHook(BaseHook):
                     # Log cache state per prefill batch (L1/L2 pool sizes)
                     tc = getattr(self, 'tree_cache', None)
                     l1_evict = l1_total = l2_avail = 0
+                    _l2_mamba_cap = _l2_mamba_cached = _l2_mamba_free = _l2_mamba_lru = -1
                     if tc is not None:
                         try:
                             l1_evict = tc.evictable_size() if hasattr(tc, 'evictable_size') else 0
@@ -3138,10 +3158,33 @@ class C_SchedulerHook(BaseHook):
                         elif hasattr(tc, 'full_kv_pool_host') and tc.full_kv_pool_host is not None:
                             l2_avail = tc.full_kv_pool_host.available_size()
                         l1_total = (tc.token_to_kv_pool_allocator.available_size() + l1_evict) if hasattr(tc, 'token_to_kv_pool_allocator') else -1
+                        # L2 KDA (MAMBA) host pool stats — for A3/L3-only diagnosis
+                        _mph = getattr(tc, 'mamba_pool_host', None)
+                        if _mph is not None and hasattr(_mph, 'get_stats'):
+                            try:
+                                _khs = _mph.get_stats()
+                                _l2_mamba_cap = _khs.get('capacity', -1)
+                                _l2_mamba_cached = _khs.get('cached_slots', -1)
+                                _l2_mamba_free = _khs.get('free_slots', -1)
+                                _l2_mamba_lru = _khs.get('lru_entries', -1)
+                            except Exception:
+                                pass
                     logger.info(
                         f"Cache state: L1_evict={l1_evict} L1_total={l1_total} "
-                        f"L2_avail={l2_avail}"
+                        f"L2_avail={l2_avail} "
+                        f"L2_KDA[cap={_l2_mamba_cap} cached={_l2_mamba_cached} "
+                        f"free={_l2_mamba_free} lru={_l2_mamba_lru}]"
                     )
+                    # Also log to kda_obs for structured analysis
+                    if kda_obs.is_obs_enabled():
+                        kda_obs.log_event("l2_kda_pool_state",
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"capacity": _l2_mamba_cap,
+                                   "cached_slots": _l2_mamba_cached,
+                                   "free_slots": _l2_mamba_free,
+                                   "lru_entries": _l2_mamba_lru,
+                                   "l1_evict": l1_evict,
+                                   "l2_avail": l2_avail})
             elif len(self.running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
                 # Prefetching
                 StateManager.step_global_clock(0.005)
@@ -3874,6 +3917,9 @@ class C_SchedulerHook(BaseHook):
                     # because no backup/load_back occurs. This is genuinely 0, not "missing".
                     metrics["kda_l3_writes"] = _dw.get('l3_writes', 0)
                     metrics["kda_l3_hits"] = _dl.get('l3_hits', 0)
+                    # [A4] L3 load duration counters (MLA vs KDA, separately accumulated)
+                    metrics["mla_l3_load_dur_total"] = getattr(C_SchedulerHook, '_mla_l3_load_total', 0.0)
+                    metrics["kda_l3_load_dur_total"] = getattr(C_SchedulerHook, '_kda_l3_load_total', 0.0)
 
                 # KDA Checkpoint native diagnostics (from COW simulation)
                 _kda_diag = getattr(C_SchedulerHook, '_kda_checkpoint_diag', None)
@@ -3902,11 +3948,16 @@ class C_SchedulerHook(BaseHook):
                         metrics["kda_pool_capacity"] = _aps.get("capacity", 0)
                     except Exception:
                         pass  # allocator not yet initialized
-                _kda_host_pool = getattr(C_SchedulerHook, '_kda_host_pool', None)
-                if _kda_host_pool is not None and _kda_host_pool and hasattr(_kda_host_pool, 'get_stats'):
-                    _khs = _kda_host_pool.get_stats()
-                    metrics["kda_l2_cached_slots"] = _khs.get('cached_slots', 0)
-                    metrics["kda_l2_capacity"] = _khs.get('capacity', 0)
+                _kda_host_pool = getattr(_tc, 'mamba_pool_host', None) if _tc is not None else None
+                if _kda_host_pool is not None and hasattr(_kda_host_pool, 'get_stats'):
+                    try:
+                        _khs = _kda_host_pool.get_stats()
+                        metrics["kda_l2_cached_slots"] = _khs.get('cached_slots', 0)
+                        metrics["kda_l2_capacity"] = _khs.get('capacity', 0)
+                        metrics["kda_l2_free_slots"] = _khs.get('free_slots', 0)
+                        metrics["kda_l2_lru_entries"] = _khs.get('lru_entries', 0)
+                    except Exception:
+                        pass
 
                 # MLA instantaneous: capture current KV usage from server log context
                 _kv_pool = getattr(self, 'token_to_kv_pool', None) or getattr(
