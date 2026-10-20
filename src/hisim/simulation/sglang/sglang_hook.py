@@ -1981,15 +1981,16 @@ class C_HiRadixCacheHook(BaseHook):
                 if _CT.FULL in self.components:
                     self.components[_CT.FULL]._full_kv_pool_host = self.full_kv_pool_host
 
-                if hasattr(self, 'mamba_pool_host') and self.mamba_pool_host is not None and not isinstance(self.mamba_pool_host, MockMambaStatePoolHost):
-                    _l2_mamba_size_orig = int(os.environ.get("HISIM_L2_MAMBA_SIZE", "330"))
-                    self.mamba_pool_host = MockMambaStatePoolHost(
-                        size=_l2_mamba_size_orig,
-                        slot_bytes=14653440,  # K3 KDA slot bytes (TP=8)
-                    )
-                    if _CT.MAMBA in self.components:
-                        self.components[_CT.MAMBA]._mamba_pool_host = self.mamba_pool_host
-                    logger.info(f"Swapped mamba_pool_host to mock (L2 size={_l2_mamba_size_orig})")
+                # Mamba pool host: ALWAYS create a MockMambaStatePoolHost with
+                # the correct L2 size, regardless of what original init set.
+                _l2_mamba_size_orig = int(os.environ.get("HISIM_L2_MAMBA_SIZE", "330"))
+                self.mamba_pool_host = MockMambaStatePoolHost(
+                    size=_l2_mamba_size_orig,
+                    slot_bytes=14653440,
+                )
+                if _CT.MAMBA in self.components:
+                    self.components[_CT.MAMBA]._mamba_pool_host = self.mamba_pool_host
+                logger.info(f"Force-set mamba_pool_host (L2 size={_l2_mamba_size_orig})")
 
                 logger.info("Swapped real host pools to mock versions")
                 _apply_mock_start_overrides(self, self.full_kv_pool_host, getattr(self, 'mamba_pool_host', None))
