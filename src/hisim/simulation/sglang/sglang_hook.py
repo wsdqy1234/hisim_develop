@@ -2091,35 +2091,79 @@ class C_HiRadixCacheHook(BaseHook):
                 if _orig_ednn_inst is not None:
                     def _wrapped_ednn(ct, tracker, orig=_orig_ednn_inst):
                         result = orig(ct, tracker)
-                        _lru_info = {}
                         try:
                             from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _ECT
                             if ct == _ECT.MAMBA:
-                                _lru = _tc_ednn.lru_lists.get(_ECT.MAMBA)
-                                _comp = _tc_ednn.components_by_type.get(_ECT.MAMBA)
-                                _cursor = getattr(_comp, '_evict_device_cursor', None)
-                                _session = getattr(_tc_ednn, 'enable_session_radix_cache', None)
-                                _nodes_info = []
-                                if _lru is not None:
-                                    _tail = getattr(_lru, 'tail', None)
-                                    _x = _tail.lru_prev[_lru._pt] if _tail else None
-                                    _count = 0
-                                    while _x is not None and _x != getattr(_lru, 'head', None) and _count < 10:
-                                        _cd = _x.component_data[_ECT.MAMBA]
-                                        _nodes_info.append({"id": getattr(_x, 'id', -1), "lock_ref": _cd.lock_ref})
-                                        _x = _x.lru_prev[_lru._pt]
-                                        _count += 1
-                                _lru_info = {"session": _session, "cursor_none": _cursor is None, "lru_nodes": _nodes_info}
-                        except Exception as _e:
-                            _lru_info = {"error": str(_e)[:150]}
-                        kda_obs.log_event("ednn_trace",
-                            virtual_time=StateManager.get_global_clock(),
-                            extra={"ct": getattr(ct, 'value', str(ct)),
-                                   "node_id": result.node_id if result.node_id else -1,
-                                   "made_progress": result.made_progress,
-                                   **_lru_info})
+                                kda_obs.log_event("ednn_trace",
+                                    virtual_time=StateManager.get_global_clock(),
+                                    extra={"ct": getattr(ct, 'value', str(ct)),
+                                           "node_id": result.node_id if result.node_id else -1,
+                                           "made_progress": result.made_progress})
+                        except Exception:
+                            pass
                         return result
                     _tc_ednn.evict_device_next_node = _wrapped_ednn
+
+            # [Phase2] Install KDA eviction policy hook on _evict_device_next_node.
+            # Hook point: UnifiedRadixCache._evict_device_next_node (not tree_core).
+            # This is the caller that invokes tree_core.evict_device_next_node,
+            # frees values, and returns (node_id, made_progress).
+            # Policy: after native LRU selects a victim, check if policy says
+            # to skip it. If skip, return (None, True) — the eviction loop
+            # treats this as "internal progress, no leaf selected" and continues
+            # to the next LRU victim. The skipped leaf's slot is NOT freed
+            # (because _evict_device_leaf is not called for it).
+            # Fallback: after MAX_SKIPS, force-evict to avoid cursor exhaustion.
+            from hisim.simulation import kda_policy as _kda_pol
+            _policy = _kda_pol.get_policy()
+            _orig_evict_next = getattr(self, '_evict_device_next_node', None)
+            logger.info(f"[Phase2-DEBUG] self_type={type(self).__name__} has_method={_orig_evict_next is not None} policy={_policy.name}")
+            if _orig_evict_next is not None and _policy.name != "native":
+                _skip_count = [0]
+                _MAX_SKIPS = 50
+                def _policy_evict_next(ct, tracker, orig=_orig_evict_next, pol=_policy):
+                    node_id, made_progress = orig(ct, tracker)
+                    # Only filter MAMBA component
+                    try:
+                        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _PCT
+                        if ct != _PCT.MAMBA or node_id is None:
+                            return node_id, made_progress
+                    except Exception:
+                        return node_id, made_progress
+                    # Get prefix hash for node identity
+                    _hash = ""
+                    try:
+                        _node = _tc_ednn.node_by_id(node_id) if _tc_ednn else None
+                        if _node is not None:
+                            _h = getattr(_node, 'hash_value', None)
+                            if _h:
+                                _hash = str(_h[-1]) if isinstance(_h, list) else str(_h)
+                    except Exception:
+                        pass
+                    # Policy decision
+                    if pol.should_evict(node_id, _hash):
+                        _skip_count[0] = 0  # Reset on successful eviction
+                        pol.record_eviction(node_id, _hash)
+                        logger.info(f"[POLICY:{pol.name}] EVICT node={node_id} hash={_hash[:8]}")
+                        kda_obs.log_event("policy_evict",
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"policy": pol.name, "node_id": node_id,
+                                   "hash": _hash[:16], "action": "evict"})
+                        return node_id, made_progress
+                    else:
+                        _skip_count[0] += 1
+                        if _skip_count[0] >= _MAX_SKIPS:
+                            logger.info(f"[POLICY:{pol.name}] MAX_SKIPS reached, force evict node={node_id}")
+                            pol.record_eviction(node_id, _hash)
+                            return node_id, made_progress
+                        logger.info(f"[POLICY:{pol.name}] SKIP node={node_id} hash={_hash[:8]} (skip_count={_skip_count[0]})")
+                        kda_obs.log_event("policy_evict",
+                            virtual_time=StateManager.get_global_clock(),
+                            extra={"policy": pol.name, "node_id": node_id,
+                                   "hash": _hash[:16], "action": "skip"})
+                        return None, True  # Skip: pretend internal progress
+                self._evict_device_next_node = _policy_evict_next
+                logger.info(f"[Phase2] KDA eviction policy '{_policy.name}' installed on _evict_device_next_node")
                 # Hook inc_lock_ref and dec_lock_ref
                 _orig_inc = getattr(_tc_ednn, 'inc_lock_ref', None)
                 _orig_dec = getattr(_tc_ednn, 'dec_lock_ref', None)
@@ -2426,6 +2470,21 @@ class C_HiRadixCacheHook(BaseHook):
                             mamba_host_hit=int(_mhost) if _mhost is not None else 0,
                             best_match_node=int(_bmn) if _bmn is not None else -1,
                         )
+                # [Phase2] Record access for HotnessAware policy
+                if _bmn is not None:
+                    try:
+                        from hisim.simulation import kda_policy as _kp
+                        _pol = _kp.get_policy()
+                        _vt = StateManager.get_global_clock()
+                        _node = self.tree_core.node_by_id(_bmn) if hasattr(self, 'tree_core') else None
+                        _hash = ""
+                        if _node is not None:
+                            _h = getattr(_node, 'hash_value', None)
+                            if _h:
+                                _hash = str(_h[-1]) if isinstance(_h, list) else str(_h)
+                        _pol.record_access(int(_bmn), _hash, _vt)
+                    except Exception:
+                        pass
 
             except Exception as e:
                 logger.warning(f"P2 match_prefix error: {e}")
