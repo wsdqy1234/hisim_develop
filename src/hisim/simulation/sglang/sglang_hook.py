@@ -3668,18 +3668,40 @@ class C_SchedulerHook(BaseHook):
             if ret.__class__.__name__ == "GenerationBatchResult":
                 hisim_batch = HisimScheduleBatch(reqs=[])
                 if batch.forward_mode.is_extend():
+                    # [P1-FIX] Get MAMBA restore status for replay token accounting
+                    _tc_p1 = getattr(self, 'tree_cache', None)
+                    _diag_l_p1 = getattr(_tc_p1, '_hismim_diag_l', {}) if _tc_p1 else {}
+                    _mamba_restore_failed = _diag_l_p1.get('mamba_restore_failed', False)
                     for req in batch.reqs:
+                        _ext_len = getattr(
+                            getattr(req, "extend_range", None),
+                            "length",
+                            len(req.origin_input_ids),
+                        )
+                        _prefix_len = len(req.prefix_indices)
+                        _cow_src = req_mamba_get(req, 'mamba_cow_src_index', None)
+                        # Calculate replay tokens: only when MAMBA not restored
+                        if _cow_src is not None:
+                            _replay = 0  # COW hit
+                        elif _mamba_restore_failed and _prefix_len > 0:
+                            _replay = _prefix_len  # MAMBA restore failed
+                        else:
+                            _replay = 0  # MAMBA restored via L2/L3
+                        _effective_compute = _ext_len + _replay
                         hisim_batch.reqs.append(
                             FakeRequest(
-                                input_length=getattr(
-                                    getattr(req, "extend_range", None),
-                                    "length",
-                                    len(req.origin_input_ids),
-                                ),
+                                input_length=_effective_compute,
                                 past_kv_length=len(req.prefix_indices)
                                 + len(req.output_ids),
                             )
                         )
+                        if _replay > 0:
+                            logger.info(
+                                f"[P1-TIMING] rid={req.rid[:8]} ext={_ext_len} "
+                                f"replay={_replay} effective={_effective_compute} "
+                                f"cow={'Y' if _cow_src is not None else 'N'} "
+                                f"mamba_failed={_mamba_restore_failed}"
+                            )
                 elif batch.forward_mode.is_decode():
                     for req in batch.reqs:
                         hisim_batch.reqs.append(
