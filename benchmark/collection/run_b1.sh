@@ -10,7 +10,7 @@ set -u
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 HISIM_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 WORKDIR=/tmp/opencode
-MODEL_DIR=/home/l00886679/models/Kimi-K3-w4a8
+MODEL_DIR=/tmp/simple-k3-model
 SIM_CONF=$WORKDIR/config_k3_0519.json
 PORT=30030
 

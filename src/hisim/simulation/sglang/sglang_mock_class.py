@@ -2122,7 +2122,10 @@ class MockHiCacheStorage:
         Uses 'mamba_' prefix to distinguish from MLA KV in kvcm."""
         if hasattr(self, "storage_manager"):
             prefixed_keys = [f"mamba_{h}" for h in slot_hashes]
-            int_hash_keys = [_pass_str_to_block_ids(k) for k in prefixed_keys]
+            # [P0-1 FIX] Convert descriptive hash keys to hex via MD5
+            # so _pass_str_to_block_ids can parse them as int(,16)
+            import hashlib
+            int_hash_keys = [_pass_str_to_block_ids(hashlib.md5(k.encode()).hexdigest()) for k in prefixed_keys]
             trace_id = "1"
             write_timestamp = int(time.time() * 1000)
             res = self.storage_manager.WriteCache(
@@ -2143,7 +2146,9 @@ class MockHiCacheStorage:
         KDA slots are independent — each slot is a hit or miss."""
         if hasattr(self, "storage_manager"):
             prefixed_keys = [f"mamba_{h}" for h in slot_hashes]
-            int_hash_keys = [_pass_str_to_block_ids(k) for k in prefixed_keys]
+            # [P0-1 FIX] Convert descriptive hash keys to hex via MD5
+            import hashlib
+            int_hash_keys = [_pass_str_to_block_ids(hashlib.md5(k.encode()).hexdigest()) for k in prefixed_keys]
             trace_id = "2"
             read_timestamp = int(time.time() * 1000)
             block_mask = 0

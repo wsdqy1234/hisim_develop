@@ -1611,6 +1611,13 @@ class C_HiRadixCacheHook(BaseHook):
                             if _evicted:
                                 _l3_mamba.extend(_evicted)
                                 mh._last_evicted_hashes = []
+                                # [P0-1 DIAG] Log L2 evictions for analysis
+                                # (do NOT clear host_value yet — causes node removal)
+                                if kda_obs.is_obs_enabled():
+                                    for _eh in _evicted:
+                                        kda_obs.log_event("l2_evict_diag",
+                                            virtual_time=StateManager.get_global_clock(),
+                                            extra={"slot_hash": _eh})
                         if _l3_mamba:
                             try:
                                 st.batch_set_mamba(_l3_mamba)
@@ -1740,6 +1747,8 @@ class C_HiRadixCacheHook(BaseHook):
                         _xv = getattr(_xn, 'value', str(_xn))
                         if _xv == 'mamba':
                             _mamba_loads.append(_xfer)
+                    # [P0-1 DIAG] Log whether MAMBA transfers exist
+                    logger.info(f"[LOAD-DIAG] calls={_diag_l['calls']} pt_count={len(_pt)} mamba_loads={len(_mamba_loads)} ni={list(_ni)[:3]}")
                     if _mamba_loads and mh is not None:
                         _diag_l["mamba_pt"] += 1
                         for _xfer in _mamba_loads:
@@ -1752,12 +1761,15 @@ class C_HiRadixCacheHook(BaseHook):
                                     _slot_idx = int(_mdi[_i]) if _mdi is not None and hasattr(_mdi, '__getitem__') else _i
                                     _slot_hash = f"kda_{_nid}_{_i}"
                                     _l2_hit = mh.has(_slot_hash)
+                                    logger.info(f"[LOAD-L2CHECK] hash={_slot_hash} l2_hit={_l2_hit} l2_cached={len(getattr(mh, '_slots', {}))} l2_cap={getattr(mh, 'size', -1)} st_is_none={st is None} st_type={type(st).__name__ if st else 'None'}")
                                     if _l2_hit:
                                         mh.load_to_device(_slot_hash)
                                         if kda_obs.is_obs_enabled():
                                             kda_obs.shadow_restore_l2(_slot_hash, _slot_idx)
                                     elif st is not None:
                                         _m_hits = st.batch_exists_mamba([_slot_hash])
+                                        _l3_hit_val = _m_hits.get(_slot_hash, 0) if _m_hits else 0
+                                        logger.info(f"[LOAD-L3CHECK] hash={_slot_hash} l3_hit={_l3_hit_val} raw={_m_hits}")
                                         if any(_m_hits.values()):
                                             _slot_bytes = getattr(mh, 'slot_bytes', 14653440)
                                             _kda_l3_dur = _slot_bytes / _disk_read_bw
@@ -1770,7 +1782,7 @@ class C_HiRadixCacheHook(BaseHook):
                                             if kda_obs.is_obs_enabled():
                                                 kda_obs.shadow_restore_l3(_slot_hash, _slot_idx)
                             except Exception as e:
-                                logger.debug(f"mamba load_to_device failed: {e}")
+                                logger.info(f"[LOAD-ERROR] mamba load_to_device failed: {e}", exc_info=True)
                     elif _pt:
                         _diag_l["full_only"] += 1
                     # Set value on MAMBA component (restore from L2)
@@ -2419,7 +2431,9 @@ class C_HiRadixCacheHook(BaseHook):
             logger.debug("Wrapped evict for eviction chain tracing")
 
             # [A2] Hook tree_core.evict_device_next_node to trace cursor state
-            _orig_ednn = getattr(target.tree_core, 'evict_device_next_node', None) if target.tree_core else None
+            # tree_core is an instance attribute, not a class attribute — use getattr
+            _tc_cls = getattr(target, 'tree_core', None)
+            _orig_ednn = getattr(_tc_cls, 'evict_device_next_node', None) if _tc_cls else None
             if _orig_ednn is not None and kda_obs.is_obs_enabled():
                 def wrapped_ednn(self_tc, component_type, tracker, orig=_orig_ednn):
                     _ct_val = getattr(component_type, 'value', str(component_type))

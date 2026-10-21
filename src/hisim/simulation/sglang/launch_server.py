@@ -3,6 +3,34 @@ import json
 import sys
 import argparse
 import torch
+# [P0-FIX] Monkey-patch tensor creation to force CPU device.
+# torch_npu (if installed) changes default device to NPU.
+_orig_ones = torch.ones
+_orig_zeros = torch.zeros
+_orig_empty = torch.empty
+_orig_tensor = torch.tensor
+def _cpu_ones(*a, **kw):
+    kw.setdefault('device', 'cpu')
+    return _orig_ones(*a, **kw)
+def _cpu_zeros(*a, **kw):
+    kw.setdefault('device', 'cpu')
+    return _orig_zeros(*a, **kw)
+def _cpu_empty(*a, **kw):
+    kw.setdefault('device', 'cpu')
+    return _orig_empty(*a, **kw)
+def _cpu_tensor(*a, **kw):
+    kw.setdefault('device', 'cpu')
+    return _orig_tensor(*a, **kw)
+torch.ones = _cpu_ones
+torch.zeros = _cpu_zeros
+torch.empty = _cpu_empty
+torch.tensor = _cpu_tensor
+if hasattr(torch, 'npu'):
+    try:
+        torch.npu.is_available = lambda: False
+        torch.npu.device_count = lambda: 0
+    except Exception:
+        pass
 import types
 import hisim.hook as hisim_hook
 from hisim.simulation.sglang import sgl_kernel_hook, sglang_hook
@@ -788,6 +816,8 @@ try:
         logger.info("Manually applied C_HiRadixCacheHook to UnifiedRadixCache")
 except Exception as e:
     logger.warning(f"Failed to manually apply C_HiRadixCacheHook: {e}")
+    import traceback
+    traceback.print_exc()
 
 
 
