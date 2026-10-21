@@ -1427,9 +1427,14 @@ class C_HiRadixCacheHook(BaseHook):
                 # Always use MockHiCacheStorage — the real storage_backend may be
                 # HiCacheFile (if C_StorageBackendFactory hook didn't fire) which
                 # lacks batch_set/batch_exists.
-                _storage = getattr(cache.cache_controller, 'storage_backend', None)
-                if not isinstance(_storage, MockHiCacheStorage):
-                    _storage = MockHiCacheStorage()
+                # [P0-2] HISIM_DISABLE_L3=1 forces _storage=None for true L1-only
+                if os.environ.get("HISIM_DISABLE_L3", ""):
+                    _storage = None
+                    logger.info("L3 storage disabled (HISIM_DISABLE_L3=1) — true L1-only mode")
+                else:
+                    _storage = getattr(cache.cache_controller, 'storage_backend', None)
+                    if not isinstance(_storage, MockHiCacheStorage):
+                        _storage = MockHiCacheStorage()
 
                 # L3 timing helpers
                 _disk_write_bw = 8e9  # 8 GB/s default
@@ -1649,9 +1654,33 @@ class C_HiRadixCacheHook(BaseHook):
                                     if _mamba_xfers and _mv is not None:
                                         _mhi = getattr(_mamba_xfers[0], 'host_indices', None)
                                         if _mhi is not None:
-                                            _mv.host_value = _mhi.clone() if hasattr(_mhi, 'clone') else _mhi
+                                            # [P0-1 FIX] Only set host_value if the slot
+                                            # is still in L2 after backup. With L2=0 or
+                                            # L2 full, the slot is immediately evicted,
+                                            # and host_value would point to stale data.
+                                            # The native init_load_back uses host_value
+                                            # to "restore" MAMBA state, bypassing the
+                                            # HiSim mock's L2/L3 membership check.
+                                            _l2_still_has = True
+                                            if mh is not None:
+                                                for _sh in _mamba_slot_hashes:
+                                                    if not mh.has(_sh):
+                                                        _l2_still_has = False
+                                                        break
+                                            if _l2_still_has:
+                                                _mv.host_value = _mhi.clone() if hasattr(_mhi, 'clone') else _mhi
+                                            else:
+                                                _mv.host_value = None  # L2 evicted
                                     if _mv is not None and _mv.value is not None and _mv.host_value is None:
-                                        _mv.host_value = _mv.value.clone() if hasattr(_mv.value, 'clone') else _mv.value
+                                        # Fallback: only set if L2 didn't evict
+                                        _l2_ok = True
+                                        if mh is not None:
+                                            for _sh in _mamba_slot_hashes:
+                                                if not mh.has(_sh):
+                                                    _l2_ok = False
+                                                    break
+                                        if _l2_ok:
+                                            _mv.host_value = _mv.value.clone() if hasattr(_mv.value, 'clone') else _mv.value
                             except Exception as e:
                                 logger.debug(f"set host_value failed node {nid}: {e}")
                     _ack_wq_before = len(cc.ack_write_queue) if hasattr(cc, 'ack_write_queue') else -1
@@ -1751,6 +1780,7 @@ class C_HiRadixCacheHook(BaseHook):
                     logger.info(f"[LOAD-DIAG] calls={_diag_l['calls']} pt_count={len(_pt)} mamba_loads={len(_mamba_loads)} ni={list(_ni)[:3]}")
                     if _mamba_loads and mh is not None:
                         _diag_l["mamba_pt"] += 1
+                        _any_mamba_restore = False
                         for _xfer in _mamba_loads:
                             _mhi = getattr(_xfer, 'host_indices', None)
                             _mdi = getattr(_xfer, 'device_indices', None)
@@ -1764,6 +1794,7 @@ class C_HiRadixCacheHook(BaseHook):
                                     logger.info(f"[LOAD-L2CHECK] hash={_slot_hash} l2_hit={_l2_hit} l2_cached={len(getattr(mh, '_slots', {}))} l2_cap={getattr(mh, 'size', -1)} st_is_none={st is None} st_type={type(st).__name__ if st else 'None'}")
                                     if _l2_hit:
                                         mh.load_to_device(_slot_hash)
+                                        _any_mamba_restore = True
                                         if kda_obs.is_obs_enabled():
                                             kda_obs.shadow_restore_l2(_slot_hash, _slot_idx)
                                     elif st is not None:
@@ -1774,6 +1805,7 @@ class C_HiRadixCacheHook(BaseHook):
                                             _slot_bytes = getattr(mh, 'slot_bytes', 14653440)
                                             _kda_l3_dur = _slot_bytes / _disk_read_bw
                                             StateManager.inc_hicache_kda_l3_load_dur(_kda_l3_dur)
+                                            _any_mamba_restore = True
                                             # [A4] Log KDA L3 load (separate from MLA counter)
                                             logger.info(f"[A4-KDA-L3-LOAD] hash={_slot_hash} dur={_kda_l3_dur:.6f}")
                                             C_SchedulerHook._kda_l3_load_total = getattr(C_SchedulerHook, '_kda_l3_load_total', 0.0) + _kda_l3_dur
@@ -1783,6 +1815,13 @@ class C_HiRadixCacheHook(BaseHook):
                                                 kda_obs.shadow_restore_l3(_slot_hash, _slot_idx)
                             except Exception as e:
                                 logger.info(f"[LOAD-ERROR] mamba load_to_device failed: {e}", exc_info=True)
+                        # [P0-2] Track if MAMBA restore failed for this batch
+                        if not _any_mamba_restore:
+                            _diag_l["mamba_restore_failed"] = True
+                            logger.info("[LOAD-RESULT] MAMBA restore FAILED — replay needed")
+                        else:
+                            _diag_l["mamba_restore_failed"] = False
+                            logger.info("[LOAD-RESULT] MAMBA restore OK — no replay needed")
                     elif _pt:
                         _diag_l["full_only"] += 1
                     # Set value on MAMBA component (restore from L2)
@@ -3514,6 +3553,15 @@ class C_SchedulerHook(BaseHook):
                                 _total_in = len(getattr(_req, 'origin_input_ids', []))
                                 _expected_ext_if_restored = _total_in - _prefix_len
                                 _is_restored = (_ext_len <= _expected_ext_if_restored + 1)  # +1 tolerance
+                                # [P0-2 FIX] Also check if MAMBA state was actually restored.
+                                # extend_range.length only reflects KV cache prefix match,
+                                # NOT MAMBA state restore. If MAMBA restore failed (L2 miss,
+                                # L3 miss/None), replay IS needed even if extend_range is small.
+                                _tc_rf = getattr(self, 'tree_cache', None)
+                                _diag_l_rb = getattr(_tc_rf, '_hismim_diag_l', {}) if _tc_rf else {}
+                                _mamba_failed = _diag_l_rb.get('mamba_restore_failed', False)
+                                if _is_restored and _mamba_failed:
+                                    _is_restored = False  # MAMBA not restored → replay needed
                                 if _is_restored:
                                     _replay = 0  # State restored via load_back, no replay needed
                                     logger.info(
