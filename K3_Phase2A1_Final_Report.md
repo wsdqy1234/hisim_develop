@@ -70,13 +70,12 @@ evict_for_alloc (capacity trigger, native)
 后续 eviction 再次 free 同一 slot → AssertionError 崩溃。
 **修复**: `_StrictMambaAllocator.free()` 改为幂等 — 已释放的 slot 跳过并 warning。
 
-## 6. 三策略结果
+## 6. 三策略结果（Phase 2A.2 最终回归）
 
 ### 配置
-- Trace v3: 56 requests (8 hot × 3 access + 8 cold × 1 + 16 churn + 16 reuse)
-- KDA=16, L1-only (L2=0, L3 disabled), max_running_requests=4
-- HotnessAware: sliding window frequency, threshold=0
-- Oracle: farthest-next-use (Belady's), future map from trace
+- Trace v4: 56 requests (8 hot × 3 access + 8 cold + 2 fork + 12 churn + 18 reuse)
+- Fork test: F0 shares first token (100000) with S0, different suffix (999000 vs 100001)
+- KDA=16, L1-only, strict free mode, _node_prefix_identity (MD5)
 
 ### 结果对照
 
@@ -84,46 +83,28 @@ evict_for_alloc (capacity trigger, native)
 |--------|--------|---------|--------|
 | Completed | 56/56 ✓ | 56/56 ✓ | 56/56 ✓ |
 | COW Hits | 8 | 16 (+100%) | 20 (+150%) |
-| Replay Tokens | 16384 | 8192 (-50%) | 4096 (-75%) |
-| Prefix Reuse Ratio | 0.428 | 0.428 | 0.428 |
-| MA-FREE-SKIP | 0 | 55 | 0 |
+| Replay Tokens | 18432 | 10240 (-45%) | 6144 (-67%) |
+| Double-Free (strict) | 0 ✓ | 0 ✓ | 0 ✓ |
+| MA-STALE | 0 | 0 | 0 |
 | Policy Decisions | N/A | 55 | 47 |
+| Unique Victim Identities | N/A | 22 | 24 |
 
-### Victim 分析
+### P0: Double-Free 验收
+- 根因: `free_mamba_cache` 释放 `req.kv.mamba_pool_idx`，slot 已被 eviction 释放
+- 修复: `_safe_free()` 预检查 + 严格 `free()` assert + slot ledger
+- **验收: 三种策略严格模式 Double-Free=0** ✓
 
-**Native LRU**: 淘汰 S0-S15 (16 个最旧 checkpoint) → reuse 全部 miss
-  - COW = 8 (re-access only) + 0 (reuse) = 8
-  - Replay = 16 (all reuse sessions)
+### P1: Checkpoint Identity 验收
+- `_node_prefix_identity`: MD5 hash of full root-to-node token sequence
+- Fork 测试: F0 (首 token=100000, 第二=999000) 与 S0 (首=100000, 第二=100001) 有不同 identity ✓
+- Hotness: F0 frequency=0, S0 frequency=1 — 未错误合并 ✓
+- Oracle: F0 next-access=540, S0 next-access=400 — 正确区分 ✓
 
-**HotnessAware**: 保留 S0-S7 (frequency=1), 淘汰 S8-S15 + churn (frequency=0)
-  - COW = 8 (re-access) + 8 (reuse hot) = 16
-  - Replay = 8 (reuse cold only)
-
-**Oracle (Belady's)**: 保留 S0-S7 (next at 400-470) + S8-S11 (next at 480-510),
-  淘汰 S12-S15 (next at 520-550) + 12 churn (never reused, inf)
-  - COW = 8 (re-access) + 8 (reuse hot) + 4 (reuse cold S8-S11) = 20
-  - Replay = 4 (reuse cold S12-S15 only)
-
-### Oracle 策略日志（正确的 farthest-next-use 排序）
-
-```
-top=[n31:310.0, n30:300.0, n29:290.0, ..., n22:220.0]  ← 距离递减
-top=[n34:inf, n30:270.0, ...]                            ← churn=inf, 优先淘汰
-```
-
-Hash 值确认正确匹配 trace:
-```
-node=31 hash=1500000  → cold S5 (base=1500000)
-node=32 hash=1600000  → cold S6
-node=33 hash=1700000  → cold S7
-```
-
-### Lock/ACK/Slot 守恒验证
-- 所有策略完成 56/56 请求 ✓
-- 相同容量 (KDA=16) 和原生 eviction 触发 ✓
-- 每次分配最终满足容量需求 ✓
-- Hotness 55 次 double-free 被 idempotent free 阻止，不影响正确性 ✓
-- Oracle 0 次 double-free (不同淘汰路径) ✓
+### P1: Pre-sort Hook 语义一致性
+- Queue 弹出时重新检查: `in_list` + `evictable_device_leaves` + `_can_evict_leaf_atomically` ✓
+- Queue 耗尽后 native fallback 处理 tombstone/cascade ✓
+- 已淘汰节点从 LRU 移除，native 不重复访问 ✓
+- FULL/MAMBA cascade 由 `_evict_device_leaf` 原生处理 ✓
 
 ## 7. Native EVICT=36 vs Hotness EVICT=4 解释
 
