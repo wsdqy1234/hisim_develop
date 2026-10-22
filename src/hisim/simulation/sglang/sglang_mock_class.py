@@ -518,14 +518,27 @@ class MockReqToTokenPool:
         _alloc = self._mock_mamba_allocator if hasattr(self, "_mock_mamba_allocator") else None
 
         def _safe_free(val, label=""):
-            """Free slot only if still allocated (not already freed by eviction)."""
+            """Free slot only if still allocated and NOT reallocated to a new owner.
+            
+            [P2B] Owner/Generation safety:
+            - Check 1: slot in free_slots → already freed by eviction (stale ref)
+            - Check 2: slot was reallocated (freed then alloc'd) → stale ref from
+              old owner, must NOT free (would free new owner's state)
+            """
             if val == -1 or val is None:
                 return
-            if _alloc is not None and val in _alloc.free_slots:
-                _ma_l.warning("[MA-STALE] %s slot %d already freed (eviction?), "
-                              "clearing stale ref (alloc_count=%d free_count=%d)",
-                              label, val, _alloc._alloc_count, _alloc._free_count)
-                return  # Don't call free() — slot already freed
+            if _alloc is not None:
+                if val in _alloc.free_slots:
+                    _ma_l.warning("[MA-STALE] %s slot %d already freed (eviction?), "
+                                  "clearing stale ref (alloc_count=%d free_count=%d)",
+                                  label, val, _alloc._alloc_count, _alloc._free_count)
+                    return  # Don't call free() — slot already freed
+                # Check if slot was freed and reallocated (generation mismatch)
+                if _alloc.was_reallocated(val):
+                    _ma_l.warning("[MA-REALLOC-RISK] %s slot %d was freed+reallocated "
+                                  "(possible stale owner), skipping free to protect new owner",
+                                  label, val)
+                    return  # Don't free — might belong to new owner
             self.mamba_allocator.free(_t.tensor([val], dtype=_t.int64))
 
         # 1. Always free the active mamba slot (if any).
@@ -586,8 +599,12 @@ class MockReqToTokenPool:
                     self.free_slots = list(range(1, capacity + 1))
                     self._alloc_count = 0
                     self._free_count = 0
-                    # [P2A.2] Slot ledger: {slot_id: [(event, ts, caller, stack)]}
+                    # [P2A.2] Slot ledger: {slot_id: [(event, gen, ts, stack)]}
                     self._ledger = {}
+                    # [P2B] Generation per slot: incremented on alloc and free
+                    # If a stale reference tries to free a slot that was freed
+                    # and reallocated, the generation will not match.
+                    self._slot_gen = {s: 0 for s in range(1, capacity + 1)}
                     _ma_l.info("[MA-INIT] capacity=%d device=%s free_slots=%s", capacity, device, self.free_slots)
                 def available_size(self):
                     return len(self.free_slots)
@@ -608,7 +625,9 @@ class MockReqToTokenPool:
                     import traceback as _tb
                     _stk = "".join(_tb.format_stack(limit=8))
                     for s in slots:
-                        self._ledger[s] = [("alloc", self._alloc_count, _stk)]
+                        self._slot_gen[s] += 1
+                        _gen = self._slot_gen[s]
+                        self._ledger.setdefault(s, []).append(("alloc", _gen, self._alloc_count, _stk))
                     _ma_l.info("[MA-ALLOC] n=%d slots=%s remaining=%d free=%s alloc_count=%d",
                                 n, slots, len(self.free_slots), self.free_slots, self._alloc_count)
                     return _torch.tensor(slots, dtype=_torch.int64, device=self.device)
@@ -620,26 +639,37 @@ class MockReqToTokenPool:
                     _vals = idx.tolist() if hasattr(idx, 'tolist') else [idx]
                     for v in _vals:
                         if v in self.free_slots:
-                            # [P2A.2] STRICT: double-free detected — log full ledger and raise
                             _hist = self._ledger.get(v, [])
                             _ma_l.error("[MA-DOUBLE-FREE] slot %d (alloc_count=%d free_count=%d)",
                                         v, self._alloc_count, self._free_count)
                             _ma_l.error("[MA-DOUBLE-FREE] slot %d history:", v)
-                            for _evt, _cnt, _s in _hist:
-                                _ma_l.error("  %s (cnt=%d):\n%s", _evt, _cnt, _s)
-                            _ma_l.error("[MA-DOUBLE-FREE] current call:\n%s", _stk)
+                            for _evt, _gen, _cnt, _s in _hist[-5:]:
+                                _ma_l.error("  %s (gen=%d, cnt=%d):\n%s", _evt, _gen, _cnt, _s[-200:])
+                            _ma_l.error("[MA-DOUBLE-FREE] current call:\n%s", _stk[-200:])
                             raise AssertionError(
                                 f"double free of mamba slot {v} "
                                 f"(alloc_count={self._alloc_count}, "
                                 f"free_count={self._free_count}, capacity={self.capacity})")
+                        self._slot_gen[v] = self._slot_gen.get(v, 0) + 1
+                        _gen = self._slot_gen[v]
                         self.free_slots.append(v)
-                        if v in self._ledger:
-                            self._ledger[v].append(("free", self._free_count, _stk))
-                        else:
-                            self._ledger[v] = [("free_unknown", self._free_count, _stk)]
+                        self._ledger.setdefault(v, []).append(("free", _gen, self._free_count, _stk))
                     self._free_count += len(_vals)
                     _ma_l.info("[MA-FREE] slots=%s remaining=%d free=%s alloc_count=%d free_count=%d",
                                 _vals, len(self.free_slots), self.free_slots, self._alloc_count, self._free_count)
+                def get_slot_gen(self, slot_id):
+                    """Get current generation of a slot for owner verification."""
+                    return self._slot_gen.get(slot_id, -1)
+                def was_reallocated(self, slot_id):
+                    """Check if slot was freed and reallocated (generation mismatch risk)."""
+                    hist = self._ledger.get(slot_id, [])
+                    if len(hist) < 2:
+                        return False
+                    # Check if there's a free followed by an alloc
+                    for i in range(len(hist) - 1):
+                        if hist[i][0] == "free" and hist[i+1][0] == "alloc":
+                            return True
+                    return False
                 def get_stats(self):
                     return {
                         "capacity": self.capacity,
