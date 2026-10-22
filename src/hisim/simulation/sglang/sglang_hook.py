@@ -2104,66 +2104,146 @@ class C_HiRadixCacheHook(BaseHook):
                         return result
                     _tc_ednn.evict_device_next_node = _wrapped_ednn
 
-            # [Phase2] Install KDA eviction policy hook on _evict_device_next_node.
-            # Hook point: UnifiedRadixCache._evict_device_next_node (not tree_core).
-            # This is the caller that invokes tree_core.evict_device_next_node,
-            # frees values, and returns (node_id, made_progress).
-            # Policy: after native LRU selects a victim, check if policy says
-            # to skip it. If skip, return (None, True) — the eviction loop
-            # treats this as "internal progress, no leaf selected" and continues
-            # to the next LRU victim. The skipped leaf's slot is NOT freed
-            # (because _evict_device_leaf is not called for it).
-            # Fallback: after MAX_SKIPS, force-evict to avoid cursor exhaustion.
+            # [Phase2] Pre-sort eviction hook on MambaComponent.
+            # Hook point: MambaComponent._evict_device_start / _evict_device_next_node
+            # (NOT UnifiedRadixCache._evict_device_next_node — that was the old
+            # filter approach which had cursor-advancement side effects).
+            #
+            # Design:
+            #   _evict_device_start: after native cursor setup, walk LRU list,
+            #     collect ALL evictable MAMBA leaves, sort by policy, store as
+            #     _policy_evict_queue. NO side effects at this point (cursor is
+            #     set up but not walked).
+            #   _evict_device_next_node: pop from pre-sorted queue (NO cursor
+            #     advancement for policy-selected nodes). When queue exhausted,
+            #     fall back to native walk (for tombstone cleanup).
+            #   _evict_device_end: clear the queue.
+            #
+            # Safety:
+            #   - Same evictable candidate set (evictable_device_leaves)
+            #   - Same capacity trigger (evict_for_alloc → _evict_components)
+            #   - Same eviction execution (_evict_device_leaf, native, unmodified)
+            #   - NO cursor advancement before policy decision
+            #   - NO device/host frees, NO tracker updates for non-evicted nodes
+            #   - ALL candidates in queue → no cursor exhaustion, no alloc failure
+            #   - Does NOT re-enable HiSim Proactive Eviction
+            #   - Does NOT call allocator.free directly
+            #   - Does NOT modify Lock/ACK/Cascade semantics
             from hisim.simulation import kda_policy as _kda_pol
+            from hisim.simulation.kda_policy import _node_prefix_hash
             _policy = _kda_pol.get_policy()
-            _orig_evict_next = getattr(self, '_evict_device_next_node', None)
-            logger.info(f"[Phase2-DEBUG] self_type={type(self).__name__} has_method={_orig_evict_next is not None} policy={_policy.name}")
-            if _orig_evict_next is not None and _policy.name != "native":
-                _skip_count = [0]
-                _MAX_SKIPS = 50
-                def _policy_evict_next(ct, tracker, orig=_orig_evict_next, pol=_policy):
-                    node_id, made_progress = orig(ct, tracker)
-                    # Only filter MAMBA component
+
+            try:
+                from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _PCT
+                _mamba_comp = _tc_ednn.components_by_type.get(_PCT.MAMBA) if _tc_ednn else None
+            except Exception:
+                _mamba_comp = None
+
+            logger.info(f"[Phase2-DEBUG] self_type={type(self).__name__} "
+                        f"mamba_comp={_mamba_comp is not None} policy={_policy.name}")
+
+            if _mamba_comp is not None and _policy.name != "native":
+                # Capture bound methods before replacing
+                _orig_start_b = _mamba_comp._evict_device_start
+                _orig_next_b = _mamba_comp._evict_device_next_node
+                _orig_end_b = _mamba_comp._evict_device_end
+
+                def _policy_start(request_cnt, orig=_orig_start_b,
+                                   comp=_mamba_comp, pol=_policy, tc=_tc_ednn):
+                    """Pre-sort: collect evictable leaves, sort by policy."""
+                    orig(request_cnt)  # Native cursor + request_cnt setup
                     try:
-                        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _PCT
-                        if ct != _PCT.MAMBA or node_id is None:
-                            return node_id, made_progress
-                    except Exception:
-                        return node_id, made_progress
-                    # Get prefix hash for node identity
-                    _hash = ""
-                    try:
-                        _node = _tc_ednn.node_by_id(node_id) if _tc_ednn else None
-                        if _node is not None:
-                            _h = getattr(_node, 'hash_value', None)
-                            if _h:
-                                _hash = str(_h[-1]) if isinstance(_h, list) else str(_h)
-                    except Exception:
-                        pass
-                    # Policy decision
-                    if pol.should_evict(node_id, _hash):
-                        _skip_count[0] = 0  # Reset on successful eviction
-                        pol.record_eviction(node_id, _hash)
-                        logger.info(f"[POLICY:{pol.name}] EVICT node={node_id} hash={_hash[:8]}")
-                        kda_obs.log_event("policy_evict",
+                        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _CT
+                        _lru = tc.lru_lists.get(_CT.MAMBA)
+                        _evictable = tc.evictable_device_leaves
+                        _enabled = getattr(tc, 'enable_session_radix_cache', False)
+
+                        _candidates = []
+                        _node = _lru.get_lru_no_lock() if _lru else None
+                        _wc = 0
+                        while _node is not None and _wc < 10000:
+                            if _node in _evictable:
+                                _ce = True
+                                if _enabled:
+                                    _ce = comp._can_evict_leaf_atomically(_node)
+                                if _ce:
+                                    _candidates.append((_node, _node_prefix_hash(_node)))
+                            _node = _lru.get_prev_no_lock(_node) if _lru else None
+                            _wc += 1
+
+                        # Set current time for Oracle policy
+                        if hasattr(pol, 'set_current_time'):
+                            pol.set_current_time(StateManager.get_global_clock())
+                        _sorted = pol.select_victims(_candidates, _lru, tc)
+                        comp._policy_evict_queue = [n for n, _ in _sorted]
+                        comp._policy_evict_hashes = [h for _, h in _sorted]
+                        comp._policy_evict_idx = 0
+                        _prio_list = []
+                        for n, h in _sorted[:10]:
+                            _prio_list.append(f"n{n.id}:{pol.get_priority(h):.1f}")
+                        logger.info(f"[POLICY:{pol.name}] start: req={request_cnt} "
+                                    f"cand={len(_candidates)} q={len(_sorted)} "
+                                    f"top=[{', '.join(_prio_list)}]")
+                        kda_obs.log_event("policy_start",
                             virtual_time=StateManager.get_global_clock(),
-                            extra={"policy": pol.name, "node_id": node_id,
-                                   "hash": _hash[:16], "action": "evict"})
-                        return node_id, made_progress
+                            extra={"policy": pol.name, "request_cnt": request_cnt,
+                                   "candidates": len(_candidates),
+                                   "queue_size": len(_sorted)})
+                    except Exception as e:
+                        logger.warning(f"[POLICY:{pol.name}] start error: {e}")
+                        comp._policy_evict_queue = None
+
+                def _policy_next(tracker, device_frees, host_frees,
+                                 orig=_orig_next_b, comp=_mamba_comp,
+                                 pol=_policy, tc=_tc_ednn):
+                    """Pop from pre-sorted queue. Fall back to native."""
+                    _queue = getattr(comp, '_policy_evict_queue', None)
+                    if _queue is not None:
+                        try:
+                            from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _CT
+                            _lru = tc.lru_lists.get(_CT.MAMBA)
+                            _evictable = tc.evictable_device_leaves
+                            _enabled = getattr(tc, 'enable_session_radix_cache', False)
+
+                            while comp._policy_evict_idx < len(_queue):
+                                _node = _queue[comp._policy_evict_idx]
+                                _ph = comp._policy_evict_hashes[comp._policy_evict_idx]
+                                comp._policy_evict_idx += 1
+                                if _lru and _lru.in_list(_node) and _node in _evictable:
+                                    _ce = True
+                                    if _enabled:
+                                        _ce = comp._can_evict_leaf_atomically(_node)
+                                    if _ce:
+                                        pol.record_eviction(_node.id, _ph)
+                                        logger.info(f"[POLICY:{pol.name}] EVICT "
+                                                    f"node={_node.id} hash={_ph[:8]}")
+                                        kda_obs.log_event("policy_evict",
+                                            virtual_time=StateManager.get_global_clock(),
+                                            extra={"policy": pol.name, "node_id": _node.id,
+                                                   "hash": _ph[:16], "action": "evict"})
+                                        return _node.id
+                            # Queue exhausted
+                            comp._policy_evict_queue = None
+                            logger.info(f"[POLICY:{pol.name}] queue exhausted → native fallback")
+                            return orig(tracker, device_frees, host_frees)
+                        except Exception as e:
+                            logger.warning(f"[POLICY:{pol.name}] next error: {e}")
+                            comp._policy_evict_queue = None
+                            return orig(tracker, device_frees, host_frees)
                     else:
-                        _skip_count[0] += 1
-                        if _skip_count[0] >= _MAX_SKIPS:
-                            logger.info(f"[POLICY:{pol.name}] MAX_SKIPS reached, force evict node={node_id}")
-                            pol.record_eviction(node_id, _hash)
-                            return node_id, made_progress
-                        logger.info(f"[POLICY:{pol.name}] SKIP node={node_id} hash={_hash[:8]} (skip_count={_skip_count[0]})")
-                        kda_obs.log_event("policy_evict",
-                            virtual_time=StateManager.get_global_clock(),
-                            extra={"policy": pol.name, "node_id": node_id,
-                                   "hash": _hash[:16], "action": "skip"})
-                        return None, True  # Skip: pretend internal progress
-                self._evict_device_next_node = _policy_evict_next
-                logger.info(f"[Phase2] KDA eviction policy '{_policy.name}' installed on _evict_device_next_node")
+                        return orig(tracker, device_frees, host_frees)
+
+                def _policy_end(orig=_orig_end_b, comp=_mamba_comp):
+                    """Clear policy queue on eviction end."""
+                    comp._policy_evict_queue = None
+                    comp._policy_evict_idx = 0
+                    orig()
+
+                _mamba_comp._evict_device_start = _policy_start
+                _mamba_comp._evict_device_next_node = _policy_next
+                _mamba_comp._evict_device_end = _policy_end
+                logger.info(f"[Phase2] Pre-sort eviction policy '{_policy.name}' "
+                            f"installed on MambaComponent")
                 # Hook inc_lock_ref and dec_lock_ref
                 _orig_inc = getattr(_tc_ednn, 'inc_lock_ref', None)
                 _orig_dec = getattr(_tc_ednn, 'dec_lock_ref', None)
@@ -2474,15 +2554,13 @@ class C_HiRadixCacheHook(BaseHook):
                 if _bmn is not None:
                     try:
                         from hisim.simulation import kda_policy as _kp
+                        from hisim.simulation.kda_policy import _node_prefix_hash
                         _pol = _kp.get_policy()
                         _vt = StateManager.get_global_clock()
                         _node = self.tree_core.node_by_id(_bmn) if hasattr(self, 'tree_core') else None
-                        _hash = ""
-                        if _node is not None:
-                            _h = getattr(_node, 'hash_value', None)
-                            if _h:
-                                _hash = str(_h[-1]) if isinstance(_h, list) else str(_h)
-                        _pol.record_access(int(_bmn), _hash, _vt)
+                        _hash = _node_prefix_hash(_node) if _node is not None else ""
+                        if _hash:
+                            _pol.record_access(int(_bmn), _hash, _vt)
                     except Exception:
                         pass
 

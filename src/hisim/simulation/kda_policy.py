@@ -1,22 +1,100 @@
 """KDA Eviction Policy interface for Phase 2 strategy experiments.
 
-Hook point: tree_core.evict_device_next_node (inside wrapped_init_hicache)
-- Native LRU cursor provides evictable candidates (same set for all policies)
-- Policy only filters WHICH candidate to evict first
-- Does NOT change: Lock, ACK, Allocator, Cascade, eviction execution
-- Does NOT re-enable HiSim Proactive Eviction
+Hook point: MambaComponent._evict_device_start / _evict_device_next_node
+  (inside wrapped_init_hicache, via tree_core.components_by_type[MAMBA])
+
+Design:
+  - _evict_device_start: after native cursor setup, walk LRU list to collect
+    ALL evictable MAMBA leaves, sort by policy, store as _policy_evict_queue.
+  - _evict_device_next_node: pop from pre-sorted queue (NO cursor advancement).
+    When queue exhausted, fall back to native walk (for tombstone cleanup).
+  - No side effects before policy decision: cursor NOT advanced for policy-
+    selected nodes. Device/host frees and tracker updates only happen for
+    nodes that are actually evicted (via _evict_device_leaf, native, unmodified).
+
+Safety:
+  - Same evictable candidate set (from evictable_device_leaves)
+  - Same capacity trigger (evict_for_alloc → _evict_components)
+  - Same eviction execution (_evict_device_leaf, lock/ACK/allocator/cascade)
+  - Does NOT re-enable HiSim Proactive Eviction
+  - Does NOT call allocator.free directly
+  - Does NOT modify Lock/ACK/Cascade semantics
+
+Checkpoint Identity:
+  - Uses (prefix_hash, checkpoint_depth) instead of node_id
+  - prefix_hash from node.hash_value (stable across node split/reinsert)
+  - checkpoint_depth from len(node.key) (token count at this node)
 """
 import os
 import time
+import hashlib
 import logging
 from collections import defaultdict, deque
-from typing import Optional
+from typing import Optional, List
 
 logger = logging.getLogger(__name__)
 
 
+def _node_prefix_hash(node) -> str:
+    """Extract stable prefix hash from a tree node.
+
+    Uses node.get_last_hash_value() + len(hash_value) for identity.
+    Stable across node split (same prefix → same last hash + length).
+    """
+    if node is None:
+        return ""
+    hv = getattr(node, 'hash_value', None)
+    if hv is None:
+        return ""
+    last = None
+    try:
+        last = node.get_last_hash_value()
+    except Exception:
+        pass
+    if last is not None:
+        return f"{last}_{len(hv)}"
+    if isinstance(hv, (list, tuple)) and len(hv) > 0:
+        return f"{hv[-1]}_{len(hv)}"
+    return ""
+
+
+def _node_first_token(node):
+    """Get the first token of the full prefix (root-to-node path).
+
+    Walks from node to root, collecting key segments.
+    Returns the first token of the first non-empty segment.
+    Handles node split (root key may be empty after split).
+    Used by Oracle to match nodes to trace entries.
+    """
+    if node is None:
+        return None
+    segments = []
+    cur = node
+    while cur is not None:
+        key = getattr(cur, 'key', None)
+        if key is not None and hasattr(key, '__len__') and len(key) > 0:
+            segments.insert(0, key)
+        cur = getattr(cur, 'parent', None)
+    if segments:
+        try:
+            return int(segments[0][0])
+        except (ValueError, TypeError, IndexError):
+            return segments[0][0]
+    return None
+
+
+def _node_depth(node) -> int:
+    """Get checkpoint depth (token count) from node."""
+    if node is None:
+        return 0
+    key = getattr(node, 'key', None)
+    if key is not None:
+        return len(key)
+    return 0
+
+
 class KDAEvictionPolicy:
-    """Base class: delegates to native LRU (no filtering)."""
+    """Base class: delegates to native LRU (no reordering)."""
 
     def __init__(self):
         self._name = "native"
@@ -29,94 +107,160 @@ class KDAEvictionPolicy:
         """Called when a prefix match accesses a checkpoint."""
         pass
 
-    def should_evict(self, node_id: int, prefix_hash: str = "") -> bool:
-        """Return True if this node should be evicted (native: always True)."""
-        return True
+    def select_victims(self, candidates: list, lru_list, tree_core) -> list:
+        """Sort/reorder evictable candidates. Return ordered list.
+
+        For NativeLRU: return as-is (already in LRU order from walk).
+        For HotnessAware/Oracle: reorder by policy.
+
+        Args:
+            candidates: list of (node, prefix_hash) in LRU order
+            lru_list: the LRU list (for tie-breaking)
+            tree_core: UnifiedTreeCore (for evictable_device_leaves, etc.)
+        Returns:
+            list of (node, prefix_hash) in eviction priority order
+        """
+        return candidates  # Native: no reordering
 
     def record_eviction(self, node_id: int, prefix_hash: str = ""):
         """Called after a node is evicted."""
         pass
+
+    def get_priority(self, prefix_hash: str) -> float:
+        """Lower = evict sooner. Used for logging/debugging."""
+        return 0.0
 
 
 class HotnessAwarePolicy(KDAEvictionPolicy):
     """Evict least-recently-accessed (cold) nodes first.
 
     Uses sliding window frequency + recency.
-    Tie-break: native LRU order.
+    Tie-break: native LRU order (preserved from candidate list).
     """
 
-    def __init__(self, window_size: int = 20, cold_threshold: int = 1):
+    def __init__(self, window_size: int = 20, cold_threshold: int = 0):
         super().__init__()
         self._name = "hotness"
         self._window_size = window_size
         self._cold_threshold = cold_threshold
-        # {node_id: deque([access_times])} — sliding window
+        # {prefix_hash: deque([access_times])} — sliding window
         self._access_history = defaultdict(deque)
-        # {node_id: last_access_time}
+        # {prefix_hash: last_access_time}
         self._last_access = {}
+        # {node_id: prefix_hash} for reverse lookup
+        self._node_to_hash = {}
 
     def record_access(self, node_id, prefix_hash, virtual_time):
-        hist = self._access_history[node_id]
+        if not prefix_hash:
+            return
+        hist = self._access_history[prefix_hash]
         hist.append(virtual_time)
         if len(hist) > self._window_size:
             hist.popleft()
-        self._last_access[node_id] = virtual_time
+        self._last_access[prefix_hash] = virtual_time
+        self._node_to_hash[node_id] = prefix_hash
 
-    def should_evict(self, node_id, prefix_hash=""):
-        count = len(self._access_history.get(node_id, []))
-        # Cold: fewer than threshold accesses in window → evict
-        # Hot: more accesses → preserve
-        if count <= self._cold_threshold:
-            return True  # Cold, evict
-        return False  # Hot, skip (let native LRU find another)
+    def select_victims(self, candidates, lru_list, tree_core):
+        """Sort: cold (fewer accesses) first, hot (more accesses) last.
+        Tie-break: native LRU order (stable sort preserves original order).
+        """
+        def hotness_key(item):
+            node, prefix_hash = item
+            count = len(self._access_history.get(prefix_hash, []))
+            return count  # Lower count = colder = evict first
+
+        # Stable sort: preserves LRU order for ties
+        return sorted(candidates, key=hotness_key)
+
+    def get_priority(self, prefix_hash):
+        return float(len(self._access_history.get(prefix_hash, [])))
 
     def record_eviction(self, node_id, prefix_hash=""):
-        self._access_history.pop(node_id, None)
-        self._last_access.pop(node_id, None)
+        self._access_history.pop(prefix_hash, None)
+        self._last_access.pop(prefix_hash, None)
+        self._node_to_hash.pop(node_id, None)
 
 
 class OraclePolicy(KDAEvictionPolicy):
-    """Ideal policy with future access knowledge.
+    """Ideal policy with future access knowledge (Belady's algorithm).
 
     Evicts nodes that will be re-accessed FARTHEST in the future,
-    or never re-accessed. This is a hit-rate reference (Belady's algorithm),
-    NOT a cost-aware TTFT optimizer.
+    or never re-accessed. This is a hit-rate reference, NOT a
+    cost-aware TTFT optimizer.
+
+    NOTE: Farthest-next-use Oracle maximizes hit rate but does NOT
+    guarantee TTFT optimality — a cost-aware oracle would also consider
+    restore latency and replay cost.
     """
 
-    def __init__(self, future_access_map: dict):
-        """future_access_map: {prefix_hash: [future_access_times]}"""
+    def __init__(self, future_access_map: dict = None):
         super().__init__()
         self._name = "oracle"
-        self._future = future_access_map
+        # {prefix_hash: [future_access_times]}
+        self._future = future_access_map or {}
         self._current_time = 0.0
-        self._future_idx = defaultdict(int)  # {prefix_hash: next_access_index}
+        self._future_idx = defaultdict(int)
         self._evicted = set()
 
     def set_current_time(self, t: float):
         self._current_time = t
 
-    def _next_access_time(self, prefix_hash: str) -> float:
-        times = self._future.get(prefix_hash, [])
-        idx = self._future_idx.get(prefix_hash, 0)
-        # Advance past accesses that already happened
+    def load_future_map(self, trace_path: str):
+        """Pre-compute future access map from trace file.
+
+        For each request, the first token identifies the session.
+        Build a map: str(first_token) -> [timestamps].
+        At eviction time, match node's root first_token to this map.
+        """
+        import json
+        prefix_access = defaultdict(list)
+        with open(trace_path) as f:
+            for line in f:
+                req = json.loads(line)
+                ts = req.get("timestamp", 0.0)
+                ids = req.get("input_ids", [])
+                if len(ids) > 0:
+                    prefix_key = str(ids[0])
+                    prefix_access[prefix_key].append(ts)
+        self._future = dict(prefix_access)
+        logger.info(f"Oracle: loaded {len(self._future)} prefix entries from {trace_path}")
+
+    def _next_access_time(self, prefix_key: str) -> float:
+        """Get next future access time for this prefix key."""
+        times = self._future.get(prefix_key, [])
+        idx = self._future_idx.get(prefix_key, 0)
         while idx < len(times) and times[idx] <= self._current_time:
             idx += 1
-        self._future_idx[prefix_hash] = idx
+        self._future_idx[prefix_key] = idx
         if idx < len(times):
             return times[idx]
         return float('inf')  # Never accessed again
 
-    def should_evict(self, node_id, prefix_hash=""):
-        if not prefix_hash:
-            return True  # No identity info, fall back to native
+    def select_victims(self, candidates, lru_list, tree_core):
+        """Sort: farthest-next-use first (evict nodes not needed soon).
+        Tie-break: native LRU order (stable sort).
+
+        Uses _node_first_token to match nodes to future access map.
+        This is a Belady's-style oracle (hit-rate reference), NOT a
+        cost-aware TTFT optimizer.
+        """
+        from hisim.simulation.kda_policy import _node_first_token
+        def oracle_key(item):
+            node, prefix_hash = item
+            first_tok = _node_first_token(node)
+            key = str(first_tok) if first_tok is not None else prefix_hash
+            next_t = self._next_access_time(key)
+            if next_t == float('inf'):
+                return float('inf')  # Never re-accessed, evict first
+            return next_t - self._current_time  # Larger distance = evict first
+
+        return sorted(candidates, key=oracle_key, reverse=True)
+
+    def get_priority(self, prefix_hash):
         next_t = self._next_access_time(prefix_hash)
         if next_t == float('inf'):
-            return True  # Never re-accessed, evict first
-        # Threshold: if next access is "far" (> 100s), evict
-        # This is a simplification of Belady's algorithm
-        if next_t - self._current_time > 100.0:
-            return True
-        return False  # Will be re-accessed soon, preserve
+            return float('inf')
+        return next_t - self._current_time
 
     def record_eviction(self, node_id, prefix_hash=""):
         self._evicted.add(prefix_hash)
@@ -127,14 +271,16 @@ def create_policy() -> KDAEvictionPolicy:
     name = os.environ.get("HISIM_KDA_POLICY", "native").lower()
     if name == "hotness":
         window = int(os.environ.get("HISIM_HOTNESS_WINDOW", "20"))
-        threshold = int(os.environ.get("HISIM_HOTNESS_THRESHOLD", "1"))
+        threshold = int(os.environ.get("HISIM_HOTNESS_THRESHOLD", "0"))
         p = HotnessAwarePolicy(window_size=window, cold_threshold=threshold)
         logger.info(f"KDA Policy: hotness (window={window}, threshold={threshold})")
         return p
     elif name == "oracle":
-        # Oracle needs future access map, loaded separately
-        p = OraclePolicy({})
-        logger.info("KDA Policy: oracle (future_access_map empty — load trace first)")
+        trace = os.environ.get("HISIM_ORACLE_TRACE", "")
+        p = OraclePolicy()
+        if trace:
+            p.load_future_map(trace)
+        logger.info(f"KDA Policy: oracle (trace={trace})")
         return p
     else:
         p = KDAEvictionPolicy()
