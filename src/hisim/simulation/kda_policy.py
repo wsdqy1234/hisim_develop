@@ -220,9 +220,10 @@ class OraclePolicy(KDAEvictionPolicy):
     def load_future_map(self, trace_path: str):
         """Pre-compute future access map from trace file.
 
-        Uses full prefix token hash (first 1024 tokens = checkpoint depth)
-        as identity. At eviction time, _node_prefix_identity(node) computes
-        the same hash from the node's root-to-node token sequence.
+        Uses full prefix token hash as identity. For build requests,
+        hash input_ids[:input_length]. For re-access/reuse requests
+        (input_length = build_length + 1), hash input_ids[:input_length-1]
+        so the hash matches the build's prefix.
         """
         import json, hashlib
         prefix_access = defaultdict(list)
@@ -231,11 +232,18 @@ class OraclePolicy(KDAEvictionPolicy):
                 req = json.loads(line)
                 ts = req.get("timestamp", 0.0)
                 ids = req.get("input_ids", [])
-                if len(ids) > 0:
-                    # Use first 1024 tokens (checkpoint depth) as identity
-                    prefix = ids[:1024]
-                    identity = hashlib.md5(str(prefix).encode()).hexdigest()[:16]
-                    prefix_access[identity].append(ts)
+                ilen = req.get("input_length", len(ids))
+                label = req.get("session_label", "")
+                if len(ids) == 0:
+                    continue
+                # For re-access/reuse (length = build+1), use build length
+                hash_len = ilen - 1 if ("reaccess" in label or "reuse" in label or "reaccess" in label) else ilen
+                hash_len = min(hash_len, len(ids))
+                if hash_len <= 0:
+                    hash_len = min(ilen, len(ids))
+                prefix = ids[:hash_len]
+                identity = hashlib.md5(str(prefix).encode()).hexdigest()[:16]
+                prefix_access[identity].append(ts)
         self._future = dict(prefix_access)
         logger.info(f"Oracle: loaded {len(self._future)} prefix entries from {trace_path}")
 
