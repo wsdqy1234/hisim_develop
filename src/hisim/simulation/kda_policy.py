@@ -292,7 +292,12 @@ class OraclePolicy(KDAEvictionPolicy):
 def create_policy() -> KDAEvictionPolicy:
     """Factory: select policy via HISIM_KDA_POLICY env var."""
     name = os.environ.get("HISIM_KDA_POLICY", "native").lower()
-    if name == "hotness":
+    if name == "neutral":
+        p = KDAEvictionPolicy()
+        p._name = "neutral"
+        logger.info("KDA Policy: neutral (pre-sort hook installed, no reordering)")
+        return p
+    elif name == "hotness":
         window = int(os.environ.get("HISIM_HOTNESS_WINDOW", "20"))
         threshold = int(os.environ.get("HISIM_HOTNESS_THRESHOLD", "0"))
         p = HotnessAwarePolicy(window_size=window, cold_threshold=threshold)
