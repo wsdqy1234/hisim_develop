@@ -2086,6 +2086,44 @@ class C_HiRadixCacheHook(BaseHook):
 
             # [A2] Install ednn_trace hook AND inc/dec_lock_ref hooks on tree_core
             _tc_ednn = getattr(self, 'tree_core', None)
+
+            # [P2B-FIX] Hook _drain_device_frees to prevent eviction-path double-free.
+            # When free_mamba_cache frees a slot (stale ref), the eviction later
+            # tries to free the same slot via _drain_device_frees → strict assert.
+            # Fix: pre-filter already-freed MAMBA slots before calling native free().
+            # This does NOT make free() idempotent — it's a pre-check in the
+            # eviction path. free() remains strict (asserts on double-free).
+            _orig_drain = getattr(self, '_drain_device_frees', None)
+            if _orig_drain is not None:
+                def _safe_drain_dev(device_frees, orig=_orig_drain, _self=self):
+                    try:
+                        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _DCT
+                        if _DCT.MAMBA in device_frees:
+                            _alloc = getattr(_self.cache.req_to_token_pool, 'mamba_allocator', None)
+                            if _alloc is not None and hasattr(_alloc, 'free_slots'):
+                                _free_set = set(_alloc.free_slots)
+                                _tensors = device_frees[_DCT.MAMBA]
+                                _filtered = []
+                                _skipped = 0
+                                for _t in _tensors:
+                                    _vals = _t.tolist() if hasattr(_t, 'tolist') else [int(_t)]
+                                    _remaining = [v for v in _vals if v not in _free_set]
+                                    _skipped += len(_vals) - len(_remaining)
+                                    if _remaining:
+                                        import torch as _torch
+                                        _filtered.append(_torch.tensor(_remaining, dtype=_t.dtype, device=_t.device))
+                                if _skipped > 0:
+                                    logger.info(f"[EVICT-PREFILTER] {_skipped} MAMBA slots already freed by free_mamba_cache, filtered from eviction")
+                                if _filtered:
+                                    device_frees[_DCT.MAMBA] = _filtered
+                                else:
+                                    del device_frees[_DCT.MAMBA]
+                    except Exception:
+                        pass
+                    return orig(device_frees)
+                self._drain_device_frees = _safe_drain_dev
+                logger.info("[P2B-FIX] _drain_device_frees pre-filter installed (eviction double-free prevention)")
+
             if _tc_ednn is not None and kda_obs.is_obs_enabled():
                 _orig_ednn_inst = getattr(_tc_ednn, 'evict_device_next_node', None)
                 if _orig_ednn_inst is not None:
