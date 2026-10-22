@@ -608,7 +608,7 @@ class MockReqToTokenPool:
                     import traceback as _tb
                     _stk = "".join(_tb.format_stack(limit=8))
                     for s in slots:
-                        self._ledger[s] = [("alloc", _alloc_count, _stk)]
+                        self._ledger[s] = [("alloc", self._alloc_count, _stk)]
                     _ma_l.info("[MA-ALLOC] n=%d slots=%s remaining=%d free=%s alloc_count=%d",
                                 n, slots, len(self.free_slots), self.free_slots, self._alloc_count)
                     return _torch.tensor(slots, dtype=_torch.int64, device=self.device)
