@@ -64,6 +64,7 @@ def _node_first_token(node):
     Walks from node to root, collecting key segments.
     Returns the first token of the first non-empty segment.
     Handles node split (root key may be empty after split).
+    Handles RadixKey (has .token_ids attribute, not directly subscriptable).
     Used by Oracle to match nodes to trace entries.
     """
     if node is None:
@@ -72,14 +73,19 @@ def _node_first_token(node):
     cur = node
     while cur is not None:
         key = getattr(cur, 'key', None)
-        if key is not None and hasattr(key, '__len__') and len(key) > 0:
-            segments.insert(0, key)
+        if key is not None:
+            # RadixKey has .token_ids (array[int])
+            token_ids = getattr(key, 'token_ids', None)
+            if token_ids is not None and len(token_ids) > 0:
+                segments.insert(0, token_ids)
+            elif hasattr(key, '__len__') and len(key) > 0:
+                segments.insert(0, key)
         cur = getattr(cur, 'parent', None)
     if segments:
         try:
             return int(segments[0][0])
         except (ValueError, TypeError, IndexError):
-            return segments[0][0]
+            return None
     return None
 
 
