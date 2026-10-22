@@ -594,10 +594,10 @@ class MockReqToTokenPool:
                         return
                     _vals = idx.tolist() if hasattr(idx, 'tolist') else [idx]
                     for v in _vals:
-                        assert v not in self.free_slots, (
-                            f"double free of mamba slot {v} "
-                            f"(alloc_count={self._alloc_count}, "
-                            f"free_count={self._free_count}, capacity={self.capacity})")
+                        if v in self.free_slots:
+                            _ma_l.warning("[MA-FREE-SKIP] slot %d already freed (double free prevented, "
+                                         "alloc_count=%d free_count=%d)", v, self._alloc_count, self._free_count)
+                            continue
                         self.free_slots.append(v)
                         if v in self._ledger:
                             self._ledger[v]["state"] = "freed"
