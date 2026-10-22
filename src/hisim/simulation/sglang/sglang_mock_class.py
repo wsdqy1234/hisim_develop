@@ -518,27 +518,20 @@ class MockReqToTokenPool:
         _alloc = self._mock_mamba_allocator if hasattr(self, "_mock_mamba_allocator") else None
 
         def _safe_free(val, label=""):
-            """Free slot only if still allocated and NOT reallocated to a new owner.
+            """Free slot only if still allocated (not already freed by eviction).
             
-            [P2B] Owner/Generation safety:
-            - Check 1: slot in free_slots → already freed by eviction (stale ref)
-            - Check 2: slot was reallocated (freed then alloc'd) → stale ref from
-              old owner, must NOT free (would free new owner's state)
+            [P2B] Safety: check val in free_slots to detect stale references
+            from eviction. Do NOT use was_reallocated() — it returns True
+            forever after one realloc, causing legitimate frees to be skipped
+            and the MAMBA pool to leak.
             """
             if val == -1 or val is None:
                 return
-            if _alloc is not None:
-                if val in _alloc.free_slots:
-                    _ma_l.warning("[MA-STALE] %s slot %d already freed (eviction?), "
-                                  "clearing stale ref (alloc_count=%d free_count=%d)",
-                                  label, val, _alloc._alloc_count, _alloc._free_count)
-                    return  # Don't call free() — slot already freed
-                # Check if slot was freed and reallocated (generation mismatch)
-                if _alloc.was_reallocated(val):
-                    _ma_l.warning("[MA-REALLOC-RISK] %s slot %d was freed+reallocated "
-                                  "(possible stale owner), skipping free to protect new owner",
-                                  label, val)
-                    return  # Don't free — might belong to new owner
+            if _alloc is not None and val in _alloc.free_slots:
+                _ma_l.warning("[MA-STALE] %s slot %d already freed (eviction?), "
+                              "clearing stale ref (alloc_count=%d free_count=%d)",
+                              label, val, _alloc._alloc_count, _alloc._free_count)
+                return  # Don't call free() — slot already freed
             self.mamba_allocator.free(_t.tensor([val], dtype=_t.int64))
 
         # 1. Always free the active mamba slot (if any).
