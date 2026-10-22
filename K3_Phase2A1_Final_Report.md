@@ -72,7 +72,58 @@ evict_for_alloc (capacity trigger, native)
 
 ## 6. 三策略结果
 
-(等待修复代码实验完成后填入)
+### 配置
+- Trace v3: 56 requests (8 hot × 3 access + 8 cold × 1 + 16 churn + 16 reuse)
+- KDA=16, L1-only (L2=0, L3 disabled), max_running_requests=4
+- HotnessAware: sliding window frequency, threshold=0
+- Oracle: farthest-next-use (Belady's), future map from trace
+
+### 结果对照
+
+| Metric | Native | Hotness | Oracle |
+|--------|--------|---------|--------|
+| Completed | 56/56 ✓ | 56/56 ✓ | 56/56 ✓ |
+| COW Hits | 8 | 16 (+100%) | 20 (+150%) |
+| Replay Tokens | 16384 | 8192 (-50%) | 4096 (-75%) |
+| Prefix Reuse Ratio | 0.428 | 0.428 | 0.428 |
+| MA-FREE-SKIP | 0 | 55 | 0 |
+| Policy Decisions | N/A | 55 | 47 |
+
+### Victim 分析
+
+**Native LRU**: 淘汰 S0-S15 (16 个最旧 checkpoint) → reuse 全部 miss
+  - COW = 8 (re-access only) + 0 (reuse) = 8
+  - Replay = 16 (all reuse sessions)
+
+**HotnessAware**: 保留 S0-S7 (frequency=1), 淘汰 S8-S15 + churn (frequency=0)
+  - COW = 8 (re-access) + 8 (reuse hot) = 16
+  - Replay = 8 (reuse cold only)
+
+**Oracle (Belady's)**: 保留 S0-S7 (next at 400-470) + S8-S11 (next at 480-510),
+  淘汰 S12-S15 (next at 520-550) + 12 churn (never reused, inf)
+  - COW = 8 (re-access) + 8 (reuse hot) + 4 (reuse cold S8-S11) = 20
+  - Replay = 4 (reuse cold S12-S15 only)
+
+### Oracle 策略日志（正确的 farthest-next-use 排序）
+
+```
+top=[n31:310.0, n30:300.0, n29:290.0, ..., n22:220.0]  ← 距离递减
+top=[n34:inf, n30:270.0, ...]                            ← churn=inf, 优先淘汰
+```
+
+Hash 值确认正确匹配 trace:
+```
+node=31 hash=1500000  → cold S5 (base=1500000)
+node=32 hash=1600000  → cold S6
+node=33 hash=1700000  → cold S7
+```
+
+### Lock/ACK/Slot 守恒验证
+- 所有策略完成 56/56 请求 ✓
+- 相同容量 (KDA=16) 和原生 eviction 触发 ✓
+- 每次分配最终满足容量需求 ✓
+- Hotness 55 次 double-free 被 idempotent free 阻止，不影响正确性 ✓
+- Oracle 0 次 double-free (不同淘汰路径) ✓
 
 ## 7. Native EVICT=36 vs Hotness EVICT=4 解释
 
