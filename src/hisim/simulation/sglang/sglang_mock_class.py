@@ -609,47 +609,37 @@ class MockReqToTokenPool:
                     pass
                 def alloc(self, n=1):
                     if n <= 0 or len(self.free_slots) < n:
-                        _ma_l.info("[MA-ALLOC-FAIL] n=%d available=%d free=%s alloc_count=%d free_count=%d",
-                                    n, len(self.free_slots), self.free_slots, self._alloc_count, self._free_count)
+                        _ma_l.debug("[MA-ALLOC-FAIL] n=%d available=%d", n, len(self.free_slots))
                         return None
                     slots = self.free_slots[:n]
                     self.free_slots = self.free_slots[n:]
                     self._alloc_count += n
-                    import traceback as _tb
-                    _stk = "".join(_tb.format_stack(limit=8))
                     for s in slots:
                         self._slot_gen[s] += 1
-                        _gen = self._slot_gen[s]
-                        self._ledger.setdefault(s, []).append(("alloc", _gen, self._alloc_count, _stk))
-                    _ma_l.info("[MA-ALLOC] n=%d slots=%s remaining=%d free=%s alloc_count=%d",
-                                n, slots, len(self.free_slots), self.free_slots, self._alloc_count)
+                    _ma_l.debug("[MA-ALLOC] n=%d slots=%s remaining=%d alloc_count=%d",
+                                n, slots, len(self.free_slots), self._alloc_count)
                     return _torch.tensor(slots, dtype=_torch.int64, device=self.device)
                 def free(self, idx):
                     if idx is None:
                         return
-                    import traceback as _tb
-                    _stk = "".join(_tb.format_stack(limit=8))
                     _vals = idx.tolist() if hasattr(idx, 'tolist') else [idx]
                     for v in _vals:
                         if v in self.free_slots:
                             _hist = self._ledger.get(v, [])
                             _ma_l.error("[MA-DOUBLE-FREE] slot %d (alloc_count=%d free_count=%d)",
                                         v, self._alloc_count, self._free_count)
-                            _ma_l.error("[MA-DOUBLE-FREE] slot %d history:", v)
-                            for _evt, _gen, _cnt, _s in _hist[-5:]:
-                                _ma_l.error("  %s (gen=%d, cnt=%d):\n%s", _evt, _gen, _cnt, _s[-200:])
-                            _ma_l.error("[MA-DOUBLE-FREE] current call:\n%s", _stk[-200:])
+                            for _evt, _gen, _cnt, _s in _hist[-3:]:
+                                _ma_l.error("  %s gen=%d cnt=%d", _evt, _gen, _cnt)
                             raise AssertionError(
                                 f"double free of mamba slot {v} "
                                 f"(alloc_count={self._alloc_count}, "
                                 f"free_count={self._free_count}, capacity={self.capacity})")
                         self._slot_gen[v] = self._slot_gen.get(v, 0) + 1
-                        _gen = self._slot_gen[v]
                         self.free_slots.append(v)
-                        self._ledger.setdefault(v, []).append(("free", _gen, self._free_count, _stk))
+                        # Only log to ledger on error (not every alloc/free)
                     self._free_count += len(_vals)
-                    _ma_l.info("[MA-FREE] slots=%s remaining=%d free=%s alloc_count=%d free_count=%d",
-                                _vals, len(self.free_slots), self.free_slots, self._alloc_count, self._free_count)
+                    _ma_l.debug("[MA-FREE] slots=%s remaining=%d alloc_count=%d free_count=%d",
+                                _vals, len(self.free_slots), self._alloc_count, self._free_count)
                 def get_slot_gen(self, slot_id):
                     """Get current generation of a slot for owner verification."""
                     return self._slot_gen.get(slot_id, -1)
