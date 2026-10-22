@@ -2130,7 +2130,7 @@ class C_HiRadixCacheHook(BaseHook):
             #   - Does NOT call allocator.free directly
             #   - Does NOT modify Lock/ACK/Cascade semantics
             from hisim.simulation import kda_policy as _kda_pol
-            from hisim.simulation.kda_policy import _node_first_token
+            from hisim.simulation.kda_policy import _node_prefix_identity
             _policy = _kda_pol.get_policy()
 
             try:
@@ -2167,7 +2167,7 @@ class C_HiRadixCacheHook(BaseHook):
                                 if _enabled:
                                     _ce = comp._can_evict_leaf_atomically(_node)
                                 if _ce:
-                                    _candidates.append((_node, str(_node_first_token(_node))))
+                                    _candidates.append((_node, _node_prefix_identity(_node)))
                             _node = _lru.get_prev_no_lock(_node) if _lru else None
                             _wc += 1
 
@@ -2554,14 +2554,13 @@ class C_HiRadixCacheHook(BaseHook):
                 if _bmn is not None:
                     try:
                         from hisim.simulation import kda_policy as _kp
-                        from hisim.simulation.kda_policy import _node_first_token
+                        from hisim.simulation.kda_policy import _node_prefix_identity
                         _pol = _kp.get_policy()
                         _vt = StateManager.get_global_clock()
                         _node = self.tree_core.node_by_id(_bmn) if hasattr(self, 'tree_core') else None
-                        _ft = _node_first_token(_node) if _node is not None else None
-                        _hash = str(_ft) if _ft is not None else ""
-                        if _hash:
-                            _pol.record_access(int(_bmn), _hash, _vt)
+                        _ident = _node_prefix_identity(_node) if _node is not None else ""
+                        if _ident:
+                            _pol.record_access(int(_bmn), _ident, _vt)
                     except Exception:
                         pass
 

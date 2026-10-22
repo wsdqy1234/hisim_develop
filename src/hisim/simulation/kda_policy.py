@@ -35,27 +35,34 @@ from typing import Optional, List
 logger = logging.getLogger(__name__)
 
 
-def _node_prefix_hash(node) -> str:
-    """Extract stable prefix hash from a tree node.
+def _node_prefix_identity(node) -> str:
+    """Stable identity from full root-to-node prefix token sequence.
 
-    Uses node.get_last_hash_value() + len(hash_value) for identity.
-    Stable across node split (same prefix → same last hash + length).
+    Walks root-to-node, collects all key.token_ids segments,
+    concatenates, and hashes with MD5. This is:
+    - Stable across node split (same prefix → same tokens → same hash)
+    - Stable across eviction + reinsert (same prefix → same hash)
+    - Different for different branches (even with same first token)
+    - Independent of slot generation (logical prefix, not physical slot)
     """
     if node is None:
         return ""
-    hv = getattr(node, 'hash_value', None)
-    if hv is None:
+    import hashlib
+    segments = []
+    cur = node
+    while cur is not None:
+        key = getattr(cur, 'key', None)
+        if key is not None:
+            token_ids = getattr(key, 'token_ids', None)
+            if token_ids is not None and len(token_ids) > 0:
+                segments.insert(0, list(token_ids))
+        cur = getattr(cur, 'parent', None)
+    if not segments:
         return ""
-    last = None
-    try:
-        last = node.get_last_hash_value()
-    except Exception:
-        pass
-    if last is not None:
-        return f"{last}_{len(hv)}"
-    if isinstance(hv, (list, tuple)) and len(hv) > 0:
-        return f"{hv[-1]}_{len(hv)}"
-    return ""
+    all_tokens = []
+    for seg in segments:
+        all_tokens.extend(seg)
+    return hashlib.md5(str(all_tokens).encode()).hexdigest()[:16]
 
 
 def _node_first_token(node):
@@ -65,7 +72,7 @@ def _node_first_token(node):
     Returns the first token of the first non-empty segment.
     Handles node split (root key may be empty after split).
     Handles RadixKey (has .token_ids attribute, not directly subscriptable).
-    Used by Oracle to match nodes to trace entries.
+    Kept for backward compatibility; prefer _node_prefix_identity.
     """
     if node is None:
         return None
@@ -74,7 +81,6 @@ def _node_first_token(node):
     while cur is not None:
         key = getattr(cur, 'key', None)
         if key is not None:
-            # RadixKey has .token_ids (array[int])
             token_ids = getattr(key, 'token_ids', None)
             if token_ids is not None and len(token_ids) > 0:
                 segments.insert(0, token_ids)
@@ -214,11 +220,11 @@ class OraclePolicy(KDAEvictionPolicy):
     def load_future_map(self, trace_path: str):
         """Pre-compute future access map from trace file.
 
-        For each request, the first token identifies the session.
-        Build a map: str(first_token) -> [timestamps].
-        At eviction time, match node's root first_token to this map.
+        Uses full prefix token hash (first 1024 tokens = checkpoint depth)
+        as identity. At eviction time, _node_prefix_identity(node) computes
+        the same hash from the node's root-to-node token sequence.
         """
-        import json
+        import json, hashlib
         prefix_access = defaultdict(list)
         with open(trace_path) as f:
             for line in f:
@@ -226,13 +232,15 @@ class OraclePolicy(KDAEvictionPolicy):
                 ts = req.get("timestamp", 0.0)
                 ids = req.get("input_ids", [])
                 if len(ids) > 0:
-                    prefix_key = str(ids[0])
-                    prefix_access[prefix_key].append(ts)
+                    # Use first 1024 tokens (checkpoint depth) as identity
+                    prefix = ids[:1024]
+                    identity = hashlib.md5(str(prefix).encode()).hexdigest()[:16]
+                    prefix_access[identity].append(ts)
         self._future = dict(prefix_access)
         logger.info(f"Oracle: loaded {len(self._future)} prefix entries from {trace_path}")
 
     def _next_access_time(self, prefix_key: str) -> float:
-        """Get next future access time for this prefix key."""
+        """Get next future access time for this prefix identity."""
         times = self._future.get(prefix_key, [])
         idx = self._future_idx.get(prefix_key, 0)
         while idx < len(times) and times[idx] <= self._current_time:
@@ -246,16 +254,17 @@ class OraclePolicy(KDAEvictionPolicy):
         """Sort: farthest-next-use first (evict nodes not needed soon).
         Tie-break: native LRU order (stable sort).
 
-        Uses _node_first_token to match nodes to future access map.
+        Uses _node_prefix_identity to match nodes to future access map.
         This is a Belady's-style oracle (hit-rate reference), NOT a
         cost-aware TTFT optimizer.
         """
-        from hisim.simulation.kda_policy import _node_first_token
+        from hisim.simulation.kda_policy import _node_prefix_identity
         def oracle_key(item):
-            node, prefix_hash = item
-            first_tok = _node_first_token(node)
-            key = str(first_tok) if first_tok is not None else prefix_hash
-            next_t = self._next_access_time(key)
+            node, prefix_identity = item
+            identity = prefix_identity
+            if not identity:
+                identity = _node_prefix_identity(node)
+            next_t = self._next_access_time(identity)
             if next_t == float('inf'):
                 return float('inf')  # Never re-accessed, evict first
             return next_t - self._current_time  # Larger distance = evict first

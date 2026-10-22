@@ -498,27 +498,42 @@ class MockReqToTokenPool:
         *args,
         **kwargs,
     ):
-        # Free mamba state cache slots when a request finishes (0.5.18+).
-        # Mirrors HybridReqToTokenPool.free_mamba_cache:
-        #   1. always free req.kv.mamba_pool_idx (the active state slot);
-        #   2. free the non-keep ping-pong slot (the keep slot belongs to the
-        #      prefix-cache value that was donated);
-        #   3. clear the req.kv tracking attributes.
+        """Free mamba state cache slots when a request finishes.
+
+        [P2A.2] Fix: check if slot was already freed by eviction before
+        calling mamba_allocator.free(). If slot is in free_slots, it was
+        already freed (stale reference from eviction) — clear the ref
+        without calling free() again. The free() method remains strict.
+        """
         if req is None:
             if args and hasattr(getattr(args[0], "kv", args[0]), "mamba_pool_idx"):
                 req = args[0]
             else:
                 return
         import torch as _t
+        import logging as _ma_l_log
+        _ma_l = _ma_l_log.getLogger("hisim.mock.mamba_allocator")
 
         _kv = req.kv
+        _alloc = self._mock_mamba_allocator if hasattr(self, "_mock_mamba_allocator") else None
+
+        def _safe_free(val, label=""):
+            """Free slot only if still allocated (not already freed by eviction)."""
+            if val == -1 or val is None:
+                return
+            if _alloc is not None and val in _alloc.free_slots:
+                _ma_l.warning("[MA-STALE] %s slot %d already freed (eviction?), "
+                              "clearing stale ref (alloc_count=%d free_count=%d)",
+                              label, val, _alloc._alloc_count, _alloc._free_count)
+                return  # Don't call free() — slot already freed
+            self.mamba_allocator.free(_t.tensor([val], dtype=_t.int64))
 
         # 1. Always free the active mamba slot (if any).
         _mpi = getattr(_kv, "mamba_pool_idx", None)
         if _mpi is not None:
             _mpi_val = _mpi.item() if hasattr(_mpi, "item") else int(_mpi)
             if _mpi_val != -1:
-                self.mamba_allocator.free(_t.tensor([_mpi_val], dtype=_t.int64))
+                _safe_free(_mpi_val, "mamba_pool_idx")
             _kv.mamba_pool_idx = None
 
         # 2. Free the non-keep ping-pong slot(s).
@@ -531,9 +546,7 @@ class MockReqToTokenPool:
                 _other = _pp[other_idx]
                 _other_val = _other.item() if hasattr(_other, "item") else int(_other)
                 if _other_val != -1:
-                    self.mamba_allocator.free(
-                        _t.tensor([_other_val], dtype=_t.int64)
-                    )
+                    _safe_free(_other_val, "ping_pong_keep")
             else:
                 _vals = []
                 for _i in range(len(_pp)):
@@ -541,7 +554,15 @@ class MockReqToTokenPool:
                     if _v != -1:
                         _vals.append(_v)
                 if _vals:
-                    self.mamba_allocator.free(_t.tensor(_vals, dtype=_t.int64))
+                    # Check each slot before batch free
+                    _to_free = []
+                    for _v in _vals:
+                        if _alloc is not None and _v in _alloc.free_slots:
+                            _ma_l.warning("[MA-STALE] ping_pong slot %d already freed, clearing", _v)
+                        else:
+                            _to_free.append(_v)
+                    if _to_free:
+                        self.mamba_allocator.free(_t.tensor(_to_free, dtype=_t.int64))
 
         # 3. Clear the req.kv tracking attributes.
         _kv.mamba_ping_pong_track_buffer = None
@@ -565,7 +586,7 @@ class MockReqToTokenPool:
                     self.free_slots = list(range(1, capacity + 1))
                     self._alloc_count = 0
                     self._free_count = 0
-                    # [A2] Slot ownership ledger: {slot_id: {owner, gen, state}}
+                    # [P2A.2] Slot ledger: {slot_id: [(event, ts, caller, stack)]}
                     self._ledger = {}
                     _ma_l.info("[MA-INIT] capacity=%d device=%s free_slots=%s", capacity, device, self.free_slots)
                 def available_size(self):
@@ -573,9 +594,9 @@ class MockReqToTokenPool:
                 def schedulable_available_size(self):
                     return len(self.free_slots)
                 def alloc_group_begin(self, n):
-                    pass  # no-op, slots are allocated individually
+                    pass
                 def alloc_group_end(self):
-                    pass  # no-op
+                    pass
                 def alloc(self, n=1):
                     if n <= 0 or len(self.free_slots) < n:
                         _ma_l.info("[MA-ALLOC-FAIL] n=%d available=%d free=%s alloc_count=%d free_count=%d",
@@ -584,24 +605,38 @@ class MockReqToTokenPool:
                     slots = self.free_slots[:n]
                     self.free_slots = self.free_slots[n:]
                     self._alloc_count += n
+                    import traceback as _tb
+                    _stk = "".join(_tb.format_stack(limit=8))
                     for s in slots:
-                        self._ledger[s] = {"owner": "alloc", "gen": self._alloc_count, "state": "allocated"}
+                        self._ledger[s] = [("alloc", _alloc_count, _stk)]
                     _ma_l.info("[MA-ALLOC] n=%d slots=%s remaining=%d free=%s alloc_count=%d",
                                 n, slots, len(self.free_slots), self.free_slots, self._alloc_count)
                     return _torch.tensor(slots, dtype=_torch.int64, device=self.device)
                 def free(self, idx):
                     if idx is None:
                         return
+                    import traceback as _tb
+                    _stk = "".join(_tb.format_stack(limit=8))
                     _vals = idx.tolist() if hasattr(idx, 'tolist') else [idx]
                     for v in _vals:
                         if v in self.free_slots:
-                            _ma_l.warning("[MA-FREE-SKIP] slot %d already freed (double free prevented, "
-                                         "alloc_count=%d free_count=%d)", v, self._alloc_count, self._free_count)
-                            continue
+                            # [P2A.2] STRICT: double-free detected — log full ledger and raise
+                            _hist = self._ledger.get(v, [])
+                            _ma_l.error("[MA-DOUBLE-FREE] slot %d (alloc_count=%d free_count=%d)",
+                                        v, self._alloc_count, self._free_count)
+                            _ma_l.error("[MA-DOUBLE-FREE] slot %d history:", v)
+                            for _evt, _cnt, _s in _hist:
+                                _ma_l.error("  %s (cnt=%d):\n%s", _evt, _cnt, _s)
+                            _ma_l.error("[MA-DOUBLE-FREE] current call:\n%s", _stk)
+                            raise AssertionError(
+                                f"double free of mamba slot {v} "
+                                f"(alloc_count={self._alloc_count}, "
+                                f"free_count={self._free_count}, capacity={self.capacity})")
                         self.free_slots.append(v)
                         if v in self._ledger:
-                            self._ledger[v]["state"] = "freed"
-                            self._ledger[v]["free_gen"] = self._free_count
+                            self._ledger[v].append(("free", self._free_count, _stk))
+                        else:
+                            self._ledger[v] = [("free_unknown", self._free_count, _stk)]
                     self._free_count += len(_vals)
                     _ma_l.info("[MA-FREE] slots=%s remaining=%d free=%s alloc_count=%d free_count=%d",
                                 _vals, len(self.free_slots), self.free_slots, self._alloc_count, self._free_count)
