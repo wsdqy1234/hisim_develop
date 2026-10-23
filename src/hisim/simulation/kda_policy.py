@@ -38,27 +38,49 @@ logger = logging.getLogger(__name__)
 def _node_prefix_identity(node) -> str:
     """Stable identity from full root-to-node prefix token sequence.
 
-    Walks root-to-node, collects all key.token_ids segments,
-    concatenates, and hashes with MD5. This is:
-    - Stable across node split (same prefix → same tokens → same hash)
-    - Stable across eviction + reinsert (same prefix → same hash)
-    - Different for different branches (even with same first token)
-    - Independent of slot generation (logical prefix, not physical slot)
+    Walks root-to-node, collects all key.raw_token_ids() segments,
+    converts to Python ints, concatenates, and hashes with MD5.
+
+    Uses raw_token_ids() (honors RadixKey.limit) instead of token_ids
+    (raw array, may include tokens beyond limit). Converts each token
+    to int() to ensure consistent str() representation across array('q'),
+    list, numpy, and trace-file JSON sources.
+
+    O(depth) walk + O(total_tokens) extend + O(string) MD5.
+    No O(n^2) insert(0); uses append + reverse.
+
+    Stable across node split (same prefix → same tokens → same hash).
+    Stable across eviction + reinsert (same prefix → same hash).
+    Different for different branches (even with same first token).
+    Independent of slot generation (logical prefix, not physical slot).
     """
     if node is None:
         return ""
-    import hashlib
     segments = []
     cur = node
     while cur is not None:
         key = getattr(cur, 'key', None)
         if key is not None:
-            token_ids = getattr(key, 'token_ids', None)
-            if token_ids is not None and len(token_ids) > 0:
-                segments.insert(0, list(token_ids))
+            # Prefer raw_token_ids() which honors RadixKey.limit;
+            # fall back to token_ids for non-RadixKey key types.
+            raw = None
+            if hasattr(key, 'raw_token_ids'):
+                try:
+                    raw = key.raw_token_ids()
+                except Exception:
+                    raw = None
+            if raw is None:
+                raw = getattr(key, 'token_ids', None)
+            if raw is not None and len(raw) > 0:
+                # Convert to Python ints for consistent str() representation.
+                # array('q') yields Python ints via list(), but numpy/torch
+                # elements may have different str(). int() normalizes all.
+                segments.append([int(t) for t in raw])
         cur = getattr(cur, 'parent', None)
     if not segments:
         return ""
+    # Reverse to get root-to-node order (collected leaf-to-root).
+    segments.reverse()
     all_tokens = []
     for seg in segments:
         all_tokens.extend(seg)
@@ -224,6 +246,10 @@ class OraclePolicy(KDAEvictionPolicy):
         hash input_ids[:input_length]. For re-access/reuse requests
         (input_length = build_length + 1), hash input_ids[:input_length-1]
         so the hash matches the build's prefix.
+
+        Converts all tokens to Python int before hashing to ensure
+        consistency with _node_prefix_identity (which also converts
+        array('q') elements to int).
         """
         import json, hashlib
         prefix_access = defaultdict(list)
@@ -237,11 +263,13 @@ class OraclePolicy(KDAEvictionPolicy):
                 if len(ids) == 0:
                     continue
                 # For re-access/reuse (length = build+1), use build length
-                hash_len = ilen - 1 if ("reaccess" in label or "reuse" in label or "reaccess" in label) else ilen
+                is_reaccess = ("reaccess" in label or "reuse" in label)
+                hash_len = ilen - 1 if is_reaccess else ilen
                 hash_len = min(hash_len, len(ids))
                 if hash_len <= 0:
                     hash_len = min(ilen, len(ids))
-                prefix = ids[:hash_len]
+                # Convert to Python int for consistent str() / MD5
+                prefix = [int(t) for t in ids[:hash_len]]
                 identity = hashlib.md5(str(prefix).encode()).hexdigest()[:16]
                 prefix_access[identity].append(ts)
         self._future = dict(prefix_access)
@@ -290,7 +318,11 @@ class OraclePolicy(KDAEvictionPolicy):
 
 
 def _full_node_depth(node) -> int:
-    """Compute total token count from root to node (full prefix depth)."""
+    """Compute total token count from root to node (full prefix depth).
+
+    Uses len(key) (effective length, honors RadixKey.limit and is_bigram)
+    instead of len(token_ids) (raw array length, may exceed effective).
+    """
     if node is None:
         return 0
     depth = 0
@@ -298,9 +330,14 @@ def _full_node_depth(node) -> int:
     while cur is not None:
         key = getattr(cur, 'key', None)
         if key is not None:
-            token_ids = getattr(key, 'token_ids', None)
-            if token_ids is not None:
-                depth += len(token_ids)
+            # Use len(key) for effective depth (honors limit/is_bigram).
+            try:
+                depth += len(key)
+            except TypeError:
+                # Fallback for non-RadixKey key types
+                token_ids = getattr(key, 'token_ids', None)
+                if token_ids is not None:
+                    depth += len(token_ids)
         cur = getattr(cur, 'parent', None)
     return depth
 
@@ -311,6 +348,8 @@ def _nearest_recoverable_ancestor_depth(node, tree_core) -> int:
     Walks from node's parent to root. Returns the depth (token count)
     of the nearest ancestor whose component_data[MAMBA].value is not None.
     Returns 0 if no valid ancestor (root or all ancestors evicted).
+
+    Uses len(key) for effective depth (honors RadixKey.limit/is_bigram).
 
     This enables Fork-Aware marginal cost:
       marginal = full_depth - ancestor_depth
@@ -324,9 +363,12 @@ def _nearest_recoverable_ancestor_depth(node, tree_core) -> int:
         while cur is not None:
             key = getattr(cur, 'key', None)
             if key is not None:
-                token_ids = getattr(key, 'token_ids', None)
-                if token_ids is not None:
-                    depth += len(token_ids)
+                try:
+                    depth += len(key)
+                except TypeError:
+                    token_ids = getattr(key, 'token_ids', None)
+                    if token_ids is not None:
+                        depth += len(token_ids)
             cd = cur.component_data[ct]
             if cd.value is not None:
                 return depth
@@ -383,9 +425,16 @@ class CostAwarePolicy(KDAEvictionPolicy):
     not the full prefix.
 
     Score = reuse_probability × marginal_cost (lower = evict first).
-    Cold checkpoints (prob=0) always evicted before hot ones.
+    Cold checkpoints (freq=0) get base_prob (configurable) instead of 0,
+    allowing marginal cost to differentiate among cold candidates.
     Among hot, lower marginal cost evicted first.
     Tie-break: native LRU order (stable sort).
+
+    Ablation via HISIM_COST_AWARE_BASE_PROB:
+      0.0  → cold all score 0 → degrades to Hotness (current P2C.1 behavior)
+      0.01 → minimal differentiation among cold
+      0.05 → moderate differentiation
+      0.10 → strong differentiation (cold almost as valuable as 1-access hot)
 
     Note: Oracle (Farthest-Next-Use) maximizes hit rate, not minimize
     replay tokens. Cost-Aware targets replay cost, which is different.
@@ -396,7 +445,10 @@ class CostAwarePolicy(KDAEvictionPolicy):
         self._name = "cost_aware"
         self._window_size = window_size
         self._access_history = defaultdict(deque)
+        self._base_prob = float(os.environ.get(
+            "HISIM_COST_AWARE_BASE_PROB", "0.0"))
         self._cost_log = []  # (node_id, full_depth, ancestor_depth, marginal, prob, score)
+        self._verify_log = []  # detailed verification log
 
     def record_access(self, node_id, prefix_hash, virtual_time):
         if not prefix_hash:
@@ -408,12 +460,13 @@ class CostAwarePolicy(KDAEvictionPolicy):
 
     def select_victims(self, candidates, lru_list, tree_core):
         self._cost_log = []
+        self._verify_log = []
 
         def cost_key(item):
             node, prefix_hash = item
             freq = len(self._access_history.get(prefix_hash, []))
-            # Estimated reuse probability: 0 if never accessed, scales with freq
-            prob = min(1.0, freq * 0.5)  # 2 accesses = 100%
+            # Estimated reuse probability: base_prob for cold, scales with freq
+            prob = max(self._base_prob, min(1.0, freq * 0.5))
 
             full_depth = _full_node_depth(node)
             ancestor_depth = _nearest_recoverable_ancestor_depth(node, tree_core)
@@ -422,6 +475,18 @@ class CostAwarePolicy(KDAEvictionPolicy):
             score = prob * marginal
             self._cost_log.append((getattr(node, 'id', -1), full_depth,
                                    ancestor_depth, marginal, prob, score))
+            # [P2C.2-VERIFY] Detailed marginal cost verification log
+            self._verify_log.append({
+                'node_id': getattr(node, 'id', -1),
+                'prefix_hash': prefix_hash[:16],
+                'freq': freq,
+                'full_depth': full_depth,
+                'ancestor_depth': ancestor_depth,
+                'marginal': marginal,
+                'prob': prob,
+                'score': score,
+                'has_checkpoint': True,  # it's an evictable leaf
+            })
             return score
 
         result = sorted(candidates, key=cost_key)
@@ -430,7 +495,8 @@ class CostAwarePolicy(KDAEvictionPolicy):
             _top = sorted(self._cost_log, key=lambda x: x[5])[:5]
             for nid, fd, ad, marg, prob, score in _top:
                 logger.info(f"[POLICY:cost_aware] node={nid} full={fd} ancestor={ad} "
-                            f"marginal={marg} prob={prob:.1f} score={score:.0f}")
+                            f"marginal={marg} prob={prob:.2f} score={score:.0f} "
+                            f"base_prob={self._base_prob}")
         return result
 
     def record_eviction(self, node_id, prefix_hash=""):
@@ -438,6 +504,10 @@ class CostAwarePolicy(KDAEvictionPolicy):
 
     def get_priority(self, prefix_hash):
         return float(len(self._access_history.get(prefix_hash, [])))
+
+    def get_verify_log(self):
+        """Return detailed marginal cost verification log."""
+        return self._verify_log
 
 
 def create_policy() -> KDAEvictionPolicy:
@@ -456,7 +526,8 @@ def create_policy() -> KDAEvictionPolicy:
     elif name == "cost_aware":
         window = int(os.environ.get("HISIM_HOTNESS_WINDOW", "20"))
         p = CostAwarePolicy(window_size=window)
-        logger.info(f"KDA Policy: cost-aware (window={window}, fork-aware marginal cost)")
+        logger.info(f"KDA Policy: cost-aware (window={window}, "
+                    f"base_prob={p._base_prob}, fork-aware marginal cost)")
         return p
     elif name == "hotness":
         window = int(os.environ.get("HISIM_HOTNESS_WINDOW", "20"))

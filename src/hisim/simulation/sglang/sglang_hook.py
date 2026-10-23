@@ -2214,16 +2214,26 @@ class C_HiRadixCacheHook(BaseHook):
                         # Set current time for Oracle policy
                         if hasattr(pol, 'set_current_time'):
                             pol.set_current_time(StateManager.get_global_clock())
+                        # [P2C.2-DIAG] Log candidate order BEFORE sort
+                        _before_ids = [getattr(n, 'id', -1) for n, _ in _candidates]
                         _sorted = pol.select_victims(_candidates, _lru, tc)
+                        _after_ids = [getattr(n, 'id', -1) for n, _ in _sorted]
+                        _order_changed = _before_ids != _after_ids
+                        if _order_changed and len(_candidates) > 1:
+                            logger.info(f"[POLICY:{pol.name}] SORT-CHANGED "
+                                        f"before={_before_ids[:10]} "
+                                        f"after={_after_ids[:10]} "
+                                        f"ncand={len(_candidates)}")
                         comp._policy_evict_queue = [n for n, _ in _sorted]
                         comp._policy_evict_hashes = [h for _, h in _sorted]
                         comp._policy_evict_idx = 0
                         _prio_list = []
                         for n, h in _sorted[:10]:
                             _prio_list.append(f"n{n.id}:{pol.get_priority(h):.1f}")
+                        _suffix = " ORDER_CHANGED" if _order_changed else ""
                         logger.info(f"[POLICY:{pol.name}] start: req={request_cnt} "
                                     f"cand={len(_candidates)} q={len(_sorted)} "
-                                    f"top=[{', '.join(_prio_list)}]")
+                                    f"top=[{', '.join(_prio_list)}]{_suffix}")
                         kda_obs.log_event("policy_start",
                             virtual_time=StateManager.get_global_clock(),
                             extra={"policy": pol.name, "request_cnt": request_cnt,
@@ -2598,9 +2608,37 @@ class C_HiRadixCacheHook(BaseHook):
                         _pol = _kp.get_policy()
                         _vt = StateManager.get_global_clock()
                         _node = self.tree_core.node_by_id(_bmn) if hasattr(self, 'tree_core') else None
-                        _ident = _node_prefix_identity(_node) if _node is not None else ""
-                        if _ident:
-                            _pol.record_access(int(_bmn), _ident, _vt)
+                        if _node is not None:
+                            _ident = _node_prefix_identity(_node)
+                            if _ident:
+                                _pol.record_access(int(_bmn), _ident, _vt)
+                            # [P2C.2-FIX] Also record for all ANCESTOR nodes
+                            # with MAMBA checkpoints. When best_match is a deep
+                            # leaf, the ancestor checkpoints are implicitly used
+                            # (SSM state at ancestor is the replay starting point).
+                            # When best_match is a shallow ancestor (e.g. 32K
+                            # shared root), this records the ancestor itself.
+                            try:
+                                from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _RACT
+                                _ct_m = _RACT.MAMBA
+                                _cur = getattr(_node, 'parent', None)
+                                _anc_count = 0
+                                while _cur is not None:
+                                    _cd = getattr(_cur, 'component_data', None)
+                                    if _cd is not None:
+                                        _mcd = _cd.get(_ct_m) if hasattr(_cd, 'get') else None
+                                        if _mcd is not None and getattr(_mcd, 'value', None) is not None:
+                                            _a_ident = _node_prefix_identity(_cur)
+                                            if _a_ident:
+                                                _pol.record_access(getattr(_cur, 'id', -1), _a_ident, _vt)
+                                                _anc_count += 1
+                                    _cur = getattr(_cur, 'parent', None)
+                                if _anc_count > 0 and _kp.logger.isEnabledFor(10):
+                                    _kp.logger.debug(
+                                        f"[RECORD-ACCESS] bmn={_bmn} ident={_ident[:8]} "
+                                        f"ancestors_recorded={_anc_count}")
+                            except Exception as _ae:
+                                pass
                     except Exception:
                         pass
 
