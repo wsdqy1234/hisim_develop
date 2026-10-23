@@ -4,10 +4,17 @@
 
 Phase 2C.2 fixed three P0 issues (Identity, Determinism, Ancestor Access Recording)
 and redesigned the Cost-Aware probability model. The key finding is that
-**Cost-Aware degradation is caused by incorrect future-access prediction, not
-by incorrect cost estimation** — the marginal cost calculation is verified correct,
-but the probability model (based on past frequency) cannot distinguish "cold but
-will be re-accessed" from "truly cold" candidates.
+**Cost-Aware degradation is caused by the cold-first eviction ORDER triggering
+cascade effects, not by incorrect cost estimation** — the marginal cost
+calculation is verified correct, but any reordering from Native's LRU order
+changes the cascade path. The same 4 nodes are evicted by all strategies, but
+Native/Oracle evict them in an order that avoids cascade (R=0), while
+Hotness/Depth/Cost-Aware evict cold-first, triggering cascade (R=820447).
+
+**Confirmed results (deterministic, seed=42):**
+- B2-Fork: 7/7 experiments complete — Native R=0, Hotness/Depth/Cost-Aware R=820447, Oracle R=0
+- B1-8K: 4/4 experiments complete — All non-Native strategies identical (COW=16, R=65536)
+- Mixed/B1-32K: NPU crash after 11 experiments — using P2C.1 data (non-deterministic)
 
 ## P0 Fixes Implemented
 
@@ -321,7 +328,15 @@ L1 eviction policies:
 - `f69987f`: Phase 2C.1 policies (DepthAwarePolicy, CostAwarePolicy)
 - `c097d7f`: Phase 2C.1 results (prob=0 issue identified)
 - `c9dab7d`: Phase 2C.1 non-determinism note
-- `a1b2c3d`: Phase 2C.2 identity fix (raw_token_ids, int conversion, O(n) reverse)
-- `b2c3d4e`: Phase 2C.2 ancestor access recording + sort diagnostic
-- `c3d4e5f`: Phase 2C.2 Cost-Aware base_prob + marginal cost verification
-- `3ff3543`: Phase 2C.2 run script fix (pkill instead of fuser)
+- Phase 2C.2 commits on `develop_dqy_evict_reuse`:
+  - Identity fix (`_node_prefix_identity`: raw_token_ids, int conversion, O(n) reverse)
+  - Depth fix (`_full_node_depth`, `_nearest_recoverable_ancestor_depth`: len(key))
+  - Oracle fix (`load_future_map`: int conversion for consistency)
+  - Ancestor access recording (sglang_hook.py: record for all ancestor checkpoints)
+  - Sort diagnostic (`SORT-CHANGED` logging in `_policy_start`)
+  - Cost-Aware base_prob (`HISIM_COST_AWARE_BASE_PROB` env var, ablation 0.0/0.01/0.05/0.10)
+  - Marginal cost verification logging (detailed per-candidate log)
+  - Determinism fix (`--random-seed=42`, `PYTHONHASHSEED=42`)
+  - Run script fix (pkill instead of fuser, no set -e)
+  - Identity consistency test (8K/32K/40K/128K, Fork, Split, Reinsert)
+  - Final report `K3_Phase2C2_CostAware_Validation.md`
