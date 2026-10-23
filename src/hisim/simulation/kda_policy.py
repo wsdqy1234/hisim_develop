@@ -289,6 +289,157 @@ class OraclePolicy(KDAEvictionPolicy):
         self._evicted.add(prefix_hash)
 
 
+def _full_node_depth(node) -> int:
+    """Compute total token count from root to node (full prefix depth)."""
+    if node is None:
+        return 0
+    depth = 0
+    cur = node
+    while cur is not None:
+        key = getattr(cur, 'key', None)
+        if key is not None:
+            token_ids = getattr(key, 'token_ids', None)
+            if token_ids is not None:
+                depth += len(token_ids)
+        cur = getattr(cur, 'parent', None)
+    return depth
+
+
+def _nearest_recoverable_ancestor_depth(node, tree_core) -> int:
+    """Find depth of nearest ancestor with valid MAMBA checkpoint in L1.
+
+    Walks from node's parent to root. Returns the depth (token count)
+    of the nearest ancestor whose component_data[MAMBA].value is not None.
+    Returns 0 if no valid ancestor (root or all ancestors evicted).
+
+    This enables Fork-Aware marginal cost:
+      marginal = full_depth - ancestor_depth
+    Example: 40K branch with 32K shared ancestor still in L1 → marginal = 8K
+    """
+    try:
+        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _CT
+        ct = _CT.MAMBA
+        cur = getattr(node, 'parent', None)
+        depth = 0
+        while cur is not None:
+            key = getattr(cur, 'key', None)
+            if key is not None:
+                token_ids = getattr(key, 'token_ids', None)
+                if token_ids is not None:
+                    depth += len(token_ids)
+            cd = cur.component_data[ct]
+            if cd.value is not None:
+                return depth
+            cur = getattr(cur, 'parent', None)
+        return 0
+    except Exception:
+        return 0
+
+
+class DepthAwarePolicy(KDAEvictionPolicy):
+    """Evict based on access frequency × checkpoint depth.
+
+    Score = frequency × full_depth (lower = evict first).
+    Cold checkpoints (freq=0) always evicted before hot ones.
+    Among same-frequency, shallower checkpoints evicted first.
+    Tie-break: native LRU order (stable sort).
+    """
+
+    def __init__(self, window_size=20):
+        super().__init__()
+        self._name = "depth"
+        self._window_size = window_size
+        self._access_history = defaultdict(deque)
+
+    def record_access(self, node_id, prefix_hash, virtual_time):
+        if not prefix_hash:
+            return
+        hist = self._access_history[prefix_hash]
+        hist.append(virtual_time)
+        if len(hist) > self._window_size:
+            hist.popleft()
+
+    def select_victims(self, candidates, lru_list, tree_core):
+        def depth_key(item):
+            node, prefix_hash = item
+            freq = len(self._access_history.get(prefix_hash, []))
+            depth = _full_node_depth(node)
+            return freq * depth
+        return sorted(candidates, key=depth_key)
+
+    def record_eviction(self, node_id, prefix_hash=""):
+        self._access_history.pop(prefix_hash, None)
+
+    def get_priority(self, prefix_hash):
+        return float(len(self._access_history.get(prefix_hash, [])))
+
+
+class CostAwarePolicy(KDAEvictionPolicy):
+    """Evict based on estimated reuse probability × marginal replay cost.
+
+    Marginal cost = full_depth - nearest_recoverable_ancestor_depth.
+    This is Fork-Aware: if a branch checkpoint is evicted but the shared
+    ancestor is still in L1, the replay cost is only the branch suffix,
+    not the full prefix.
+
+    Score = reuse_probability × marginal_cost (lower = evict first).
+    Cold checkpoints (prob=0) always evicted before hot ones.
+    Among hot, lower marginal cost evicted first.
+    Tie-break: native LRU order (stable sort).
+
+    Note: Oracle (Farthest-Next-Use) maximizes hit rate, not minimize
+    replay tokens. Cost-Aware targets replay cost, which is different.
+    """
+
+    def __init__(self, window_size=20):
+        super().__init__()
+        self._name = "cost_aware"
+        self._window_size = window_size
+        self._access_history = defaultdict(deque)
+        self._cost_log = []  # (node_id, full_depth, ancestor_depth, marginal, prob, score)
+
+    def record_access(self, node_id, prefix_hash, virtual_time):
+        if not prefix_hash:
+            return
+        hist = self._access_history[prefix_hash]
+        hist.append(virtual_time)
+        if len(hist) > self._window_size:
+            hist.popleft()
+
+    def select_victims(self, candidates, lru_list, tree_core):
+        self._cost_log = []
+
+        def cost_key(item):
+            node, prefix_hash = item
+            freq = len(self._access_history.get(prefix_hash, []))
+            # Estimated reuse probability: 0 if never accessed, scales with freq
+            prob = min(1.0, freq * 0.5)  # 2 accesses = 100%
+
+            full_depth = _full_node_depth(node)
+            ancestor_depth = _nearest_recoverable_ancestor_depth(node, tree_core)
+            marginal = max(1, full_depth - ancestor_depth)
+
+            score = prob * marginal
+            self._cost_log.append((getattr(node, 'id', -1), full_depth,
+                                   ancestor_depth, marginal, prob, score))
+            return score
+
+        result = sorted(candidates, key=cost_key)
+        # Log cost analysis for top candidates
+        if self._cost_log:
+            _top = sorted(self._cost_log, key=lambda x: x[5])[:5]
+            for nid, fd, ad, marg, prob, score in _top:
+                logger.info(f"[POLICY:cost_aware] node={nid} full={fd} ancestor={ad} "
+                            f"marginal={marg} prob={prob:.1f} score={score:.0f}")
+        return result
+
+    def record_eviction(self, node_id, prefix_hash=""):
+        self._access_history.pop(prefix_hash, None)
+
+    def get_priority(self, prefix_hash):
+        return float(len(self._access_history.get(prefix_hash, [])))
+
+
 def create_policy() -> KDAEvictionPolicy:
     """Factory: select policy via HISIM_KDA_POLICY env var."""
     name = os.environ.get("HISIM_KDA_POLICY", "native").lower()
@@ -296,6 +447,16 @@ def create_policy() -> KDAEvictionPolicy:
         p = KDAEvictionPolicy()
         p._name = "neutral"
         logger.info("KDA Policy: neutral (pre-sort hook installed, no reordering)")
+        return p
+    elif name == "depth":
+        window = int(os.environ.get("HISIM_HOTNESS_WINDOW", "20"))
+        p = DepthAwarePolicy(window_size=window)
+        logger.info(f"KDA Policy: depth-aware (window={window})")
+        return p
+    elif name == "cost_aware":
+        window = int(os.environ.get("HISIM_HOTNESS_WINDOW", "20"))
+        p = CostAwarePolicy(window_size=window)
+        logger.info(f"KDA Policy: cost-aware (window={window}, fork-aware marginal cost)")
         return p
     elif name == "hotness":
         window = int(os.environ.get("HISIM_HOTNESS_WINDOW", "20"))
