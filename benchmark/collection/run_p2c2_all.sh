@@ -2,7 +2,7 @@
 # Phase 2C.2: Full deterministic experiment suite
 # All runs with --random-seed=42 and PYTHONHASHSEED=42
 
-set -e
+# Note: no set -e — run_one handles errors internally
 
 # Helper function
 run_one() {
@@ -11,7 +11,9 @@ run_one() {
     local logtag="${tag}_${pol}"
     [ "$base_prob" != "0.0" ] && { outdir="${outdir}_bp${base_prob}"; logtag="${logtag}_bp${base_prob}"; }
 
-    fuser -k 30050/tcp 2>/dev/null; sleep 5
+    # Kill any process on port 30050 (fuser may not be available)
+    pkill -f "launch_server.*30050" 2>/dev/null || true
+    sleep 5
     rm -rf "$outdir" /tmp/hisim/hicache; mkdir -p "$outdir"
 
     export SGLANG_USE_CPU_ENGINE=1 TORCH_TRANSFER_TO_NPU=0 TORCH_DEVICE_BACKEND_AUTOLOAD=0
@@ -50,7 +52,7 @@ run_one() {
 
     if ! curl -s -m 2 "http://127.0.0.1:30050/health" >/dev/null 2>&1; then
         echo "[$logtag] NOT READY"
-        kill -9 $SRV 2>/dev/null; fuser -k 30050/tcp 2>/dev/null; sleep 5
+        pkill -f "launch_server.*30050" 2>/dev/null || true; sleep 5
         return 1
     fi
 
@@ -62,7 +64,7 @@ run_one() {
         --host 127.0.0.1 --port 30050 \
         > /tmp/opencode/p2c2_${logtag}_bench.log 2>&1 || true
 
-    kill -9 $SRV 2>/dev/null; fuser -k 30050/tcp 2>/dev/null; sleep 8
+    pkill -f "launch_server.*30050" 2>/dev/null || true; sleep 8
 
     echo -n "[$logtag] RESULT: "
     if [ -f "$outdir/metrics.json" ]; then
