@@ -194,19 +194,30 @@ DOES change the order. But the result is the same degradation.
 
 **Zero improvement for B2-Fork.** Both bp=0.0 and bp=0.05 produce R=820447.
 
-Root cause: the degradation is from **incorrect future-access prediction**,
-not from incorrect cost estimation:
+**EVICT sequence analysis reveals the cascade root cause:**
 
-- Hotness evicts node 22 (cold, freq=0) first
-- But node 22 WILL be re-accessed (Oracle: next-use=180)
-- Cost-Aware also evicts node 22 (cold, prob=0.05, score=1229)
-- Cost-Aware's marginal cost (24576) is correct but irrelevant —
-  the issue is that node 22 is cold by PAST frequency but hot by FUTURE access
+```
+Native:    22,23,20,21,29,32,35,31,34,[30,33,38,41],37,36  → R=0
+Hotness:   22,23,20,21,29,32,35,31,34,[38,41,30,33],37,40  → R=820447
+Oracle:    29,23,22,21,20,35,32,31,34,[30,33,41,38],37,36  → R=0
+CostAware: 22,23,21,29,20,32,35,31,34,[38,41,33,30],37,40  → R=820447
+```
 
-The marginal cost differentiates among cold candidates by replay cost, but
-ALL cold candidates have the same fundamental problem: they're predicted as
-"unlikely to be re-accessed" based on past frequency, but some WILL be
-re-accessed. Only the Oracle (with future knowledge) can distinguish these.
+**The same 4 nodes (30,33,38,41) are evicted, but in different ORDER.**
+- Native/Oracle evict 30,33 first → R=0 (optimal)
+- Hotness/CostAware evict 38,41 first → R=820447 (cascade degradation)
+
+The eviction ORDER determines cascade effects, not just WHICH nodes are
+evicted. Cold-first split (Hotness/CostAware) changes the cascade path,
+causing 820K replay. The marginal cost ordering among cold candidates
+(CostAware bp=0.05: 38,41 by marginal cost vs Hotness: 38,41 by LRU)
+doesn't help because the cold-first split is the root cause.
+
+Root cause: the degradation is from **incorrect eviction ORDER causing
+cascade effects**, not from incorrect cost estimation. Hotness evicts
+node 22 (cold by past freq=0) which WILL be re-accessed (Oracle: next-use
+=180). The evicted node triggers cascade replays. Only Oracle (with future
+knowledge) can identify the optimal order that avoids cascade.
 
 ### Q3: Does performance change come from Probability, Depth, or Marginal Cost?
 
