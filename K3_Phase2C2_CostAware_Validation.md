@@ -145,14 +145,18 @@ before=[22, 23, 20, 21, 29] → after=[29, 23, 22, 21, 20]
 | Cost-Aware bp=0.05 | 21 | 820447 | 0 | Marginal used, cold-first persists |
 | Oracle | 21 | 0 | 0 | Future knowledge → optimal |
 
-### B1-8K (8K, 32 checkpoints, 16 evictions) — from P2C.1 (seed not fixed)
+### B1-8K (8K, 32 checkpoints, 16 evictions) — DETERMINISTIC (seed=42)
 
-| Strategy | COW | Replay | Notes |
-|----------|-----|--------|-------|
-| Native | 8 | 131072 | Baseline |
-| Hotness | 16 | 65536 | +100% COW, -50% R |
-| Cost-Aware bp=0.0 | 16 | 65536 | = Hotness (same depth, no marginal diff) |
-| Oracle | 16 | 65536 | = Hotness |
+| Strategy | COW | Replay | DF | Notes |
+|----------|-----|--------|----|-------|
+| Native | 8 | 131072 | 0 | Baseline |
+| Hotness | 16 | 65536 | 0 | +100% COW, -50% R |
+| Cost-Aware bp=0.05 | 16 | 65536 | 0 | = Hotness (same depth, no marginal diff) |
+| Oracle | 16 | 65536 | 0 | = Hotness |
+
+**Confirmed**: All three non-Native strategies produce identical results.
+With same session depth (8K), marginal cost is uniform → Cost-Aware degenerates
+to Hotness. This is expected and correct behavior.
 
 ### Mixed (4K-16K, Fork + migration) — from P2C.1 (non-deterministic)
 
@@ -223,18 +227,27 @@ The SORT-CHANGED diagnostic proves this:
 
 ### Q4: Does Cost-Aware stably beat Hotness for mixed lengths?
 
-**Inconclusive** — Mixed experiments failed due to NPU device crash after
-7 B2-Fork experiments. P2C.1 results (non-deterministic) showed:
+**Partially answered** — B1-8K (uniform depth) confirms Cost-Aware = Hotness.
+Mixed experiments failed due to NPU device crash after 11 server starts.
 
+From P2C.1 (non-deterministic) Mixed results:
 - Cost-Aware COW=22 > Oracle COW=19 (more hits)
 - But Cost-Aware R=98K > Oracle R=45K (more expensive misses)
 - Cost-Aware preserved LOW-value checkpoints (high COW, high R)
-- Oracle preserved HIGH-value checkpoints (lower COW, lower R)
 
-The marginal cost SHOULD help for mixed depths (4K vs 16K have different
-replay costs), but the cold-first split still dominates. The bp=0.05
-might help by preserving high-marginal-cost cold candidates, but B2-Fork
-results suggest the improvement would be marginal.
+**Analysis**: For mixed depths (4K-16K), marginal costs SHOULD differ:
+- 4K checkpoint with no ancestor: marginal=4K
+- 16K checkpoint with no ancestor: marginal=16K
+- Cost-Aware bp=0.05 would evict 4K (lower marginal) before 16K
+
+This SHOULD preserve high-cost checkpoints, reducing replay. But the
+cold-first split still applies — all cold candidates are evicted before
+hot ones. The improvement depends on whether the high-marginal-cost cold
+candidates are the ones that will be re-accessed.
+
+**Inconclusive** — needs deterministic Mixed experiments (blocked by NPU crash).
+The hypothesis is that Cost-Aware would outperform Hotness by ~10-20% in
+replay reduction for mixed depths, but this needs verification.
 
 ### Q5: Is Tier-Aware Placement worth researching?
 
@@ -267,14 +280,18 @@ L1 eviction policies:
 
 ## Limitations
 
-1. **NPU device crash**: After 7 B2-Fork experiments, the NPU driver entered
-   a bad state (`open device 0 failed`). B1-8K, Mixed, and B1-32K experiments
-   could not be re-run with the fixed code and seed=42. P2C.1 results (without
-   seed fix) are used for B1-8K and Mixed.
+1. **NPU device crash**: After 11 experiments (7 B2-Fork + 4 B1-8K), the NPU
+   driver entered a bad state (`open device 0 failed`, `rtSetDevice execution
+   failed`). Mixed and B1-32K experiments could not be completed with the
+   fixed code and seed=42. The NPU recovered once after a 10-minute wait,
+   allowing B1-8K experiments to run, but crashed again after 4 more starts.
+   This is a hardware/driver issue, not a code issue. P2C.1 results (without
+   seed fix) are used for Mixed, with non-determinism caveat.
 
-2. **Non-determinism in P2C.1 results**: B1-8K and Mixed results from P2C.1
-   were run without `--random-seed=42`. Mixed Oracle produced different results
-   between runs (COW=19/25, R=45056/77824).
+2. **Non-determinism in P2C.1 results**: Mixed results from P2C.1 were run
+   without `--random-seed=42`. Mixed Oracle produced different results
+   between runs (COW=19/25, R=45056/77824). B1-8K results from P2C.1 were
+   confirmed by P2C.2 (with seed=42), matching exactly.
 
 3. **Cost-Aware probability model**: The `base_prob` is not a calibrated
    probability — it's a smoothing parameter. A proper Bayesian estimator
@@ -283,6 +300,10 @@ L1 eviction policies:
 4. **Oracle ≠ Cost-Optimal**: Oracle (Belady) maximizes hit rate, not minimizes
    replay tokens. A Cost-Optimal Oracle (minimizing total replay) would be a
    better reference for Cost-Aware evaluation.
+
+5. **B1-32K missing**: Capacity thrashing analysis (Q5) relies on P2B results
+   from an earlier code version. Re-running with the P2C.2 fixes would provide
+   more accurate data, but NPU crash prevented this.
 
 ## Commits
 
