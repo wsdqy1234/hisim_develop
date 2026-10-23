@@ -54,16 +54,22 @@ node=21: full=40960, ancestor=8191,  marginal=32769  ← 40K-8K=32K ✓
 
 ### Mixed (4K-16K tokens, 23 checkpoints, 7 evictions, Fork + 热点迁移)
 
-| Strategy | COW | Replay | Replay/Miss |
-|----------|-----|--------|-------------|
-| Cost-Aware | 22 | 98240 | 8930/miss |
-| Oracle | 19 | 45056 | 3218/miss |
+**注意：Mixed 结果存在非确定性（SGLang 默认随机 seed），两次运行 Oracle 结果不同。**
 
-**Cost-Aware 有更多 COW（22>19）但更高 Replay（98K>45K）**：
-- Cost-Aware 保留了更多 checkpoint（22 hits = 11 misses）
-- Oracle 保留了更少但更贵的 checkpoint（19 hits = 14 misses）
-- Oracle 的 miss 更便宜（3K/miss vs 9K/miss）
-- **说明 Cost-Aware 的 prob=0 分组保留了低价值 checkpoint，牺牲了高价值 ones**
+| Run | Strategy | COW | Replay | Replay/Miss |
+|-----|----------|-----|--------|-------------|
+| Old | Cost-Aware | 22 | 98240 | 8930/miss |
+| Old | Oracle | 19 | 45056 | 3218/miss |
+| New | Oracle | 25 | 77824 | 9728/miss |
+
+**非确定性根因**：`--random-seed` 未设置，SGLang 每次生成不同 seed → radix tree 结构不同 → eviction 候选不同 → 结果不同。
+
+**Phase 2C.2 修复**：添加 `--random-seed 42` 确保确定性。
+
+**已知结论**（尽管非确定性）：
+- Cost-Aware COW=22 > Oracle COW=19（旧运行）：Cost-Aware 保留更多 checkpoint
+- 但 Cost-Aware R=98K > Oracle R=45K：保留的是低价值 checkpoint
+- Oracle 优化命中率（Belady），不优化 Replay Cost
 
 ## Key Findings
 
@@ -115,8 +121,10 @@ node=21: full=40960, ancestor=8191,  marginal=32769  ← 40K-8K=32K ✓
 - `_node_prefix_identity` 对 40K token 路径可能超时或异常
 - 需要优化或使用更简单的 identity（如 node ID + depth）
 
-### 3. 重新评估 Cost-Aware 在 B2-Fork 和 Mixed 上的表现
-- 修复后重跑，验证边际成本是否能避免退化
+### 3. 修复非确定性
+- 添加 `--random-seed 42` 到服务器参数
+- 确保相同 Trace + 相同策略 → 相同结果
+- 当前 Mixed Oracle 两次运行结果不同（COW=19/25, R=45056/77824）
 
 ### 4. 考虑 Oracle 不等于 Cost-Optimal
 - Oracle (Belady) 优化命中率，不优化 Replay Cost
