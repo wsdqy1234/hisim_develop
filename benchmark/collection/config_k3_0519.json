@@ -1,0 +1,38 @@
+{
+  "platform": {
+    "accelerator": {
+      "name": "H20"
+    },
+    "disk_read_bandwidth_gb": 4.0,
+    "disk_write_bandwidth_gb": 4.0,
+    "memory_read_bandwidth_gb": 64.0,
+    "memory_write_bandwidth_gb": 64.0,
+    "storage_tiers": [
+      {
+        "name": "ssd",
+        "read_bandwidth_gb": 4.0,
+        "kvcm_storage_type": "pace",
+        "kvcm_bandwidth_mbps": 4000,
+        "kvcm_capacity_gb": 10.0,
+        "kvcm_priority": 0
+      }
+    ]
+  },
+  "predictor": {
+    "name": "k3_profile_based",
+    "database_path": null,
+    "device_name": "h20e_sxm",
+    "prefill_scale_factor": 1.0,
+    "decode_scale_factor": 1.0
+  },
+  "scheduler": {
+    "tp_size": 1,
+    "ep_size": 1,
+    "dp_size": 1,
+    "data_type": "FP16",
+    "kv_cache_data_type": "FP16",
+    "backend_name": "sglang",
+    "backend_version": "0.5.6.post2",
+    "mamba_slots_per_request": 5
+  }
+}
