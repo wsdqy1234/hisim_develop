@@ -86,6 +86,7 @@ class HotnessL2Policy(L2PlacementPolicy):
         hist.append(virtual_time)
         if len(hist) > self._window_size:
             hist.popleft()
+        logger.info(f"[L2-ACCESS:hotness] hash={slot_hash} freq={len(hist)} vt={virtual_time:.1f}")
 
     def record_eviction(self, slot_hash):
         # [P2C.3.2-FIX] Do NOT clear access history on eviction.
