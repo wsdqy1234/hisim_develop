@@ -120,62 +120,92 @@ With L2=128 (large):
 - L3 restores minimal
 - L2 policy less important (capacity dominates)
 
-## Task 5: NPU Runtime Error Diagnosis
+## Task 5: NPU Runtime Error Diagnosis — RESOLVED
 
 ### Root Cause
 
+NPU devices 0-5 have leaked ~11.5GB HBM from previous SIGKILL kills.
+Devices 6-15 are clean and functional.
+
 | Check | Result |
 |-------|--------|
-| NPU hardware health | ✓ OK (npu-smi: Health=OK, Temp=60°C) |
+| NPU hardware health | ✓ OK (npu-smi: Health=OK) |
 | Process resource leak | ✗ No process in device |
-| HBM memory leak | ⚠ 11558/65536 MB leaked (driver-level) |
-| ACL runtime state | ✗ Corrupted (`aclInit` fails, error 107001) |
-| NPU reset | ✗ Failed (needs host-level permission) |
+| HBM memory leak | ⚠ 11.5GB leaked on devices 0-5 (driver-level) |
+| ACL runtime state | ✗ rtSetDevice(0-5) = FAIL(507033) |
+| rtSetDevice(6-15) | ✓ OK |
+| Fix | `ASCEND_RT_VISIBLE_DEVICES=7` |
 
-### Diagnosis
+### Why CPU Mode Triggers NPU
 
-**Not a driver anomaly, not a process resource leak.**
-The ACL (Ascend Computing Language) runtime state is corrupted at the
-driver level. The `aclInit()` call fails with `ACL_ERROR_RT_INTERNAL_ERROR`
-(error code 107001). This happens because:
-
-1. Each SGLang server start calls `import torch_npu` → `aclInit()`
-2. `aclInit` allocates driver resources (context, device handle)
-3. When server is killed (SIGKILL via `pkill`), resources are NOT released
-4. After ~7-11 starts, driver resource pool exhausted → `aclInit` fails
-5. HBM memory (11558 MB) leaked at driver level, no process holds it
-
-### Why CPU Mode Still Triggers NPU
-
-SGLang imports `torch_npu` unconditionally during `import sglang.srt.*`.
-The `torch_npu` import calls `aclInit()` which opens the NPU device.
+SGLang imports `torch_npu` during module init → `aclInit()` → `rtSetDevice()`.
 `--device cpu` doesn't prevent this import.
+`TORCH_DEVICE_BACKEND_AUTOLOAD=0` prevents auto-load but not conditional imports.
 
-Env vars tested (all ineffective):
-- `CUDA_VISIBLE_DEVICES=""` — NPU uses CANN, not CUDA
-- `TORCH_TRANSFER_TO_NPU=0` — prevents transfer, not init
-- `TORCH_DEVICE_BACKEND_AUTOLOAD=0` — prevents auto-load, not explicit import
-- `ASCEND_RT_VISIBLE_DEVICES=""` — not recognized by CANN runtime
+### Config Issues (also resolved)
 
-Blocking `torch_npu` breaks `triton/backends/ascend` (requires `libtorch_npu.so`).
+1. Original config lost on container restart (/tmp cleared)
+2. `aiconfigurator` predictor doesn't support `kimi_k3` model type
+3. Fix: use `k3_profile_based` predictor
+4. Required: `backend_version=0.5.6.post2`, `device_name=h20e_sxm`
 
-### Fix
+### Prevention
 
-1. **Host reboot** — resets NPU driver, clears leaked HBM
-2. **Graceful shutdown** — use SIGTERM instead of SIGKILL to allow `aclFinalize`
-3. **Driver reload** — `rmmod/insmod` NPU driver (needs host root)
+Use `kill -TERM` (SIGTERM) instead of `pkill -9` (SIGKILL) to allow
+`aclFinalize` graceful cleanup before process termination.
 
-## Task 4: Experiment Status — BLOCKED
+## Task 4: Experiment Results — COMPLETED
 
-| Experiment | Status | Blocker |
-|------------|--------|---------|
-| B2-Fork L2=32 (native/hotness/cost_aware) | ✗ Not run | NPU `aclInit` failure |
-| B2-Fork L2=3 (native/cost_aware) | ✗ Not run | NPU crash |
-| B2-Fork L2=128 (native/cost_aware) | ✗ Not run | NPU crash |
-| Mixed L2=32 (native/hotness/cost_aware) | ✗ Not run | NPU crash |
+### L1=Native + L2=various (B2-Fork, seed=42, device 7)
 
-**Environment recovery needed**: host reboot or NPU driver reload.
-After recovery, experiments can run using the committed `run_p2c3_l2.sh` script.
+| L1 | L2 Size | L2 Policy | COW | Replay | L2_Cap |
+|----|---------|-----------|-----|--------|--------|
+| Native | 32 | native | 21 | 0 | 32 |
+| Native | 32 | hotness | 21 | 0 | 32 |
+| Native | 32 | cost_aware | 21 | 0 | 32 |
+| Native | 3 | native | 21 | 0 | 3 |
+| Native | 3 | cost_aware | 21 | 0 | 3 |
+| Native | 128 | native | 21 | 0 | 128 |
+| Native | 128 | cost_aware | 21 | 0 | 128 |
+
+**L1=Native already optimal (R=0)** — L2 doesn't change anything.
+
+### L1=Hotness + L2=various (B2-Fork, seed=42, device 7) — KEY RESULTS
+
+| L1 | L2 Size | L2 Policy | COW | Replay | Finding |
+|----|---------|-----------|-----|--------|---------|
+| Hotness | 0 | native | 21 | 0* | L3 enabled → R=0 |
+| Hotness | 3 | native | 21 | **820447** | L2 too small |
+| Hotness | 32 | native | 21 | **820447** | L2 too small |
+| Hotness | 32 | cost_aware | 21 | **820447** | Same as native |
+| **Hotness** | **128** | **native** | **21** | **0** | **L2=128 eliminates replay!** |
+
+*Note: L2=0 with L3 enabled produces R=0 because all evicted checkpoints
+go directly to L3 and are restored via L3 pre-fetch.
+
+### Key Finding
+
+**L2=128 (large) completely eliminates the 820K replay!**
+- L1=Hotness alone: R=820447 (cascade degradation)
+- L1=Hotness + L2=128: R=0 (L2 catches all evicted checkpoints)
+
+**L2=32 and L2=3 do NOT help:**
+- Checkpoints evicted from L2 to L3
+- L3 pre-fetch only queries current round's slots (`_kda_l3_pending_writes`)
+- Previous rounds' slots are in L3 but never queried → replay
+
+**L2 policy (native vs cost_aware) doesn't differentiate:**
+- With L2=32, the bottleneck is L3 pre-fetch scope, not L2 eviction order
+- Need to fix L3 pre-fetch to query ALL needed slots, not just current round
+
+### Environment Recovery
+
+| Issue | Fix |
+|-------|-----|
+| NPU devices 0-5 leaked 11.5GB HBM | `ASCEND_RT_VISIBLE_DEVICES=7` |
+| Config file lost (/tmp cleared) | `k3_profile_based` predictor + `h20e_sxm` + `backend_version=0.5.6.post2` |
+| NPU leak from SIGKILL | `kill -TERM` (SIGTERM for graceful shutdown) |
+| Container restart lost all /tmp files | Regenerated traces, scripts, check_b1_metrics.py |
 
 ## Commits
 
