@@ -1429,13 +1429,19 @@ class C_HiRadixCacheHook(BaseHook):
                 # HiCacheFile (if C_StorageBackendFactory hook didn't fire) which
                 # lacks batch_set/batch_exists.
                 # [P0-2] HISIM_DISABLE_L3=1 forces _storage=None for true L1-only
-                if os.environ.get("HISIM_DISABLE_L3", ""):
+                # [P2C.3.1-FIX] "0" is a non-empty string and is truthy in Python,
+                # so the old check `if os.environ.get("HISIM_DISABLE_L3", ""):` wrongly
+                # disabled L3 when the user set HISIM_DISABLE_L3=0 (meaning L3 enabled).
+                # Only treat explicit truthy values ("1", "true", "yes") as disable.
+                _l3_disable_val = os.environ.get("HISIM_DISABLE_L3", "").strip().lower()
+                if _l3_disable_val in ("1", "true", "yes", "on"):
                     _storage = None
-                    logger.info("L3 storage disabled (HISIM_DISABLE_L3=1) — true L1-only mode")
+                    logger.info(f"L3 storage disabled (HISIM_DISABLE_L3={_l3_disable_val!r}) — true L1-only mode")
                 else:
                     _storage = getattr(cache.cache_controller, 'storage_backend', None)
                     if not isinstance(_storage, MockHiCacheStorage):
                         _storage = MockHiCacheStorage()
+                    logger.info(f"L3 storage ENABLED (HISIM_DISABLE_L3={_l3_disable_val!r}) — st={type(_storage).__name__}")
 
                 # L3 timing helpers
                 _disk_write_bw = 8e9  # 8 GB/s default
