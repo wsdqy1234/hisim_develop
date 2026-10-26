@@ -1502,7 +1502,27 @@ class C_HiRadixCacheHook(BaseHook):
                                     # match). The loop index disambiguates
                                     # multiple slots within one node.
                                     _slot_hash = f"kda_{_nid}_{_i}"
-                                    mh.backup_from_device(_slot_idx, _slot_hash)
+                                    # [P2C.3.1] Compute checkpoint depth
+                                    # (prefix length) from tree node for
+                                    # CostAwareL2Policy eviction scoring.
+                                    # depth = sum of key lengths from root
+                                    # to this node = total token offset.
+                                    _depth = 0
+                                    try:
+                                        _tnode = _tc.node_by_id(_nid) if (_tc is not None and hasattr(_tc, 'node_by_id')) else None
+                                        _walker = _tnode
+                                        while _walker is not None and getattr(_walker, 'key', None) is not None:
+                                            try:
+                                                _depth += len(_walker.key)
+                                            except TypeError:
+                                                _depth += 1
+                                                break
+                                            _walker = getattr(_walker, 'parent', None)
+                                    except Exception:
+                                        pass
+                                    mh.backup_from_device(_slot_idx, _slot_hash, depth=_depth)
+                                    if kda_obs.is_obs_enabled() and _i == 0:
+                                        logger.info(f"[KDA-DEPTH] node={_nid} depth={_depth} hash={_slot_hash}")
                                     _mamba_slot_hashes.append(_slot_hash)
                                     # [A2] Shadow: register + backup_l2
                                     if kda_obs.is_obs_enabled():

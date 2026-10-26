@@ -108,6 +108,8 @@ class HotnessL2Policy(L2PlacementPolicy):
             if freq == min_freq:
                 # Remove from LRU and slots
                 l2_pool._lru.pop(slot_hash, None)
+                logger.info(f"[L2-VICTIM:hotness] hash={slot_hash} freq={freq} "
+                           f"candidates={len(candidates)} min_freq={min_freq}")
                 return slot_hash
         return None
 
