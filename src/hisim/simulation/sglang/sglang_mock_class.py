@@ -1787,6 +1787,11 @@ class MockMambaStatePoolHost:
     """Simulates KDA state DRAM backup pool (L2).
     Handles D2H (backup) and H2D (load_back/COW) timing for 14.45MB/slot transfers.
     Uses the same bandwidth model as MockTokenToKVPoolHost but with slot granularity.
+
+    [P2C.3] Tier-Aware Placement: supports pluggable L2 eviction policy.
+    Policy is installed via HISIM_L2_POLICY env var. The policy decides
+    which L2 slots to evict to L3 when L2 is full. L1 eviction is NOT
+    modified — L1 stays native LRU.
     """
 
     MEMORY_READ_BANDWIDTH_BYTES = None
@@ -1803,6 +1808,18 @@ class MockMambaStatePoolHost:
         from collections import OrderedDict
         self._lru = OrderedDict()  # {slot_hash: access_time}
         self.layer_transfer_counter = None
+        # [P2C.3] Tier-Aware L2 placement policy
+        self._policy = None  # set lazily via get_l2_policy()
+
+    def _get_policy(self):
+        """Lazily get L2 placement policy (avoids import during __init__)."""
+        if self._policy is None:
+            try:
+                from hisim.simulation.l2_placement_policy import get_l2_policy
+                self._policy = get_l2_policy()
+            except Exception:
+                self._policy = None  # Fallback to native LRU
+        return self._policy
 
     def available_size(self):
         return len(self.free_slots)
@@ -1856,11 +1873,14 @@ class MockMambaStatePoolHost:
             bw = self.MEMORY_WRITE_BANDWIDTH_BYTES * eff
         return size_bytes * bw / (t0 * bw + size_bytes)
 
-    def backup_from_device(self, slot_idx: int, slot_hash: str, from_l3: bool = False):
+    def backup_from_device(self, slot_idx: int, slot_hash: str, from_l3: bool = False,
+                           depth: int = 0):
         """D2H: Backup one slot (MAMBA_SLOT_BYTES) from HBM to DRAM. Accumulates timing.
 
         If from_l3=True, this is an L3→L2 restore (data already in DRAM from SSD read).
         No additional D2H timing — SSD read timing is handled by the caller.
+
+        [P2C.3] depth parameter: checkpoint depth (token count) for CostAwareL2Policy.
         """
         from hisim.simulation.manager.state import StateManager
 
@@ -1876,11 +1896,27 @@ class MockMambaStatePoolHost:
         self._slots[slot_hash] = slot_idx
         self._lru[slot_hash] = len(self._lru)
 
-        # Evict if L2 full — collect evicted hashes for L3 promotion
+        # [P2C.3] Record admission for L2 policy
+        _pol = self._get_policy()
+        if _pol is not None:
+            _pol.record_admission(slot_hash, slot_idx, depth)
+
+        # Evict if L2 full — use L2 placement policy if available
         _evicted = []
         while len(self._slots) > self.size:
-            evicted_hash, _ = self._lru.popitem(last=False)
+            if _pol is not None:
+                evicted_hash = _pol.select_victim(self)
+            else:
+                # Fallback: native LRU
+                evicted_hash = None
+                if self._lru:
+                    evicted_hash, _ = self._lru.popitem(last=False)
+            if evicted_hash is None:
+                break
             self._slots.pop(evicted_hash, None)
+            self._lru.pop(evicted_hash, None)
+            if _pol is not None:
+                _pol.record_eviction(evicted_hash)
             _evicted.append(evicted_hash)
         if _evicted:
             # Accumulate: a single write batch may trigger several evictions,
@@ -1901,10 +1937,26 @@ class MockMambaStatePoolHost:
 
         # Update LRU
         self._lru.move_to_end(slot_hash)
+
+        # [P2C.3] Record access for L2 policy
+        _pol = self._get_policy()
+        if _pol is not None:
+            _pol.record_access(slot_hash, StateManager.get_global_clock())
         return self._slots[slot_hash]
 
     def evict(self) -> str:
-        """Evict LRU slot from L2 (for L3 backup). Returns slot_hash or None."""
+        """Evict one slot from L2 (for L3 backup). Returns slot_hash or None.
+
+        [P2C.3] Uses L2 placement policy if available, otherwise native LRU.
+        """
+        _pol = self._get_policy()
+        if _pol is not None:
+            victim = _pol.select_victim(self)
+            if victim is not None:
+                self._slots.pop(victim, None)
+                _pol.record_eviction(victim)
+            return victim
+        # Fallback: native LRU
         if not self._lru:
             return None
         slot_hash, _ = self._lru.popitem(last=False)

@@ -906,7 +906,8 @@ class C_HiCacheController(BaseHook):
             slot_hash = hashlib.md5(
                 f"kda_{req_id}_{token_offset}".encode()
             ).hexdigest()
-            cls._kda_host_pool.backup_from_device(slot_idx, slot_hash)
+            cls._kda_host_pool.backup_from_device(slot_idx, slot_hash,
+                                                   depth=token_offset)
             cls._kda_l3_pending_writes.append(slot_hash)
             cls._kda_stats["backup"] += 1
 
@@ -2135,6 +2136,15 @@ class C_HiRadixCacheHook(BaseHook):
             from hisim.simulation import kda_policy as _kda_pol
             from hisim.simulation.kda_policy import _node_prefix_identity
             _policy = _kda_pol.get_policy()
+
+            # [P2C.3] Initialize L2 placement policy (Tier-Aware Placement)
+            try:
+                from hisim.simulation.l2_placement_policy import get_l2_policy as _get_l2
+                _l2_policy = _get_l2()
+                logger.info(f"[P2C.3] L2 placement policy: {_l2_policy.name}")
+            except Exception as _l2e:
+                logger.warning(f"[P2C.3] L2 policy init skipped: {_l2e}")
+                _l2_policy = None
 
             try:
                 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _PCT
@@ -4258,6 +4268,19 @@ class C_SchedulerHook(BaseHook):
                         metrics["kda_l2_lru_entries"] = _khs.get('lru_entries', 0)
                     except Exception:
                         pass
+                # [P2C.3] L2 placement stats (backup/load_back/eviction counters)
+                _kda_stats = C_HiCacheController.get_kda_stats()
+                if _kda_stats:
+                    metrics["kda_l2_backup_count"] = _kda_stats.get("backup", 0)
+                    metrics["kda_l2_load_back_count"] = _kda_stats.get("load_back_l2", 0)
+                    metrics["kda_l3_load_back_count"] = _kda_stats.get("load_back_l3", 0)
+                    metrics["kda_l3_hit_count"] = _kda_stats.get("l3_hit", 0)
+                # [P2C.3] L2 policy name
+                try:
+                    from hisim.simulation.l2_placement_policy import get_l2_policy as _gl2p
+                    metrics["kda_l2_policy"] = _gl2p().name
+                except Exception:
+                    metrics["kda_l2_policy"] = "unknown"
 
                 # MLA instantaneous: capture current KV usage from server log context
                 _kv_pool = getattr(self, 'token_to_kv_pool', None) or getattr(
