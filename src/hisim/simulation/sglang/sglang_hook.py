@@ -1819,6 +1819,17 @@ class C_HiRadixCacheHook(BaseHook):
                                     _slot_hash = f"kda_{_nid}_{_i}"
                                     _l2_hit = mh.has(_slot_hash)
                                     logger.info(f"[LOAD-L2CHECK] hash={_slot_hash} l2_hit={_l2_hit} l2_cached={len(getattr(mh, '_slots', {}))} l2_cap={getattr(mh, 'size', -1)} st_is_none={st is None} st_type={type(st).__name__ if st else 'None'}")
+                                    # [P2C.3.2] Record L2 lookup for HotnessL2 policy
+                                    # (hit OR miss — the slot was REQUESTED).
+                                    # Previously record_access was only called
+                                    # from load_to_device (L2 hits), so evicted
+                                    # slots that were re-requested kept freq=0.
+                                    _l2_pol = mh._get_policy() if hasattr(mh, '_get_policy') else None
+                                    if _l2_pol is not None:
+                                        try:
+                                            _l2_pol.record_access(_slot_hash, StateManager.get_global_clock())
+                                        except Exception:
+                                            pass
                                     if _l2_hit:
                                         mh.load_to_device(_slot_hash)
                                         _any_mamba_restore = True
@@ -2566,7 +2577,9 @@ class C_HiRadixCacheHook(BaseHook):
                             extra={"error": repr(e)[:200], "tb": _tb.format_exc()[-400:]})
                     logger.debug(f"check_hicache_events partial failure: {e}")
             # Proactive eviction: self IS the UnifiedRadixCache instance.
-            _disable_proactive_evict = os.environ.get("HISIM_DISABLE_PROACTIVE_EVICT", "")
+            # [P2C.3.2-FIX] Same truthiness bug as HISIM_DISABLE_L3: "0" is truthy.
+            _dpe_val = os.environ.get("HISIM_DISABLE_PROACTIVE_EVICT", "").strip().lower()
+            _disable_proactive_evict = _dpe_val in ("1", "true", "yes", "on")
             if not _disable_proactive_evict:
                 try:
                     _es = self.evictable_size() if hasattr(self, 'evictable_size') else 0
@@ -3258,7 +3271,9 @@ class C_SchedulerHook(BaseHook):
             # HISIM_DISABLE_PROACTIVE_EVICT so it can be turned off for clean
             # baselines. It is NOT native scheduler capacity eviction — that
             # happens inside _tc.evict() / alloc() when the pool is full.
-            _disable_proactive_evict = os.environ.get("HISIM_DISABLE_PROACTIVE_EVICT", "")
+            # [P2C.3.2-FIX] Same truthiness bug as HISIM_DISABLE_L3.
+            _dpe_val = os.environ.get("HISIM_DISABLE_PROACTIVE_EVICT", "").strip().lower()
+            _disable_proactive_evict = _dpe_val in ("1", "true", "yes", "on")
             if not _disable_proactive_evict and kda_obs.is_obs_enabled():
                 try:
                     _rtp = getattr(self, 'req_to_token_pool', None)

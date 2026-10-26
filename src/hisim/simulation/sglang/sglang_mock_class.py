@@ -1938,10 +1938,11 @@ class MockMambaStatePoolHost:
         # Update LRU
         self._lru.move_to_end(slot_hash)
 
-        # [P2C.3] Record access for L2 policy
-        _pol = self._get_policy()
-        if _pol is not None:
-            _pol.record_access(slot_hash, StateManager.get_global_clock())
+        # [P2C.3.2] record_access moved to _mock_start_loading (L2 lookup)
+        # to capture both hits AND misses. Keeping it here would double-count.
+        # _pol = self._get_policy()
+        # if _pol is not None:
+        #     _pol.record_access(slot_hash, StateManager.get_global_clock())
         return self._slots[slot_hash]
 
     def evict(self) -> str:

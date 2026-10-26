@@ -88,7 +88,12 @@ class HotnessL2Policy(L2PlacementPolicy):
             hist.popleft()
 
     def record_eviction(self, slot_hash):
-        self._access_history.pop(slot_hash, None)
+        # [P2C.3.2-FIX] Do NOT clear access history on eviction.
+        # If a slot is evicted and later re-admitted (via L3 restore),
+        # its past access frequency should persist. The sliding window
+        # (_window_size) naturally expires old entries.
+        # Old code: self._access_history.pop(slot_hash, None)
+        pass
 
     def select_victim(self, l2_pool):
         """Select cold (low freq) L2 slot. Among same freq, use LRU."""
@@ -118,7 +123,7 @@ class HotnessL2Policy(L2PlacementPolicy):
 
 
 class CostAwareL2Policy(L2PlacementPolicy):
-    """Evict low replay cost L2 slots first.
+    """[P2C.3.2] Renamed to DepthAwareL2 — uses checkpoint depth as cost proxy.
 
     Cost = slot_depth (token_offset from slot_hash).
     Shallow checkpoints (low depth) have lower replay cost → evict first.
@@ -131,7 +136,7 @@ class CostAwareL2Policy(L2PlacementPolicy):
 
     def __init__(self, window_size: int = 20, base_prob: float = 0.0):
         super().__init__()
-        self._name = "cost_aware_l2"
+        self._name = "depth_aware_l2"
         self._window_size = window_size
         self._base_prob = base_prob
         self._access_history = defaultdict(deque)
@@ -150,7 +155,9 @@ class CostAwareL2Policy(L2PlacementPolicy):
             hist.popleft()
 
     def record_eviction(self, slot_hash):
-        self._access_history.pop(slot_hash, None)
+        # [P2C.3.2-FIX] Keep access history across eviction/re-admission cycles.
+        # Only clear depth (tied to specific checkpoint instance).
+        # Old code: self._access_history.pop(slot_hash, None)
         self._slot_depths.pop(slot_hash, None)
 
     def _extract_depth(self, slot_hash: str) -> int:
@@ -180,7 +187,7 @@ class CostAwareL2Policy(L2PlacementPolicy):
 
         # Log top candidates
         for slot_hash, prob, depth, score in candidates[:5]:
-            logger.info(f"[L2:cost_aware] hash={slot_hash[:8]} depth={depth} "
+            logger.info(f"[L2:depth_aware] hash={slot_hash[:12]} depth={depth} "
                         f"prob={prob:.2f} score={score:.0f} base_prob={self._base_prob}")
 
         victim = candidates[0][0]
@@ -189,6 +196,98 @@ class CostAwareL2Policy(L2PlacementPolicy):
 
     def get_priority(self, slot_hash):
         return float(len(self._access_history.get(slot_hash, [])))
+
+
+class TierCostAwareL2Policy(L2PlacementPolicy):
+    """[P2C.3.2] Tier Cost-Aware L2 eviction.
+
+    Uses actual bandwidth-modeled restore cost, not replay depth:
+      value = reuse_probability × incremental_restore_cost(L3 vs L2)
+
+    incremental_restore_cost = L3_restore_time - L2_restore_time
+      L2 restore: H2D = slot_bytes / DRAM_read_BW
+      L3 restore: SSD_read + H2D = slot_bytes / SSD_read_BW + slot_bytes / DRAM_read_BW
+      Incremental = slot_bytes / SSD_read_BW  (the SSD read portion)
+
+    Since slot_bytes is fixed (~14.45MB), the incremental cost is constant
+    per slot. The differentiation comes from reuse_probability, which uses
+    exponential time decay (unlike HotnessL2's raw count).
+
+    reuse_prob = max(base_prob, count_prob, exp(-decay_rate × dt))
+
+    Higher value → preserve. Lower value → evict.
+    """
+
+    def __init__(self, window_size: int = 20, base_prob: float = 0.01,
+                 decay_rate: float = 0.1, slot_bytes: float = 14.45e6,
+                 ssd_read_bw: float = 14.6e9, dram_read_bw: float = 64e9):
+        super().__init__()
+        self._name = "tier_cost_aware_l2"
+        self._window_size = window_size
+        self._base_prob = base_prob
+        self._decay_rate = decay_rate
+        self._slot_bytes = slot_bytes
+        self._ssd_read_bw = ssd_read_bw
+        self._dram_read_bw = dram_read_bw
+        self._access_history = defaultdict(deque)
+        self._last_access_time = {}  # slot_hash → last virtual_time
+        self._current_time = 0.0
+        self._incremental_cost = slot_bytes / ssd_read_bw  # fixed per slot
+
+    def record_admission(self, slot_hash, slot_idx, depth=0):
+        pass  # depth not used — cost is bandwidth-based
+
+    def record_access(self, slot_hash, virtual_time):
+        if not slot_hash:
+            return
+        self._current_time = virtual_time
+        hist = self._access_history[slot_hash]
+        hist.append(virtual_time)
+        if len(hist) > self._window_size:
+            hist.popleft()
+        self._last_access_time[slot_hash] = virtual_time
+
+    def record_eviction(self, slot_hash):
+        pass  # keep history across eviction/re-admission cycles
+
+    def _reuse_probability(self, slot_hash):
+        """Exponential decay + count blend."""
+        import math
+        last_t = self._last_access_time.get(slot_hash)
+        if last_t is None:
+            return self._base_prob
+        dt = max(0.0, self._current_time - last_t)
+        freq = len(self._access_history.get(slot_hash, []))
+        count_prob = min(1.0, freq * 0.3)
+        decay_prob = math.exp(-self._decay_rate * dt)
+        return max(self._base_prob, count_prob, decay_prob)
+
+    def select_victim(self, l2_pool):
+        if not l2_pool._lru:
+            return None
+
+        candidates = []
+        for slot_hash in l2_pool._lru:
+            prob = self._reuse_probability(slot_hash)
+            value = prob * self._incremental_cost
+            candidates.append((slot_hash, prob, self._incremental_cost, value))
+
+        if not candidates:
+            return None
+
+        # Sort by value (lower = evict first)
+        candidates.sort(key=lambda x: x[3])
+
+        for slot_hash, prob, cost, value in candidates[:5]:
+            logger.info(f"[L2:tier_cost] hash={slot_hash[:12]} prob={prob:.4f} "
+                        f"cost={cost:.6f} value={value:.6f} last_t={self._last_access_time.get(slot_hash, 'N/A')}")
+
+        victim = candidates[0][0]
+        l2_pool._lru.pop(victim, None)
+        return victim
+
+    def get_priority(self, slot_hash):
+        return self._reuse_probability(slot_hash)
 
 
 class OracleL2Policy(L2PlacementPolicy):
@@ -269,12 +368,22 @@ def create_l2_policy() -> L2PlacementPolicy:
         p = HotnessL2Policy(window_size=window)
         logger.info(f"L2 Policy: hotness (window={window})")
         return p
-    elif name == "cost_aware":
+    elif name in ("cost_aware", "depth_aware"):
+        # [P2C.3.2] cost_aware renamed to depth_aware (backward compat)
         window = int(os.environ.get("HISIM_L2_HOTNESS_WINDOW", "20"))
         base_prob = float(os.environ.get("HISIM_L2_COST_BASE_PROB", "0.0"))
         p = CostAwareL2Policy(window_size=window, base_prob=base_prob)
-        logger.info(f"L2 Policy: cost-aware (window={window}, "
+        logger.info(f"L2 Policy: depth_aware (window={window}, "
                     f"base_prob={base_prob})")
+        return p
+    elif name == "tier_cost":
+        window = int(os.environ.get("HISIM_L2_HOTNESS_WINDOW", "20"))
+        base_prob = float(os.environ.get("HISIM_L2_COST_BASE_PROB", "0.01"))
+        decay = float(os.environ.get("HISIM_L2_DECAY_RATE", "0.1"))
+        p = TierCostAwareL2Policy(window_size=window, base_prob=base_prob,
+                                 decay_rate=decay)
+        logger.info(f"L2 Policy: tier_cost_aware (window={window}, "
+                    f"base_prob={base_prob}, decay={decay})")
         return p
     elif name == "oracle":
         p = OracleL2Policy()
