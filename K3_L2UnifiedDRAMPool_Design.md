@@ -278,13 +278,15 @@ mla_pages  = total_pages − kda_pages
 | `src/hisim/simulation/l2_dram_pool.py` | 新增：`Extent` / `PageExtentAllocator` / `MLAView` / `KDAView` / `UnifiedDRAMPool` / env 单例 |
 | `src/hisim/simulation/sglang/sglang_mock_class.py` | `calc_kv_host_size_per_token`；KV mock 的 `alloc/free/available_size` 走统一池；KDA mock 的准入/驱逐计价、`notify_evicted`、index 释放幂等 |
 | `src/hisim/simulation/sglang/sglang_hook.py` | `_setup_l2_dram_pool`、`_bind_l2_host_group`（重指 `HostPoolGroup` + `storage_host_pool`）、两处容量来源、`_init_kda_pools` 注册、metrics |
-| `test/test_l2_dram_pool.py` | 11 项单测（分配/合并/外部碎片/pow2/两端分配/token 往返/部分释放/KDA 准入/两池隔离/双向借用/借用顺序/守恒） |
+| `test/test_l2_dram_pool.py` | 13 项单测（分配/合并/外部碎片/pow2/两端分配/token 往返/部分释放/KDA 准入/两池隔离/双向借用/借用顺序/守恒/mock mamba host index 生命周期） |
 | `benchmark/collection/l2_pool_frag_study.py` | 碎片 / 借用顺序对照实验（60 行结果，输出 JSON + markdown 表） |
 
 ### 10.2 已验证
 
+单测与碎片实验：
+
 ```bash
-pytest test/test_l2_dram_pool.py -q          # 11 passed
+pytest test/test_l2_dram_pool.py -q          # 13 passed
 python benchmark/collection/l2_pool_frag_study.py --ops 6000
 ```
 
@@ -293,11 +295,67 @@ python benchmark/collection/l2_pool_frag_study.py --ops 6000
 - mock 池 + 统一池：`alloc/free` 往返、分块释放、KDA 准入/`load_to_device`/`evict`、index 幂等、MLA 借 KDA（`cross_evict_kda_slots>0`）、末态归零；
 - hook 适配：`_setup_l2_dram_pool` + `_bind_l2_host_group` 之后 `HostPoolGroup` 的 `KV/MAMBA` entry 确实指向 mock，`group.size/logical_size` 与 mock 一致，`cc.storage_host_pool` 同步；One Pool 下 KDA 先借 MLA（KDA 视图为空时，`cross_evict_mla_tokens>0`）、随后 MLA 借 KDA（`cross_evict_kda_slots>0`）、`self_first` 下第二次 KDA 准入只替换自己的 slot（slot 数不变、MLA 不再被驱逐）；Two Pools 下 4 GB 预算切出 3.12 GB KV + 0.88 GB KDA（57 slots），两侧都填满后 `used ≤ total`、`external_frag=0`。
 
-### 10.3 未做（本机无法完成）
+#### 服务端 smoke（mock K3-23L / 910C / sglang 0.5.19）
 
-- **服务端 smoke 未跑**：`/tmp/opencode/k3-model`（mock K3-23L）与 `config_k3_0519.json`、预测器 profile CSV 都不在本机（此前会话已丢），`benchmark/collection/k3_onepool_twopools/` 只能生成 trace，不能重建模型。复跑前需恢复这三样，然后：
-  1. 不设 `HISIM_L2_*` 跑一格确认零回归；
-  2. `HISIM_L2_TOTAL_GB=8`（Two Pools）与 `+HISIM_L2_ONE_POOL=1`（One Pool）各跑一格，检查 `l2_*` 指标、`l2_alloc_fail_*`、`l2_used+free=total`、L3 命中不劣化。
+命令：`benchmark/collection/k3_onepool_twopools/run_exp.sh twopools 80 200000 8192 8192 /tmp/opencode/k3_p52_mla_heavy.jsonl 11 <label>`；
+预算 85 GB ≈ baseline 的 `--hicache-size 80`（mock 池口径 47,177 tokens）。
+
+| cell | `HISIM_L2_*` | 完成 | MLA prefix hits（L1 / L2） | KDA write→L3 | e2e (ms) |
+|---|---|---|---|---|---|
+| baseline | 不设 | 11/11 | 294,912（294,912 / 0） | 35 → 35 | 22,819.65 |
+| two_pools | `TOTAL_GB=85` | 11/11 | 294,912（294,912 / 0） | 6 → 6 | 22,817.36 |
+| one_pool | `TOTAL_GB=85 ONE_POOL=1` | 11/11 | 294,912（294,912 / 0） | 7 → 7 | 22,817.44 |
+
+基线在最终代码上逐位复现（同 trace 两次运行完全相同：命中数、KDA 计数、e2e 到 1e-5 ms），零回归。
+
+池状态（dump 时刻；总预算 84,977,123,328 B = 3,132 页 × 27,131,904 B，page_tokens=16）：
+
+| 指标 | two_pools | one_pool |
+|---|---|---|
+| MLA 区域 | 80.15 GB（2,954 页） | 共享全部 84.98 GB |
+| KDA 区域 | 4.83 GB（178 页，1 页/slot） | 共享（KDA floor = 0） |
+| MLA 常驻 tokens | 41,216 | 49,408（**+19.9%**） |
+| MLA 可再分配 tokens | 6,048 | 592 |
+| KDA cached slots | 6（0.163 GB） | 7（0.190 GB） |
+| used / free | 70.05 / 14.92 GB | 83.97 / 1.00 GB（98.8% 占用） |
+| internal frag | 74.9 MB（0.107%，全部来自 KDA 页内取整） | 87.3 MB（0.104%） |
+| external frag | 0 | 0 |
+| alloc_fail / admission_reject | 0 / 0 | 0 / 0 |
+
+三条不变量全部成立：`used+free=total`、`used=kv+kda`、`MLA live+avail` 与页数一致
+（Two Pools 47,264 = 2,954 × 16；One Pool 49,408 + 592 + 7 个 KDA 页 = 3,132 页）。
+
+KDA 密集 trace（`k3_p51_kda_heavy.jsonl`，102 请求，`TOTAL_GB=85` two_pools）：
+102/102，MLA hits 6,144（L1 4,096 + **L2 2,048**），KDA write 46 → L3 46，L3 hit 2，donate 96，
+KDA 常驻 46 slots（物理 1.248 GB / 逻辑 0.674 GB），e2e 418.0 ms。
+
+### 10.3 服务端验证中发现并修复的问题
+
+1. **预算口径**：服务端 mock 池 `size_per_token = 1,695,744 B`（1656 KB/token），因此
+   `HISIM_L2_TOTAL_GB=8` 只切出 1,856 个 MLA token，小于一个写批次（8,192 token）。
+   原生 `HybridCacheController.write()` 先 `mem_pool_host.alloc(len)` 再入队，分配失败直接
+   `return None`，于是 L2 写入与搭车的 KDA 备份都不发生——表现为 `l2_used_bytes=0`、
+   `kda_write_calls=0`、`l2_kda_free_slots` 缓慢下降（逻辑 index 已分配但从未提交）。
+   **这不是分配器错误，而是预算小于写粒度的退化形态**；预算应至少容纳一个写批次。
+2. **KDA host index 泄漏**（已修）：mock 的 `start_writing` 同步消费写队列，原生 ack 路径不再
+   运行，`resolve_host_transfers` 为 MAMBA 分配的 host index 永远收不回来。P5.1 实测 96 次
+   donate 泄漏 96 个（`kda_l2_free_slots` 178→36），再跑 80 余个 checkpoint 就会耗尽并静默
+   停止 KDA 备份。修法：绑定统一池后，host index 退化为纯逻辑 id（round-robin 发放，
+   容量由 `KDAView`/`admit_kda` 裁决），`available_size()`/`get_stats()['free_slots']`
+   改为回报共享池的可用 slot 数；legacy 路径的有限 free list 行为一字未改。修复后
+   `kda_l2_free_slots=132 = 178 − 46 cached`，命中/时延逐位不变。
+3. **基线与统一池的容量来源不同**：基线不重指 `HostPoolGroup`，`Cache state` 里的
+   `L2_avail=1,680,784` 来自**原生** host pool（44.53 GB，26,492 B/token）；统一池路径把
+   group 的 `KV/MAMBA` entry 换成预算 mock，容量按 1656 KB/token 计算。两者不能直接比
+   token 数，对齐时应比字节预算（85 GB ↔ `--hicache-size 80` 在 mock 口径下同为 ~47k tokens）。
+
+### 10.4 未做
+
+- **长时间压测**：本次最长 102 请求；KDA host index 泄漏已修，但未验证万级 checkpoint 下
+  L3 write-through 与统一池回收的长期稳定性。
+- **KV 满导致 KDA 备份停摆**：KDA 备份搭在 KV 写操作上，当 MLA 侧连一个批次都放不下时，
+  `write()` 返回 None，KDA checkpoint 也就不会再进 L2/L3（P5.2 里 35→6）。这是原生
+  `write()` 的语义，未改动；若要解耦需单独给 MAMBA 建写路径（超出最小版本）。
 
 ---
 
@@ -308,5 +366,14 @@ python benchmark/collection/l2_pool_frag_study.py --ops 6000
 3. **One Pool 的切分不是公平调度**：`self_first` 让切分在预热期定形，`other_first` 是最后写入者赢；两者都没有权重/水位线，唯一的保护是 `HISIM_L2_MAMBA_MIN_SLOTS`（且只在 MLA 触到 cap 时生效，本轮实测负载下未触顶）。
 4. **KDA←MLA 回收依赖 L3**：`enable_storage=False` 时不做 MLA 回收，KDA 准入失败即只留 L3（这是安全的，但会降低 L2 命中）。
 5. **两套 mamba 池共同计价**：`_kda_host_pool` 与 `mamba_pool_host` 都计入 KDA 视图，若未来确认二者模拟的是同一份物理 checkpoint，需要去重。
-6. **token_bytes 与真实 K3 口径的差异**：本机 mock 池 `size_per_token`（52,992 B）来自 `_real_head_dim × layer_num`，比真实 MLA entry 口径（5,760 B/entry，5 个 full-attn 层）大；预算与计时同源所以自洽，但与 docker 报告的"403,520 entries"不能直接换算。
-7. 未引入任何新的 placement / prefetch 算法；`l2_placement_policy` 一行未改。
+6. **token_bytes 与真实 K3 口径的差异**：服务端 mock 池实测 `size_per_token = 1,695,744 B`
+   （1656 KB/token）= `_real_head_dim(576) × _real_head_num(64) × layer_num(23) × itemsize(2)`，
+   而原生 MLA host pool 是 26,492 B/token、真实 entry 口径是 5,760 B/token（576 × 5 个 full-attn
+   层 × 2）。预算与计时同源所以自洽，但与 docker 报告的"403,520 entries"不能直接换算；
+   一个 85 GB 的预算在 mock 口径下只有 47,264 个 token。
+7. **Two Pools 的"切分成本"不是 external frag**：两个区域各自 first-fit，`stats()` 里的
+   `external_frag` 是两区域之和（各自内部都只有一段连续空闲，所以是 0），而
+   `largest_free_run_bytes` 取的是两区域最大值。区域间不可挪用体现为
+   `l2_mla_available_tokens` 被区域边界卡住（P5.2：two_pools 剩 6,048 tokens 却放不下
+   一个 8,192 的批次），不要读成碎片。
+8. 未引入任何新的 placement / prefetch 算法；`l2_placement_policy` 一行未改。

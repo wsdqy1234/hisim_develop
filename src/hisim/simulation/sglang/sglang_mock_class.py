@@ -1851,11 +1851,14 @@ class MockMambaStatePoolHost:
         self._unified = None
         self._evict_hook = None
         self._allocated_idx = set()
+        # Round-robin cursor for logical host indices (unified mode only).
+        self._rr_cursor = 0
 
     # ---- unified L2 DRAM pool integration --------------------------------
     def attach_unified(self, pool) -> None:
         self._unified = pool
         self._allocated_idx = set()
+        self._rr_cursor = 0
 
     def get_unified(self):
         return self.__dict__.get('_unified')
@@ -1887,18 +1890,40 @@ class MockMambaStatePoolHost:
         return self._policy
 
     def available_size(self):
+        _up = self.__dict__.get('_unified')
+        if _up is not None:
+            # Shared budget is the capacity authority; the native free list is
+            # not maintained in unified mode (see alloc()).
+            return _up.kda_available_slots()
         return len(self.free_slots)
 
     def get_stats(self) -> dict:
         """Return L2 KDA cache pool statistics (instantaneous snapshot)."""
+        _up = self.__dict__.get('_unified')
         return {
             "cached_slots": len(self._slots),  # slots currently cached in L2
             "capacity": self.size,             # total L2 capacity
-            "free_slots": len(self.free_slots),
+            "free_slots": self.available_size(),
             "lru_entries": len(self._lru),     # LRU tracked entries
         }
 
     def alloc(self, need_size):
+        _up = self.__dict__.get('_unified')
+        if _up is not None:
+            # Host indices are opaque logical ids in the mock: nothing reads
+            # them back, and real capacity is owned by the shared budget
+            # (admit_kda).  The native ack path that would return indices to
+            # this free list is stubbed out by the synchronous mock write, so
+            # a finite list would leak one entry per KDA checkpoint and
+            # eventually stop host backups altogether.  Hand out ids
+            # round-robin instead; duplicates are harmless because no data
+            # movement is keyed by them.
+            n = max(int(self.size), 1)
+            start = self._rr_cursor
+            self._rr_cursor = (start + int(need_size)) % n
+            idx = [(start + i) % n for i in range(int(need_size))]
+            self._allocated_idx.update(idx)
+            return torch.tensor(idx, dtype=torch.int64)
         if need_size > len(self.free_slots):
             return None
         result = self.free_slots[:need_size]

@@ -263,3 +263,53 @@ def test_accounting_consistency_exact():
     assert st["used_bytes"] + st["free_bytes"] == st["total_bytes"]
     # KDA slots are exactly page aligned at the default page size.
     assert st["kda_bytes"] == st["kda_logical_bytes"]
+
+
+# --- mock mamba host pool: legacy vs unified host-index semantics -------------
+def test_mamba_host_pool_legacy_free_list():
+    from hisim.simulation.sglang.sglang_mock_class import MockMambaStatePoolHost
+
+    pool = MockMambaStatePoolHost(size=4, slot_bytes=SLOT_BYTES)
+    idx = pool.alloc(2)
+    assert idx.tolist() == [0, 1]
+    assert pool.available_size() == 2
+    # Exhausted free list reports failure (legacy behaviour, unchanged).
+    assert pool.alloc(3) is None
+    assert pool.free(idx) == 2
+    assert pool.available_size() == 4
+
+
+def test_mamba_host_pool_bound_indices_do_not_leak():
+    """Bound to the shared pool, host ids must not consume a finite free list.
+
+    The native ack path that would release these ids is stubbed out by the
+    synchronous mock write, so a finite list leaked one entry per checkpoint
+    and eventually stopped KDA host backups (measured: 96 leaked over 96
+    donations in the P5.1 server run).
+    """
+
+    class _FakeUnified:
+        def __init__(self):
+            self.available = 2
+            self.freed = []
+
+        def kda_available_slots(self):
+            return self.available
+
+        def release_kda(self, key):
+            self.freed.append(key)
+            return True
+
+    from hisim.simulation.sglang.sglang_mock_class import MockMambaStatePoolHost
+
+    pool = MockMambaStatePoolHost(size=8, slot_bytes=SLOT_BYTES)
+    up = _FakeUnified()
+    pool.attach_unified(up)
+    for _ in range(50):  # far more than `size`
+        assert pool.alloc(3) is not None
+    # Capacity is owned by the shared budget, not by the host-index list.
+    assert pool.available_size() == 2
+    assert pool.get_stats()["free_slots"] == 2
+    # Idempotent release still works for indices handed out above.
+    assert pool.free(torch.tensor([0, 1, 2])) == 3
+    assert pool.free(torch.tensor([0, 1, 2])) == 0
