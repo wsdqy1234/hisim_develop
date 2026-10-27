@@ -847,16 +847,34 @@ class C_HiCacheController(BaseHook):
                 slot_bytes=cls.MAMBA_SLOT_BYTES,
             )
             # L2 pool (DRAM backup) — size = 2x L1 (can hold evicted + working set)
+            # With a unified L2 DRAM pool the shared budget replaces this
+            # per-object cap (checkpoint admission charges the KDA view).
+            try:
+                from hisim.simulation.l2_dram_pool import get_l2_dram_pool as _get_l2up
+                _l2up = _get_l2up()
+            except Exception:
+                _l2up = None
+            _kda_l2_size = _l2up.kda_capacity_slots if _l2up is not None else cls.MAMBA_POOL_SIZE * 2
             cls._kda_host_pool = MockMambaStatePoolHost(
-                size=cls.MAMBA_POOL_SIZE * 2,
+                size=_kda_l2_size,
                 slot_bytes=cls.MAMBA_SLOT_BYTES,
             )
             cls._kda_l3_pending_writes = []
             cls._kda_stats = {"backup": 0, "load_back_l2": 0, "load_back_l3": 0, "l3_hit": 0}
+            if _l2up is not None:
+                cls._kda_host_pool.attach_unified(_l2up)
+                cls._kda_host_pool.set_evict_hook(
+                    lambda h: cls._kda_l3_pending_writes.append(h)
+                )
+                _l2up.register_kda_pool(cls._kda_host_pool)
+                logger.info(
+                    f"KDA host pool bound to L2 unified DRAM pool "
+                    f"({_l2up.mode}, {_kda_l2_size} max slots)"
+                )
             logger.info(
                 f"KDA pools initialized: L1={cls.MAMBA_POOL_SIZE} slots "
                 f"({cls.MAMBA_SLOT_BYTES/1e6:.2f}MB/slot), "
-                f"L2={cls.MAMBA_POOL_SIZE*2} slots"
+                f"L2={_kda_l2_size} slots"
             )
         except Exception as e:
             logger.warning(f"KDA pool init failed (non-hybrid model?): {e}")
@@ -1389,6 +1407,109 @@ class C_HiCacheController(BaseHook):
         target._generic_page_set = override_generic_page_set
 
 
+def _setup_l2_dram_pool(server_args, params):
+    """Create the shared L2 DRAM pool (KDA/MLA one budget) when enabled.
+
+    Enabled by ``HISIM_L2_ONE_POOL=1`` (dynamic sharing) or by setting
+    ``HISIM_L2_TOTAL_GB`` (same total budget for the static Two Pools
+    baseline).  Returns ``None`` when disabled, which keeps the legacy
+    fixed-size host pools byte-for-byte unchanged.
+    """
+    try:
+        from hisim.simulation.l2_dram_pool import configure_l2_dram_pool
+        from hisim.simulation.sglang.sglang_mock_class import (
+            calc_kv_host_size_per_token,
+        )
+    except Exception as exc:  # pragma: no cover - import guard
+        logger.warning(f"L2 unified pool unavailable: {exc}")
+        return None
+
+    try:
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        token_bytes = calc_kv_host_size_per_token(kvcache)
+    except Exception as exc:
+        logger.warning(f"L2 unified pool: cannot size MLA token ({exc}); disabled")
+        return None
+
+    slot_bytes = 14653440
+    try:
+        from hisim.simulation.utils import calc_mamba_state_bytes
+        _model = ConfigManager.get_model_info()
+        _sched = ConfigManager.get_scheduler_config()
+        slot_bytes = int(calc_mamba_state_bytes(_model, _sched.tp_size, _sched.pp_size))
+    except Exception as exc:
+        logger.debug(f"L2 unified pool: using default KDA slot bytes ({exc})")
+
+    hicache_gb = float(getattr(server_args, "hicache_size", 0) or 0)
+    pool = configure_l2_dram_pool(hicache_gb, token_bytes, slot_bytes)
+    if pool is not None:
+        logger.info(
+            "HiSim L2 unified DRAM pool: mode=%s total=%.2fGB page=%dB mla_tokens=%d kda_slots=%d",
+            pool.mode,
+            pool.total_bytes / 1e9,
+            pool.page_bytes,
+            pool.mla_capacity_tokens,
+            pool.kda_capacity_slots,
+        )
+    return pool
+
+
+def _bind_l2_host_group(cache, l2_pool, kv_host, kda_host):
+    """Point the native HostPoolGroup at the budgeted host pools.
+
+    Without this the controller would keep allocating from the native
+    fixed-size host pools (Two Pools path) and the shared budget would only
+    affect the timing mocks.
+    """
+    from sglang.srt.mem_cache.hicache_storage import PoolName
+
+    group = getattr(cache, "host_pool_group", None)
+    cc = getattr(cache, "cache_controller", None)
+    if group is None and cc is not None:
+        group = getattr(cc, "mem_pool_host", None)
+    if group is None or not hasattr(group, "entry_map"):
+        logger.warning("L2 unified pool: no HostPoolGroup; budget on mocks only")
+    else:
+        kv_entry = group.entry_map.get(PoolName.KV)
+        if kv_entry is not None:
+            kv_entry.host_pool = kv_host
+        kda_entry = group.entry_map.get(PoolName.MAMBA)
+        if kda_entry is not None and kda_host is not None:
+            kda_entry.host_pool = kda_host
+        try:
+            group.size = kv_host.size
+            group.logical_size = kv_host.logical_size
+            group.page_size = kv_host.page_size
+            group.layout = getattr(kv_host, "layout", group.layout)
+            group.device = getattr(kv_host, "device", group.device)
+            group._refresh_transfer_capabilities()
+        except Exception as exc:
+            logger.debug(f"L2 unified pool: group refresh failed: {exc}")
+        if cc is not None and hasattr(cc, "storage_host_pool"):
+            cc.storage_host_pool = kv_host
+
+    if kv_host is not None:
+        kv_host.attach_unified(l2_pool)
+        l2_pool.bind_mla_pool(kv_host)
+    if kda_host is not None:
+        kda_host.attach_unified(l2_pool)
+        l2_pool.register_kda_pool(kda_host)
+
+    # KDA -> MLA reclaim uses the native host-eviction path (write-through L3).
+    if getattr(cache, "enable_storage", False) and hasattr(cache, "evict_host"):
+        def _mla_evict(n_tokens, _c=cache):
+            try:
+                from sglang.srt.mem_cache.unified_cache.component_type import (
+                    ComponentType,
+                )
+                return int(_c.evict_host(int(n_tokens), ComponentType.FULL) or 0)
+            except Exception as exc:
+                logger.debug(f"L2 unified pool: MLA reclaim failed: {exc}")
+                return 0
+
+        l2_pool.set_mla_evictor(_mla_evict)
+
+
 class C_HiRadixCacheHook(BaseHook):
     HOOK_CLASS_NAME = "UnifiedRadixCache"
     HOOK_MODULE_NAME = "sglang.srt.mem_cache.unified_radix_cache"
@@ -1890,6 +2011,10 @@ class C_HiRadixCacheHook(BaseHook):
                             extra={"tree_components": [getattr(c, chr(118)+chr(97)+chr(108)+chr(117)+chr(101), str(c)) for c in (_mtcs or [])],
                                    "mamba_in": _MCT.MAMBA in (_mtcs or [])})
 
+            # Unified L2 DRAM pool (KDA + MLA share one byte budget).
+            # None when HISIM_L2_ONE_POOL / HISIM_L2_TOTAL_GB are unset.
+            _l2_pool = _setup_l2_dram_pool(server_args, params)
+
             try:
                 _is_unified = getattr(server_args, 'enable_unified_memory', False)
                 if _is_unified:
@@ -1910,8 +2035,12 @@ class C_HiRadixCacheHook(BaseHook):
 
                 # Create mock host pools
                 # L2 size configurable for eviction testing (default: 330 Mamba slots, hicache_size GB KV)
-                _l2_mamba_size = int(os.environ.get("HISIM_L2_MAMBA_SIZE", "330"))
-                _l2_kv_size = float(os.environ.get("HISIM_L2_KV_SIZE_GB", str(server_args.hicache_size)))
+                if _l2_pool is not None:
+                    _l2_mamba_size = int(_l2_pool.kda_capacity_slots)
+                    _l2_kv_size = float(_l2_pool.mla_capacity_bytes) / 1e9
+                else:
+                    _l2_mamba_size = int(os.environ.get("HISIM_L2_MAMBA_SIZE", "330"))
+                    _l2_kv_size = float(os.environ.get("HISIM_L2_KV_SIZE_GB", str(server_args.hicache_size)))
                 _full_host = MockTokenToKVPoolHost(
                     _kvcache,
                     server_args.hicache_ratio,
@@ -2021,10 +2150,14 @@ class C_HiRadixCacheHook(BaseHook):
                 # Original succeeded — swap real host pools to mock
                 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType as _CT
                 _kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+                if _l2_pool is not None:
+                    _l2_kv_size_orig = float(_l2_pool.mla_capacity_bytes) / 1e9
+                else:
+                    _l2_kv_size_orig = server_args.hicache_size
                 self.full_kv_pool_host = MockTokenToKVPoolHost(
                     _kvcache,
                     server_args.hicache_ratio,
-                    server_args.hicache_size,
+                    _l2_kv_size_orig,
                     self.page_size,
                     server_args.hicache_mem_layout,
                     pin_memory=False,
@@ -2035,7 +2168,10 @@ class C_HiRadixCacheHook(BaseHook):
 
                 # Mamba pool host: ALWAYS create a MockMambaStatePoolHost with
                 # the correct L2 size, regardless of what original init set.
-                _l2_mamba_size_orig = int(os.environ.get("HISIM_L2_MAMBA_SIZE", "330"))
+                _l2_mamba_size_orig = (
+                    int(_l2_pool.kda_capacity_slots) if _l2_pool is not None
+                    else int(os.environ.get("HISIM_L2_MAMBA_SIZE", "330"))
+                )
                 self.mamba_pool_host = MockMambaStatePoolHost(
                     size=_l2_mamba_size_orig,
                     slot_bytes=14653440,
@@ -2046,6 +2182,26 @@ class C_HiRadixCacheHook(BaseHook):
 
                 logger.info("Swapped real host pools to mock versions")
                 _apply_mock_start_overrides(self, self.full_kv_pool_host, getattr(self, 'mamba_pool_host', None))
+
+            # Unified L2 DRAM pool: bind mocks to the shared budget and point
+            # the native HostPoolGroup at them (Two Pools + One Pool share the
+            # same total byte budget; only the split policy differs).
+            if _l2_pool is not None and getattr(self, 'full_kv_pool_host', None) is not None:
+                _bind_l2_host_group(
+                    self,
+                    _l2_pool,
+                    self.full_kv_pool_host,
+                    getattr(self, 'mamba_pool_host', None),
+                )
+                logger.info(
+                    "L2 unified DRAM pool bound: mode=%s total=%.2fGB "
+                    "mla=%.2fGB kda_slots=%d page=%dB",
+                    _l2_pool.mode,
+                    _l2_pool.total_bytes / 1e9,
+                    _l2_pool.mla_capacity_bytes / 1e9,
+                    _l2_pool.kda_capacity_slots,
+                    _l2_pool.page_bytes,
+                )
 
             logger.info(
                 f"HiSim hicache attached: components={set(self.components.keys())}, "
@@ -4281,6 +4437,18 @@ class C_SchedulerHook(BaseHook):
                     metrics["kda_l2_policy"] = _gl2p().name
                 except Exception:
                     metrics["kda_l2_policy"] = "unknown"
+
+                # L2 unified DRAM pool (KDA+MLA one budget) metrics
+                try:
+                    from hisim.simulation.l2_dram_pool import get_l2_dram_pool as _gl2u
+                    _l2u = _gl2u()
+                    if _l2u is not None:
+                        _l2s = _l2u.stats()
+                        for _k, _v in _l2s.items():
+                            metrics[f"l2_{_k}"] = _v
+                        metrics["l2_one_pool"] = int(_l2s.get("mode") == "one_pool")
+                except Exception as _l2e:
+                    logger.debug(f"L2 unified metrics unavailable: {_l2e}")
 
                 # MLA instantaneous: capture current KV usage from server log context
                 _kv_pool = getattr(self, 'token_to_kv_pool', None) or getattr(

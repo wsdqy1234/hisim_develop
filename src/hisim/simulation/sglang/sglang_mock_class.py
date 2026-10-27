@@ -1387,6 +1387,20 @@ def synchronized(func):
     return wrapper
 
 
+def calc_kv_host_size_per_token(device_pool) -> int:
+    """DRAM bytes per MLA token used by the L2 host pool.
+
+    Mirrors ``MockTokenToKVPoolHost.get_size_per_token`` so the unified DRAM
+    pool can be sized before the mock pool object exists.
+    """
+    layer_num = getattr(device_pool, 'layer_num', 23)
+    real_head_num = getattr(device_pool, '_real_head_num', 1)
+    real_head_dim = getattr(device_pool, '_real_head_dim', 1)
+    dtype = getattr(device_pool, 'store_dtype', torch.float32)
+    itemsize = getattr(dtype, 'itemsize', 4)
+    return int(real_head_dim * real_head_num * layer_num * itemsize * 2)
+
+
 class MockTokenToKVPoolHost:
     KV_CACHE_BYTES: int = None
     KV_CACHE_BYTES_PER_LAYER: int = None
@@ -1461,6 +1475,18 @@ class MockTokenToKVPoolHost:
         # A lock for synchronized operations on memory allocation and state transitions.
         self.lock = threading.RLock()
         self.clear()
+
+        # Optional unified L2 DRAM pool (KDA/MLA shared budget).  See
+        # hisim/simulation/l2_dram_pool.py.  None = legacy flat allocation.
+        self._unified = None
+
+    # ---- unified L2 DRAM pool integration --------------------------------
+    def attach_unified(self, pool) -> None:
+        self._unified = pool
+
+    def get_unified(self):
+        return self.__dict__.get('_unified')
+
 
     def __getattr__(self, name):
         # Catch-all for attributes accessed by HybridCacheController during
@@ -1654,10 +1680,18 @@ class MockTokenToKVPoolHost:
         self.free_slots = torch.arange(self.size, dtype=torch.int64)
 
     def available_size(self):
+        _up = self.__dict__.get('_unified')
+        if _up is not None:
+            # Largest contiguous MLA allocation the shared pool can serve.
+            return _up.mla_available_tokens()
         return len(self.free_slots)
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
+        _up = self.__dict__.get('_unified')
+        if _up is not None:
+            # Unified DRAM pool: page/extent allocation, budget shared with KDA.
+            return _up.alloc_mla_tokens(need_size)
         assert need_size % self.page_size == 0, (
             "The requested size should be a multiple of the page size."
         )
@@ -1671,6 +1705,9 @@ class MockTokenToKVPoolHost:
 
     @synchronized
     def free(self, indices: torch.Tensor) -> int:
+        _up = self.__dict__.get('_unified')
+        if _up is not None:
+            return _up.free_mla_tokens(indices)
         self.free_slots = torch.cat([self.free_slots, indices])
         return len(indices)
 
@@ -1810,6 +1847,34 @@ class MockMambaStatePoolHost:
         self.layer_transfer_counter = None
         # [P2C.3] Tier-Aware L2 placement policy
         self._policy = None  # set lazily via get_l2_policy()
+        # Unified L2 DRAM pool integration (None = legacy capacity semantics)
+        self._unified = None
+        self._evict_hook = None
+        self._allocated_idx = set()
+
+    # ---- unified L2 DRAM pool integration --------------------------------
+    def attach_unified(self, pool) -> None:
+        self._unified = pool
+        self._allocated_idx = set()
+
+    def get_unified(self):
+        return self.__dict__.get('_unified')
+
+    def set_evict_hook(self, fn) -> None:
+        """Callback receiving hashes evicted outside the normal backup path
+        (e.g. cross-view reclaim).  Default consumer promotes them to L3."""
+        self._evict_hook = fn
+
+    def notify_evicted(self, slot_hash: str) -> None:
+        """Route an L2 eviction to L3 write-through (existing mechanism)."""
+        _hook = self.__dict__.get('_evict_hook')
+        if _hook is not None:
+            try:
+                _hook(slot_hash)
+                return
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug(f"KDA evict hook failed: {exc}")
+        self._last_evicted_hashes.append(slot_hash)
 
     def _get_policy(self):
         """Lazily get L2 placement policy (avoids import during __init__)."""
@@ -1838,13 +1903,20 @@ class MockMambaStatePoolHost:
             return None
         result = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        # Logical host index only: physical KDA bytes are charged at checkpoint
+        # admission (backup_from_device), which is the semantic L2 entry point.
+        self._allocated_idx.update(result)
         return torch.tensor(result, dtype=torch.int64)
 
     def free(self, indices):
         if hasattr(indices, 'tolist'):
             indices = indices.tolist()
-        self.free_slots.extend(indices)
-        return len(indices)
+        # Idempotent: only recycle indices that are still logically allocated.
+        released = [i for i in indices if i in self._allocated_idx]
+        for i in released:
+            self._allocated_idx.discard(i)
+        self.free_slots.extend(released)
+        return len(released)
 
     def __getattr__(self, name):
         # Catch-all for attributes accessed by HybridCacheController
@@ -1892,6 +1964,14 @@ class MockMambaStatePoolHost:
         # from_l3=True: data already in DRAM (SSD read already timed by caller)
         # No additional timing — just store in L2
 
+        _up = self.__dict__.get('_unified')
+        if _up is not None and slot_hash not in self._slots:
+            # Charge one KDA slot extent from the shared DRAM budget.  When the
+            # budget is exhausted the checkpoint stays in L3 only (the caller
+            # still writes it through), so no fake L2 hit can be created.
+            if not _up.admit_kda(slot_hash):
+                return False
+
         # Store in L2 (even for L3 load_back: data now in DRAM)
         self._slots[slot_hash] = slot_idx
         self._lru[slot_hash] = len(self._lru)
@@ -1915,6 +1995,8 @@ class MockMambaStatePoolHost:
                 break
             self._slots.pop(evicted_hash, None)
             self._lru.pop(evicted_hash, None)
+            if _up is not None:
+                _up.release_kda(evicted_hash)
             if _pol is not None:
                 _pol.record_eviction(evicted_hash)
             _evicted.append(evicted_hash)
@@ -1952,15 +2034,23 @@ class MockMambaStatePoolHost:
         _pol = self._get_policy()
         if _pol is not None:
             victim = _pol.select_victim(self)
-            if victim is not None:
-                self._slots.pop(victim, None)
-                _pol.record_eviction(victim)
+            if victim is None:
+                return None
+            self._slots.pop(victim, None)
+            self._lru.pop(victim, None)
+            _up = self.__dict__.get('_unified')
+            if _up is not None:
+                _up.release_kda(victim)
+            _pol.record_eviction(victim)
             return victim
         # Fallback: native LRU
         if not self._lru:
             return None
         slot_hash, _ = self._lru.popitem(last=False)
         self._slots.pop(slot_hash, None)
+        _up = self.__dict__.get('_unified')
+        if _up is not None:
+            _up.release_kda(slot_hash)
         return slot_hash
 
     def has(self, slot_hash: str) -> bool:
