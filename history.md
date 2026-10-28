@@ -1143,3 +1143,53 @@ pop_l3_direct_load_count()  # 复位
 **注意**：pkill 自匹配坑 —— 任何命令行文本含 `launch_server`（如 py_compile 路径）的 shell 会触发 run_exp.sh 内 pkill 自杀，输出截断。用 `launch[_]serv` 模式或脚本文件跑。
 
 **遗留（P2）**：`MultiEndedAllocator._flush_peer_for_alloc` 观测计数补丁（0.5.19 失效 → peak/flush 指标缺失）、`mamba_num`/`budget_kda_bytes` 语义、`peak_resident` 公式、INFO 日志门控、layer map 运行时从 model_config 派生、`get_num_kv_heads` 补丁、统一池 mamba 初始容量对齐 docker 80（需约束内存预算，`--mem-fraction-static` 路线未试）。
+
+## 2026-10-26 — L2 KDA/MLA Unified DRAM Pool（最小版本，同预算 + Page/Extent 碎片研究）
+
+**分支**：`develop_dqy_l2_one_pool`（基于 `origin/develop_dqy_evict_reuse` @ `199b2a8`），默认关闭、零回归。
+
+**设计**（详见 `K3_L2UnifiedDRAMPool_Design.md`）：
+- 三层：① 一个 `total_bytes` 预算（`HISIM_L2_TOTAL_GB`，默认 `--hicache-size`）；② 物理 `PageExtentAllocator`（`page_bytes = HISIM_L2_PAGE_TOKENS × token_bytes`，地址序 first-fit 连续 extent、free 时相邻合并）；③ 逻辑 `MLAView`（token index）与 `KDAView`（slot hash），各自保留 metadata / identity / restore 路径。
+- 模式：`two_pools` = 同一预算静态切两个 region（不借用，公平基线）；`one_pool` = 单 region 动态共享，可选 `HISIM_L2_MAMBA_MIN_SLOTS` 给 KDA 保底。
+- 两端分配：单 region 内 MLA 从低地址、KDA 从高地址各取一端（`PageExtentAllocator.alloc(..., from_high=)`），避免长寿命 KDA extent 把 MLA 空闲空间切碎；同负载下 one_pool 占用率因此从 85–93% 升到 96–98%。
+- 计价点：MLA 在 `alloc/free`；KDA 在 `backup_from_device`（准入）/`evict`。KDA host index 仅逻辑元数据，不计物理字节 → 不会凭空造出 L2 命中。
+- 借用：MLA 不足 → 逐槽 `evict()` KDA（走既有 placement policy + `notify_evicted` → L3 待写）；KDA 不足 → 先同视图 LRU 替换，再 `cache.evict_host(n, FULL)`（仅 `enable_storage`），否则准入拒绝、checkpoint 只留 L3。
+- `HISIM_L2_BORROW_POLICY`（默认 `self_first`）：预算用满时先替换本视图、再向对方借；`other_first` 改为先抢对方（需求驱动、弹性更强，但会饿死写入少的一方）。
+- size class：`HISIM_L2_ALLOC_POLICY=exact|pow2`（默认 exact）。碎片口径：internal = 预留页字节 − 请求字节；external = free 字节 − 最大连续 run。
+
+**实现**：
+- 新增 `src/hisim/simulation/l2_dram_pool.py`（`Extent` / `PageExtentAllocator` / `MLAView` / `KDAView` / `UnifiedDRAMPool` / env 单例）。
+- `sglang_mock_class.py`：`calc_kv_host_size_per_token`；KV mock 的 `alloc/free/available_size` 接统一池；KDA mock 准入/驱逐计价、`notify_evicted`/`set_evict_hook`、index 释放幂等（`_allocated_idx`）。
+- `sglang_hook.py`：`_setup_l2_dram_pool`、`_bind_l2_host_group`（把 `HostPoolGroup` 的 `KV`/`MAMBA` entry 与 `cc.storage_host_pool` 重指到 mock，Two Pools 也如此，否则预算只管计时模型）、两处容量来源、`_init_kda_pools` 注册、`l2_*` metrics（随 `metrics_phaseN.json` + `metrics.json` 双写）。
+
+**实测（8 GB、330 KDA slots、6000 ops，`benchmark/collection/l2_pool_frag_study.py`）**：
+- `pow2` 把 KDA slot 从 159 页抬到 256 页：单 slot 多付 61%，KDA 容量 330→204，内部碎片 22.9% → **默认必须 `exact`**。
+- `exact` + `page_tokens=16`：two_pools 内部碎片 0%、外部碎片 12–60%（4.4 MB 最大 run）；`page_tokens=64/256` 时 two_pools 外部碎片 0%。
+- `one_pool`（`self_first`）占用率 93.6–98.2%，two_pools 99.7–99.9%：**收益是切分随负载而不是容量更大**（kda_heavy → 532 slots；mla_heavy → 292 slots + 3.21 GB KV），手工设 `MAMBA_SIZE` 仍是最高占用率的做法。
+- `other_first` 会饿死一方：mla_heavy 下 KDA 每次准入都抢 MLA，KV 只剩 0.62 GB（`self_first` 3.21 GB）；kda_heavy 下 KV 归 0。适合"确定某方是冷数据"，需配保底。
+- `HISIM_L2_MAMBA_MIN_SLOTS=64` 的保底在本轮负载下未触顶（KDA 实际占用远高于 64 slots），只在高 MLA 占用时才生效。
+
+**验证**：`pytest test/test_l2_dram_pool.py` 13 passed（含两端分配、self_first vs other_first 对照、mock mamba host index 生命周期）；两个临时集成脚本（未入库）验证 ① mock 池 + 统一池的 alloc/free/KDA 准入/`load_to_device`/evict/index 幂等/MLA↔KDA 双向借用/末态归零；② `_setup_l2_dram_pool` + `_bind_l2_host_group` 后 group entry 指向 mock、One Pool 双向借用（`cross_evict_mla_tokens`/`cross_evict_kda_slots`）、Two Pools 4 GB → 3.12 GB KV + 0.87 GB KDA（57 slots）且填满后 `used ≤ total`、`external_frag=0`。
+
+**服务端 smoke（已补做）**：资产从 `/root/oc-import/ses_f52cf294bffebGYAEDp0akmfb0.json` 会话记录里恢复（`gen_k3_model.py` 重建 mock K3-23L、`config_k3_0519.json`、`gen_k3_exp_traces.py` 重生成 trace）。统一池预算取 85 GB ≈ baseline `--hicache-size 80`（mock 池 1656 KB/token → 47,177 tokens）。同一 trace `k3_p52_mla_heavy.jsonl`（11 请求）：
+
+| cell | 完成 | MLA hits（L1/L2） | KDA write→L3 | e2e (ms) |
+|---|---|---|---|---|
+| baseline（不设 `HISIM_L2_*`） | 11/11 | 294,912（294,912/0） | 35 → 35 | 22,819.65 |
+| two_pools `TOTAL_GB=85` | 11/11 | 294,912（294,912/0） | 6 → 6 | 22,817.36 |
+| one_pool `+ONE_POOL=1` | 11/11 | 294,912（294,912/0） | 7 → 7 | 22,817.44 |
+
+- 基线在最终代码上逐位复现（同 trace 两次运行一致到 1e-5 ms）→ 零回归成立。
+- 同一 85 GB 预算下：two_pools 切 80.15 GB MLA（2,954 页）+ 4.83 GB KDA（178 页），MLA 常驻 41,216 tokens、KDA 6 slots；one_pool 单区域，MLA 常驻 **49,408 tokens（+19.9%）**、KDA 7 slots、占用率 98.8%。`used+free=total`、`used=kv+kda`、`MLA live+avail` 与页数一致，`alloc_fail_*`/`admission_reject_*` 全 0。
+- KDA 密集 trace（P5.1，102 请求）：102/102，MLA hits 6,144（L1 4,096 + **L2 2,048**），KDA write 46 → L3 46，L3 hit 2，46 slots 常驻（物理 1.248 GB / 逻辑 0.674 GB），e2e 418.0 ms。
+
+**服务端发现并修复**：
+1. `HISIM_L2_TOTAL_GB=8` 只切出 1,856 tokens（< 单写批次 8,192），原生 `write()` 先 alloc 后入队、失败即 `return None` → L2 与搭车的 KDA 备份全部不发生，看起来像"统一池没接上"（`l2_used=0`、`kda_write_calls=0`）。是**预算小于写粒度**的退化形态，非接线错误；预算须至少容纳一个写批次。
+2. **KDA host index 泄漏（真 bug，已修）**：mock `start_writing` 同步消费写队列、原生 ack 路径不跑，`resolve_host_transfers` 给 MAMBA 的 host index 永不释放。P5.1 实测 96 次 donate 泄漏 96 个（`kda_l2_free_slots` 178→36），再跑 80 余个 checkpoint 就会耗尽并静默停掉 KDA 备份。改为：绑定统一池后 host index 退化为纯逻辑 id（round-robin），容量由 `KDAView.admit_kda` 裁决，`available_size()/get_stats()['free_slots']` 回报共享池可用 slot；legacy 有限 free list 行为不变。修复后 `kda_l2_free_slots=132=178−46 cached`，命中/时延逐位不变。
+3. 基线与统一池的容量来源不同：基线不重指 `HostPoolGroup`，`Cache state` 的 `L2_avail=1,680,784` 来自原生 host pool（44.53 GB / 26,492 B/token）；统一池路径换成预算 mock。比 token 数没有意义，按字节预算比。
+
+**注意**：
+- `MockMambaStatePoolHost.__getattr__` 对未知属性返回 `None`（`hasattr` 恒真），统一池属性必须用 `self.__dict__.get('_unified')`。
+- `_kda_host_pool`（`kda_{req_id}_{offset}`）与 `cache.mamba_pool_host`（`kda_{nid}_{i}`）都注册到同一 KDA 视图，hash 命名空间不合并；若确认二者是同一份物理 checkpoint 需去重。
+- `page_tokens=16` 时 KDA slot 在 5,760 B/entry 口径下正好 159 页（0 内部碎片）；服务端 mock 池 1,695,744 B/token 口径下 1 页/slot，**每 slot 有 46% 页内浪费**（物理 27.13 MB / 逻辑 14.65 MB），这是 P5.1 里 `internal_frag=574 MB` 的全部来源。
+- KDA 备份搭在 KV 写操作上：MLA 侧连一个批次都放不下时 `write()` 返回 None，KDA checkpoint 也不再进 L2/L3（P5.2 中 35→6 次）。未改原生语义，解耦需另建 MAMBA 写路径。
