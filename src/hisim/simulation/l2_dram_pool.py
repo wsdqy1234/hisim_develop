@@ -807,6 +807,14 @@ def configure_l2_dram_pool(
         return None
 
     page_tokens = max(1, _env_int("HISIM_L2_PAGE_TOKENS", DEFAULT_PAGE_TOKENS))
+    # [P2C.3.3-FIX] Allow overriding token_bytes: calc_kv_host_size_per_token
+    # reads native device-pool attrs (layer_num/head_num/head_dim) which for K3
+    # gives ~10MB/token instead of HiSim's 5760 B/token (head_num=1, head_dim=288).
+    # Without this override page_bytes balloons to ~157MB and the pool becomes
+    # unusable (6 pages for 1GB). Set HISIM_L2_TOKEN_BYTES=5760 for HiSim.
+    token_bytes_override = _env_int("HISIM_L2_TOKEN_BYTES", 0)
+    if token_bytes_override > 0:
+        token_bytes = token_bytes_override
     policy = os.environ.get("HISIM_L2_ALLOC_POLICY", "exact").strip().lower()
     if policy not in VALID_POLICIES:
         logger.warning("Unknown HISIM_L2_ALLOC_POLICY=%r, using exact", policy)
