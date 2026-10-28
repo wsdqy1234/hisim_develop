@@ -18,7 +18,7 @@ TierCostAwareL2 产生**完全相同**的结果。根因是 LRU 和 frequency �
 
 | Policy | COW | Replay | L3_Wr | L3_Hit | Load_Calls | Wr_Xfer | L2_Victims |
 |--------|-----|--------|-------|--------|------------|---------|------------|
-| NativeL2 | 6 | 0 | 30 | 12 | 12 | 30 | N/A |
+| NativeL2 | 6 | 0 | 30 | 12 | 12 | 30 | N/A |git pu
 | HotnessL2 | 6 | 0 | 30 | 12 | 12 | 30 | 30 |
 | DepthAwareL2 | 6 | 0 | 30 | 12 | 12 | 30 | N/A |
 | TierCostAwareL2 | 6 | 0 | 30 | 12 | 12 | 30 | N/A |

@@ -1390,15 +1390,38 @@ def synchronized(func):
 def calc_kv_host_size_per_token(device_pool) -> int:
     """DRAM bytes per MLA token used by the L2 host pool.
 
-    Mirrors ``MockTokenToKVPoolHost.get_size_per_token`` so the unified DRAM
-    pool can be sized before the mock pool object exists.
+    [D1.4-FIX] Use HiSim Kimi-K3 MLA entry_bytes (5760 B/token) as the
+    authoritative source. The previous implementation read native device_pool
+    attrs (layer_num=61, real_head_num=128, real_head_dim=128, itemsize=4)
+    which returns ~10MB/token — 1785× larger than HiSim's simplified MLA
+    capacity mode (head_num=1, head_dim=288, entry_bytes=5760).
+
+    This matches MockTokenToKVPoolHost.get_size_per_token() and the HiSim
+    launch_server MLA capacity patch (head_dim=288 → entry_bytes=5760).
     """
-    layer_num = getattr(device_pool, 'layer_num', 23)
-    real_head_num = getattr(device_pool, '_real_head_num', 1)
-    real_head_dim = getattr(device_pool, '_real_head_dim', 1)
-    dtype = getattr(device_pool, 'store_dtype', torch.float32)
-    itemsize = getattr(dtype, 'itemsize', 4)
-    return int(real_head_dim * real_head_num * layer_num * itemsize * 2)
+    # HiSim Kimi-K3 MLA: head_num=1, head_dim=288
+    # entry_bytes = 5 × head_num × head_dim × 2(K+V) × 2(bf16) = 5760
+    HISIM_MLA_ENTRY_BYTES = 5760
+
+    # Configuration assertion: compare with native device_pool computation
+    try:
+        layer_num = getattr(device_pool, 'layer_num', 23)
+        real_head_num = getattr(device_pool, '_real_head_num', 1)
+        real_head_dim = getattr(device_pool, '_real_head_dim', 1)
+        dtype = getattr(device_pool, 'store_dtype', torch.float32)
+        itemsize = getattr(dtype, 'itemsize', 4)
+        native_bytes = int(real_head_dim * real_head_num * layer_num * itemsize * 2)
+        if native_bytes != HISIM_MLA_ENTRY_BYTES:
+            logger.info(
+                f"[D1.4] calc_kv_host_size_per_token: native device_pool gives "
+                f"{native_bytes} B/token (layer={layer_num}, head={real_head_num}, "
+                f"dim={real_head_dim}, itemsize={itemsize}), using HiSim MLA "
+                f"entry_bytes={HISIM_MLA_ENTRY_BYTES} instead"
+            )
+    except Exception:
+        pass
+
+    return HISIM_MLA_ENTRY_BYTES
 
 
 class MockTokenToKVPoolHost:

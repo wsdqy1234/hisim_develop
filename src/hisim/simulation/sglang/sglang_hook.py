@@ -1542,8 +1542,8 @@ class C_HiRadixCacheHook(BaseHook):
                 # and create fake acks (torch.Event so query/synchronize work).
                 # Also directly trigger L3 (SSD) writes/reads to bypass the
                 # broken ack processing chain (write_backup_storage never called).
-                _diag_w = {"calls": 0, "mamba_pt": 0, "full_only": 0, "l3_writes": 0}
-                _diag_l = {"calls": 0, "mamba_pt": 0, "full_only": 0, "l3_hits": 0}
+                _diag_w = {"calls": 0, "mamba_pt": 0, "full_only": 0, "l3_writes": 0, "kda_l3_writes": 0, "kda_l2_admissions": 0}
+                _diag_l = {"calls": 0, "mamba_pt": 0, "full_only": 0, "l3_hits": 0, "kda_l3_hits": 0, "kda_l3_admission_reject": 0}
 
                 # Get storage backend for L3 writes/reads
                 # Always use MockHiCacheStorage — the real storage_backend may be
@@ -1777,6 +1777,8 @@ class C_HiRadixCacheHook(BaseHook):
                                 _slot_bytes = getattr(mh, 'slot_bytes', 14653440) if mh else 14653440
                                 _kda_l3_dur = (_slot_bytes * len(_l3_mamba)) / _disk_write_bw
                                 StateManager.inc_hicache_kda_l3_backup_dur(_kda_l3_dur)
+                                # [D1.1] KDA L3 write counter (separate from MLA l3_writes)
+                                _diag_w["kda_l3_writes"] += len(_l3_mamba)
                                 # [A2] Shadow: backup_l3 for each evicted hash
                                 if kda_obs.is_obs_enabled():
                                     for _sh in _l3_mamba:
@@ -1964,12 +1966,24 @@ class C_HiRadixCacheHook(BaseHook):
                                             _slot_bytes = getattr(mh, 'slot_bytes', 14653440)
                                             _kda_l3_dur = _slot_bytes / _disk_read_bw
                                             StateManager.inc_hicache_kda_l3_load_dur(_kda_l3_dur)
-                                            _any_mamba_restore = True
+                                            # [D1.1] KDA L3 hit counter (separate from MLA l3_hits)
+                                            _diag_l["kda_l3_hits"] += 1
                                             # [A4] Log KDA L3 load (separate from MLA counter)
                                             logger.info(f"[A4-KDA-L3-LOAD] hash={_slot_hash} dur={_kda_l3_dur:.6f}")
                                             C_SchedulerHook._kda_l3_load_total = getattr(C_SchedulerHook, '_kda_l3_load_total', 0.0) + _kda_l3_dur
-                                            mh.backup_from_device(-1, _slot_hash, from_l3=True)
-                                            mh.load_to_device(_slot_hash)
+                                            # [D1.2] Check backup_from_device return — don't declare
+                                            # restore success just because L3 has data. If L2 admission
+                                            # fails (One Pool budget exhausted), the data is NOT consumable
+                                            # (no Direct Staging path in current Mock).
+                                            _bk_ret = mh.backup_from_device(-1, _slot_hash, from_l3=True)
+                                            if _bk_ret is not False:
+                                                mh.load_to_device(_slot_hash)
+                                                _any_mamba_restore = True
+                                            else:
+                                                # L2 admission rejected — data in L3 but not staged to L2
+                                                logger.info(f"[D1.2-L3-REJECT] hash={_slot_hash} L3 hit but L2 admission failed")
+                                                _diag_l["kda_l3_admission_reject"] += 1
+                                                # _any_mamba_restore stays False → replay triggered
                                             if kda_obs.is_obs_enabled():
                                                 kda_obs.shadow_restore_l3(_slot_hash, _slot_idx)
                             except Exception as e:
@@ -4422,8 +4436,13 @@ class C_SchedulerHook(BaseHook):
                     metrics["kda_load_mamba_xfers"] = _dl.get('mamba_pt', 0)  # L1 checkpoint hits (state loaded back from radix tree)
                     # HiCache-specific (L2/L3 backup). When HiCache disabled, these remain 0
                     # because no backup/load_back occurs. This is genuinely 0, not "missing".
-                    metrics["kda_l3_writes"] = _dw.get('l3_writes', 0)
-                    metrics["kda_l3_hits"] = _dl.get('l3_hits', 0)
+                    # [D1.1] Note: l3_writes/l3_hits are MLA counters (legacy naming).
+                    # KDA-specific counters added below.
+                    metrics["kda_l3_writes"] = _dw.get('l3_writes', 0)      # MLA L3 writes (legacy name)
+                    metrics["kda_l3_hits"] = _dl.get('l3_hits', 0)           # MLA L3 hits (legacy name)
+                    metrics["kda_l3_mamba_writes"] = _dw.get('kda_l3_writes', 0)  # KDA L3 writes (D1.1)
+                    metrics["kda_l3_mamba_hits"] = _dl.get('kda_l3_hits', 0)     # KDA L3 hits (D1.1)
+                    metrics["kda_l3_admission_reject"] = _dl.get('kda_l3_admission_reject', 0)  # D1.2
                     # [A4] L3 load duration counters (MLA vs KDA, separately accumulated)
                     metrics["mla_l3_load_dur_total"] = getattr(C_SchedulerHook, '_mla_l3_load_total', 0.0)
                     metrics["kda_l3_load_dur_total"] = getattr(C_SchedulerHook, '_kda_l3_load_total', 0.0)
