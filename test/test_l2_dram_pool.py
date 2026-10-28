@@ -195,6 +195,8 @@ def test_one_pool_kda_borrows_from_mla():
     assert ok
     st = pool.stats()
     assert st["cross_evict_mla_tokens"] > 0
+    assert st["evict_mla_for_kda_tokens"] > 0  # [P2D2] directional counter
+    assert st["evict_kda_for_mla_slots"] == 0   # no KDA evicted for MLA in this test
     assert st["kda_cached_slots"] >= 1
 
 

@@ -362,6 +362,68 @@ class MLAView:
             "available_tokens": self.available_tokens(),
         }
 
+    def page_diagnostics(self) -> Dict[str, Any]:
+        """Page-level breakdown of MLA allocated space.
+
+        Categories (mutually exclusive, sum to used_pages):
+        - live_full_pages: pages in extents where ALL tokens are live
+        - partial_pages:   pages in extents where SOME tokens are freed
+                           (live > 0 but live < pages * page_tokens)
+        - empty_pages:     pages in extents with live == 0 (should not exist
+                           because free_tokens releases the extent, but
+                           tracked defensively)
+
+        Derived:
+        - live_token_bytes: bytes needed for just the live tokens
+        - allocated_bytes:  bytes actually allocated (used_pages * page_bytes)
+        - slack_bytes:      allocated - live_token_bytes (the 79MB overhead)
+        """
+        live_full_pages = 0
+        partial_pages = 0
+        empty_pages = 0
+        full_extents = 0
+        partial_extents = 0
+        empty_extents = 0
+        total_live = 0
+        total_capacity_tokens = 0  # tokens that the allocated pages CAN hold
+
+        for ext in self.extents.values():
+            ext_capacity = ext.pages * self.page_tokens
+            total_capacity_tokens += ext_capacity
+            total_live += ext.live
+            if ext.live <= 0:
+                empty_pages += ext.pages
+                empty_extents += 1
+            elif ext.live >= ext_capacity:
+                live_full_pages += ext.pages
+                full_extents += 1
+            else:
+                partial_pages += ext.pages
+                partial_extents += 1
+
+        page_bytes = self.token_bytes * self.page_tokens
+        live_token_bytes = total_live * self.token_bytes
+        allocated_bytes = self._used_pages * page_bytes
+        slack_bytes = allocated_bytes - live_token_bytes
+
+        return {
+            "total_extents": len(self.extents),
+            "full_extents": full_extents,
+            "partial_extents": partial_extents,
+            "empty_extents": empty_extents,
+            "live_full_pages": live_full_pages,
+            "partial_pages": partial_pages,
+            "empty_pages": empty_pages,
+            "live_tokens": total_live,
+            "capacity_tokens": total_capacity_tokens,
+            "live_token_bytes": live_token_bytes,
+            "allocated_bytes": allocated_bytes,
+            "slack_bytes": max(0, slack_bytes),
+            "slack_ratio": (slack_bytes / allocated_bytes) if allocated_bytes else 0.0,
+            "page_tokens": self.page_tokens,
+            "page_bytes": page_bytes,
+        }
+
 
 class KDAView:
     """KDA checkpoint view.  Identity = slot hash (content addressed).
@@ -472,6 +534,14 @@ class UnifiedDRAMPool:
         self.cross_reclaim_calls = 0
         self.admission_reject_kda = 0
         self.kda_floor_bytes = 0
+        # [P2D2] Directional eviction counters — distinguish same-pool
+        # replacement from cross-type borrow.  Legacy aggregate counters
+        # (cross_evict_*) are kept for backward compatibility.
+        self.evict_mla_for_kda_tokens = 0   # MLA freed for KDA admission (cross-type)
+        self.evict_kda_for_mla_slots = 0    # KDA freed for MLA admission (cross-type)
+        self.evict_kda_for_kda_slots = 0    # KDA freed for KDA admission (same-pool)
+        self.evict_mla_for_mla_tokens = 0   # MLA freed for MLA admission (same-pool, native)
+        self._evict_mla_total_tokens = 0    # ALL MLA evictions via evict_host (for subtraction)
 
         if mode == "two_pools":
             kda_bytes = int(kda_region_bytes or 0)
@@ -565,7 +635,7 @@ class UnifiedDRAMPool:
                 if avail >= need_pages:
                     break
                 deficit = (need_pages - avail) * self.page_bytes
-                if self._reclaim_from_kda(deficit) <= 0:
+                if self._reclaim_from_kda(deficit, reason="for_mla") <= 0:
                     break
                 idx = self.mla.alloc_tokens(n_tokens)
                 if idx is not None:
@@ -588,7 +658,7 @@ class UnifiedDRAMPool:
             missing = need_pages - self.kda.alloc.largest_free_run()
             if missing <= 0:
                 break
-            if self._reclaim_from_kda(missing * self.page_bytes) <= 0:
+            if self._reclaim_from_kda(missing * self.page_bytes, reason="for_kda") <= 0:
                 break
             if self.kda.admit(key):
                 return True
@@ -634,8 +704,13 @@ class UnifiedDRAMPool:
         return self.kda.available_slots()
 
     # -- cross-view reclaim -------------------------------------------------
-    def _reclaim_from_kda(self, need_bytes: int) -> int:
-        """Evict KDA checkpoints (existing L2->L3 path) to free ``need_bytes``."""
+    def _reclaim_from_kda(self, need_bytes: int, reason: str = "for_mla") -> int:
+        """Evict KDA checkpoints (existing L2->L3 path) to free ``need_bytes``.
+
+        Args:
+            reason: "for_mla" (MLA admission triggered KDA reclaim) or
+                    "for_kda" (KDA self-replacement).
+        """
         if not self._kda_pools:
             return 0
         self.cross_reclaim_calls += 1
@@ -665,6 +740,11 @@ class UnifiedDRAMPool:
                     freed += delta_pages * self.page_bytes
                     self.cross_evict_kda_slots += 1
                     self.cross_evict_kda_bytes += delta_pages * self.page_bytes
+                    # [P2D2] Directional counter
+                    if reason == "for_kda":
+                        self.evict_kda_for_kda_slots += 1
+                    else:
+                        self.evict_kda_for_mla_slots += 1
                     self._notify_kda_evicted(pool, victim)
                     if freed >= need_bytes:
                         break
@@ -683,7 +763,13 @@ class UnifiedDRAMPool:
             logger.debug("KDA eviction notification failed: %s", exc)
 
     def _reclaim_from_mla(self, need_bytes: int) -> int:
-        """Evict MLA entries through the native host-eviction path."""
+        """Evict MLA entries through the native host-eviction path.
+
+        This is MLA-for-KDA (cross-type borrow): KDA admission needs space,
+        and MLA entries are evicted to make room.  The native evict_host
+        call is counted in _evict_mla_total_tokens by the wrapper; here we
+        record the directional counter for the KDA-triggered portion.
+        """
         if not self.mla_reclaim_enabled:
             return 0
         self.cross_reclaim_calls += 1
@@ -695,6 +781,7 @@ class UnifiedDRAMPool:
             return 0
         if freed_tokens > 0:
             self.cross_evict_mla_tokens += freed_tokens
+            self.evict_mla_for_kda_tokens += freed_tokens
         return freed_tokens * self.token_bytes
 
     # -- metrics ------------------------------------------------------------
@@ -762,9 +849,29 @@ class UnifiedDRAMPool:
             "cross_evict_kda_slots": self.cross_evict_kda_slots,
             "cross_evict_kda_bytes": self.cross_evict_kda_bytes,
             "cross_evict_mla_tokens": self.cross_evict_mla_tokens,
+            # [P2D2] Directional eviction counters
+            "evict_mla_for_kda_tokens": self.evict_mla_for_kda_tokens,
+            "evict_kda_for_mla_slots": self.evict_kda_for_mla_slots,
+            "evict_kda_for_kda_slots": self.evict_kda_for_kda_slots,
+            "evict_mla_for_mla_tokens": max(
+                0, self._evict_mla_total_tokens - self.evict_mla_for_kda_tokens
+            ),
             "kv_evict_enabled": bool(self.kv_evict and self._mla_evict_fn is not None),
             "borrow_policy": self.borrow_policy,
         }
+
+    def mla_page_diagnostics(self) -> Dict[str, Any]:
+        """Page-level MLA space breakdown for Task 4 attribution.
+
+        Returns the MLAView.page_diagnostics() dict plus pool-level
+        totals so the caller can produce a closed byte accounting:
+          payload_live + slack + external_frag + free = total
+        """
+        mla_pd = self.mla.page_diagnostics()
+        mla_pd["pool_total_bytes"] = self.total_bytes
+        mla_pd["kda_logical_bytes"] = self.kda.stats().get("logical_bytes", 0)
+        mla_pd["kda_slot_pages"] = self.kda.stats().get("slot_pages", 0)
+        return mla_pd
 
 
 # ---------------------------------------------------------------------------

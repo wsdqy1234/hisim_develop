@@ -1495,19 +1495,51 @@ def _bind_l2_host_group(cache, l2_pool, kv_host, kda_host):
         kda_host.attach_unified(l2_pool)
         l2_pool.register_kda_pool(kda_host)
 
-    # KDA -> MLA reclaim uses the native host-eviction path (write-through L3).
-    if getattr(cache, "enable_storage", False) and hasattr(cache, "evict_host"):
+    # [P2D2] KDA -> MLA reclaim uses the native host-eviction path.
+    # The enable_storage guard was overly conservative: evict_host is a
+    # radix-tree operation that works regardless of L3 storage.  In HiSim
+    # Mock, L3 writes happen in the backup path (_mock_start_writing), so
+    # evicted L2 entries already have L3 copies.  Removing the guard allows
+    # MLA→KDA cross-type borrow in One Pool mode without enabling native
+    # Storage.
+    if hasattr(cache, "evict_host"):
+        from sglang.srt.mem_cache.unified_cache.component_type import (
+            ComponentType as _P2D2_CT,
+        )
+
+        # [P2D2] Wrap evict_host to count ALL MLA evictions (for the
+        # evict_mla_for_mla counter = total - evict_mla_for_kda).
+        _orig_evict_host = cache.evict_host
+        _l2_ref = l2_pool  # capture for counter update
+
+        def _wrapped_evict_host(*args, **kwargs):
+            result = _orig_evict_host(*args, **kwargs)
+            try:
+                # component_type is the 2nd positional arg or kwarg
+                # If not specified, the original default was used (FULL for K3)
+                ct = args[1] if len(args) > 1 else kwargs.get("component_type")
+                if result and (ct is None or ct == _P2D2_CT.FULL):
+                    _l2_ref._evict_mla_total_tokens += int(result)
+            except Exception:
+                pass
+            return result
+
+        cache.evict_host = _wrapped_evict_host
+
         def _mla_evict(n_tokens, _c=cache):
             try:
-                from sglang.srt.mem_cache.unified_cache.component_type import (
-                    ComponentType,
-                )
-                return int(_c.evict_host(int(n_tokens), ComponentType.FULL) or 0)
+                return int(_c.evict_host(int(n_tokens), _P2D2_CT.FULL) or 0)
             except Exception as exc:
                 logger.debug(f"L2 unified pool: MLA reclaim failed: {exc}")
                 return 0
 
         l2_pool.set_mla_evictor(_mla_evict)
+        logger.info(
+            "[P2D2] MLA evictor registered (enable_storage=%s, evict_host wrapped for tracking)",
+            getattr(cache, "enable_storage", False),
+        )
+    else:
+        logger.warning("[P2D2] cache.evict_host not found — MLA→KDA borrow disabled")
 
 
 class C_HiRadixCacheHook(BaseHook):
@@ -1543,7 +1575,7 @@ class C_HiRadixCacheHook(BaseHook):
                 # Also directly trigger L3 (SSD) writes/reads to bypass the
                 # broken ack processing chain (write_backup_storage never called).
                 _diag_w = {"calls": 0, "mamba_pt": 0, "full_only": 0, "l3_writes": 0, "kda_l3_writes": 0, "kda_l2_admissions": 0}
-                _diag_l = {"calls": 0, "mamba_pt": 0, "full_only": 0, "l3_hits": 0, "kda_l3_hits": 0, "kda_l3_admission_reject": 0}
+                _diag_l = {"calls": 0, "mamba_pt": 0, "full_only": 0, "l3_hits": 0, "kda_l3_hits": 0, "kda_l3_admission_reject": 0, "kda_l2_load_fail": 0, "kda_l3_stage_fail": 0}
 
                 # Get storage backend for L3 writes/reads
                 # Always use MockHiCacheStorage — the real storage_backend may be
@@ -1954,10 +1986,18 @@ class C_HiRadixCacheHook(BaseHook):
                                         except Exception:
                                             pass
                                     if _l2_hit:
-                                        mh.load_to_device(_slot_hash)
-                                        _any_mamba_restore = True
-                                        if kda_obs.is_obs_enabled():
-                                            kda_obs.shadow_restore_l2(_slot_hash, _slot_idx)
+                                        # [P2D2] Check load_to_device return value.
+                                        # load_to_device returns -1 if the slot
+                                        # is not actually in L2 (race / stale).
+                                        # Only mark restore success on valid return.
+                                        _ld_ret = mh.load_to_device(_slot_hash)
+                                        if _ld_ret is not None and _ld_ret >= 0:
+                                            _any_mamba_restore = True
+                                            if kda_obs.is_obs_enabled():
+                                                kda_obs.shadow_restore_l2(_slot_hash, _slot_idx)
+                                        else:
+                                            logger.info(f"[P2D2-L2-LOAD-FAIL] hash={_slot_hash} load_to_device={_ld_ret} — restore NOT confirmed")
+                                            _diag_l["kda_l2_load_fail"] = _diag_l.get("kda_l2_load_fail", 0) + 1
                                     elif st is not None:
                                         _m_hits = st.batch_exists_mamba([_slot_hash])
                                         _l3_hit_val = _m_hits.get(_slot_hash, 0) if _m_hits else 0
@@ -1977,8 +2017,16 @@ class C_HiRadixCacheHook(BaseHook):
                                             # (no Direct Staging path in current Mock).
                                             _bk_ret = mh.backup_from_device(-1, _slot_hash, from_l3=True)
                                             if _bk_ret is not False:
-                                                mh.load_to_device(_slot_hash)
-                                                _any_mamba_restore = True
+                                                # [P2D2] Verify the staged slot is actually loadable.
+                                                # backup_from_device may succeed (admission OK) but
+                                                # the slot might not be in _slots if there was a
+                                                # race or internal error.
+                                                _ld_ret = mh.load_to_device(_slot_hash)
+                                                if _ld_ret is not None and _ld_ret >= 0:
+                                                    _any_mamba_restore = True
+                                                else:
+                                                    logger.info(f"[P2D2-L3-STAGE-FAIL] hash={_slot_hash} staged but load returned {_ld_ret}")
+                                                    _diag_l["kda_l3_stage_fail"] = _diag_l.get("kda_l3_stage_fail", 0) + 1
                                             else:
                                                 # L2 admission rejected — data in L3 but not staged to L2
                                                 logger.info(f"[D1.2-L3-REJECT] hash={_slot_hash} L3 hit but L2 admission failed")
@@ -2253,6 +2301,68 @@ class C_HiRadixCacheHook(BaseHook):
                     _l2_pool.kda_capacity_slots,
                     _l2_pool.page_bytes,
                 )
+            else:
+                # [P2D2] Legacy mode: normalize HostPoolGroup capacity to
+                # the mock pool's logical size.  Without this, group.size
+                # stays at the native default (hicache_size=80GB), which
+                # prevents radix tree eviction and creates an unfair baseline
+                # (Legacy never evicts radix nodes → inflated L3 hits).
+                _kv_h = getattr(self, 'full_kv_pool_host', None)
+                _mb_h = getattr(self, 'mamba_pool_host', None)
+                if _kv_h is not None:
+                    from sglang.srt.mem_cache.hicache_storage import PoolName as _P2D2_PN
+                    _grp = getattr(self, "host_pool_group", None)
+                    _cc_p2d2 = getattr(self, "cache_controller", None)
+                    if _grp is None and _cc_p2d2 is not None:
+                        _grp = getattr(_cc_p2d2, "mem_pool_host", None)
+                    if _grp is not None and hasattr(_grp, "entry_map"):
+                        _kv_ent = _grp.entry_map.get(_P2D2_PN.KV)
+                        if _kv_ent is not None:
+                            _kv_ent.host_pool = _kv_h
+                        _mb_ent = _grp.entry_map.get(_P2D2_PN.MAMBA)
+                        if _mb_ent is not None and _mb_h is not None:
+                            _mb_ent.host_pool = _mb_h
+                        try:
+                            _grp.size = _kv_h.size
+                            _grp.logical_size = getattr(_kv_h, 'logical_size', _kv_h.size)
+                            _grp.page_size = getattr(_kv_h, 'page_size', 1)
+                            _grp._refresh_transfer_capabilities()
+                        except Exception as _exc:
+                            logger.debug(f"[P2D2] Legacy group.size normalization failed: {_exc}")
+                        logger.info(
+                            "[P2D2] Legacy HostPoolGroup normalized: "
+                            "group.size=%d tokens (%.3fGB), kv_host.size=%d, "
+                            "mamba_size=%d",
+                            _grp.size,
+                            _grp.size * 5760 / 1e9,
+                            _kv_h.size,
+                            getattr(_mb_h, 'size', 0) if _mb_h else 0,
+                        )
+
+            # [P2D2] Capacity verification — print and validate at startup
+            _kv_h_v = getattr(self, 'full_kv_pool_host', None)
+            _grp_v = getattr(self, "host_pool_group", None)
+            _cc_v = getattr(self, "cache_controller", None)
+            if _grp_v is None and _cc_v is not None:
+                _grp_v = getattr(_cc_v, "mem_pool_host", None)
+            _grp_size_v = getattr(_grp_v, 'size', None) if _grp_v else None
+            _kv_size_v = getattr(_kv_h_v, 'size', None) if _kv_h_v else None
+            logger.info(
+                "[P2D2] Capacity check: group.size=%s kv_host.size=%s "
+                "enable_storage=%s hicache_size=%sGB mode=%s",
+                _grp_size_v,
+                _kv_size_v,
+                getattr(self, 'enable_storage', 'N/A'),
+                getattr(server_args, 'hicache_size', 'N/A'),
+                "unified" if _l2_pool is not None else "legacy",
+            )
+            if _grp_size_v is not None and _kv_size_v is not None:
+                if _grp_size_v != _kv_size_v:
+                    logger.warning(
+                        "[P2D2] MISMATCH: group.size=%d != kv_host.size=%d "
+                        "— radix tree eviction will be incorrect",
+                        _grp_size_v, _kv_size_v,
+                    )
 
             logger.info(
                 f"HiSim hicache attached: components={set(self.components.keys())}, "
@@ -4443,6 +4553,9 @@ class C_SchedulerHook(BaseHook):
                     metrics["kda_l3_mamba_writes"] = _dw.get('kda_l3_writes', 0)  # KDA L3 writes (D1.1)
                     metrics["kda_l3_mamba_hits"] = _dl.get('kda_l3_hits', 0)     # KDA L3 hits (D1.1)
                     metrics["kda_l3_admission_reject"] = _dl.get('kda_l3_admission_reject', 0)  # D1.2
+                    # [P2D2] Restore Ready failure boundary counters
+                    metrics["kda_l2_load_fail"] = _dl.get('kda_l2_load_fail', 0)
+                    metrics["kda_l3_stage_fail"] = _dl.get('kda_l3_stage_fail', 0)
                     # [A4] L3 load duration counters (MLA vs KDA, separately accumulated)
                     metrics["mla_l3_load_dur_total"] = getattr(C_SchedulerHook, '_mla_l3_load_total', 0.0)
                     metrics["kda_l3_load_dur_total"] = getattr(C_SchedulerHook, '_kda_l3_load_total', 0.0)
@@ -4507,6 +4620,13 @@ class C_SchedulerHook(BaseHook):
                         for _k, _v in _l2s.items():
                             metrics[f"l2_{_k}"] = _v
                         metrics["l2_one_pool"] = int(_l2s.get("mode") == "one_pool")
+                        # [P2D2] MLA page-level diagnostics for overhead attribution
+                        try:
+                            _mla_pd = _l2u.mla_page_diagnostics()
+                            for _pk, _pv in _mla_pd.items():
+                                metrics[f"l2_mla_pd_{_pk}"] = _pv
+                        except Exception as _pd_err:
+                            logger.debug(f"MLA page diagnostics unavailable: {_pd_err}")
                 except Exception as _l2e:
                     logger.debug(f"L2 unified metrics unavailable: {_l2e}")
 
