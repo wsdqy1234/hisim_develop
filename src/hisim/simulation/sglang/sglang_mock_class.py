@@ -1524,7 +1524,13 @@ class MockTokenToKVPoolHost:
         # Keep mock 1x1 for actual buffer allocation (saves memory)
         self.head_num = getattr(self.device_pool, 'head_num', 1)
         self.head_dim = getattr(self.device_pool, 'head_dim', 576)
-        return real_head_dim * real_head_num * self.layer_num * self.dtype.itemsize * 2
+        # [P2D2] Use HiSim MLA entry_bytes (5760) for capacity calculation.
+        # The native computation below returns ~10MB/token (1785× larger):
+        #   real_head_dim * real_head_num * layer_num * dtype.itemsize * 2
+        # This matches calc_kv_host_size_per_token() (D1.4 fix) and ensures
+        # kv_host.size = int(host_size_gb * 1e9 / 5760) gives the correct
+        # token capacity for both Legacy and Unified modes.
+        return calc_kv_host_size_per_token(self.device_pool)
 
     def init_kv_buffer(self):
         if self.layout == "layer_first":
