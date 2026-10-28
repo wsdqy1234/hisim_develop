@@ -2252,7 +2252,12 @@ class C_HiRadixCacheHook(BaseHook):
                 if _l2_pool is not None:
                     _l2_kv_size_orig = float(_l2_pool.mla_capacity_bytes) / 1e9
                 else:
-                    _l2_kv_size_orig = server_args.hicache_size
+                    # [P2D2] Read HISIM_L2_KV_SIZE_GB in the swap path too.
+                    # Previously this used server_args.hicache_size (80GB)
+                    # directly, ignoring the env var that sets the correct
+                    # L2 KV budget for Legacy mode.
+                    _l2_kv_size_orig = float(os.environ.get(
+                        "HISIM_L2_KV_SIZE_GB", str(server_args.hicache_size)))
                 self.full_kv_pool_host = MockTokenToKVPoolHost(
                     _kvcache,
                     server_args.hicache_ratio,
