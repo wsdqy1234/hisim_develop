@@ -32,9 +32,13 @@ benchlog=$RESULTS_DIR/${NAME}_bench.log
 echo "[$(date +%H:%M:%S)] Starting: $NAME"
 
 # Kill existing
-pkill -f "launch_server" 2>/dev/null || true
-sleep 3
-while ss -tlnp 2>/dev/null | grep -q $PORT; do sleep 1; done
+pkill -9 -f "launch_server" 2>/dev/null || true
+sleep 5
+# Also kill anything on the port directly
+for i in $(seq 1 10); do
+    ss -tlnp 2>/dev/null | grep -q $PORT || break
+    sleep 2
+done
 
 # Clear pycache
 cd /home/d00954154/hisim
