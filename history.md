@@ -1193,3 +1193,41 @@ pop_l3_direct_load_count()  # 复位
 - `_kda_host_pool`（`kda_{req_id}_{offset}`）与 `cache.mamba_pool_host`（`kda_{nid}_{i}`）都注册到同一 KDA 视图，hash 命名空间不合并；若确认二者是同一份物理 checkpoint 需去重。
 - `page_tokens=16` 时 KDA slot 在 5,760 B/entry 口径下正好 159 页（0 内部碎片）；服务端 mock 池 1,695,744 B/token 口径下 1 页/slot，**每 slot 有 46% 页内浪费**（物理 27.13 MB / 逻辑 14.65 MB），这是 P5.1 里 `internal_frag=574 MB` 的全部来源。
 - KDA 备份搭在 KV 写操作上：MLA 侧连一个批次都放不下时 `write()` 返回 None，KDA checkpoint 也不再进 L2/L3（P5.2 中 35→6 次）。未改原生语义，解耦需另建 MAMBA 写路径。
+
+## 2026-11-02 L2 分配策略对拍：两端 first-fit vs MemCache best-fit
+
+**动机**：MemCache 的 `MmcBlobAllocator` 用 best-fit（`sizeTree_.lower_bound` 选最小可容纳块，
+从块低地址切分），并有一份双端（头/尾、按 1 MiB 阈值）设计文档；我们的统一池用两端 first-fit。
+需要回答：DRAM 分配是否该换成 best-fit。
+
+**方法**：新增 `benchmark/collection/l2_pool_alloc_policy_study.py`（结果 `l2_pool_alloc_policy_results.json`，
+96 行聚合 + 480 行原始）。**开环** trace：分配/释放序列与策略无关、不做淘汰换空间，
+放不下即丢弃（丢弃=碎片代价）；5 个 seed 取均值，另报逐 seed 方向。
+8 个策略：`two_ended_ff`（现状）/`two_ended_bf`（端内 best-fit，MemCache 文档方案 D）/
+`best_fit_low|high`（MemCache 现行）/`dual_ended_bf@16|64|159`（按尺寸阈值分端）/`ideal_compact`（零外部碎片上界）。
+两组几何：`server_1656KB`（page 27.1 MB、3132 页/85 GB、KDA slot=1 页，池内仅 ~20–30 个对象）与
+`real_5760B`（page 92 KB、86,805 页/8 GB、KDA slot=159 页，~500–700 个活跃 extent）。
+
+**结论**：
+- 部署几何（server）下换 best-fit 无稳定收益：占用率差 0.6–1.3 点、MLA 碎片差 <1 点，
+  多数落在 seed 噪声内（`big-blocked%` 的 seed 标准差 4–13 点，对象数太少）。逐 seed 看，
+  KDA-heavy 档两端占用率 **5/5 领先**（83.0–84.0 vs 81.4–82.9）、整批被挡 **4/5 更低**，balanced 档 3/5 更低。
+- 真实口径（`real_5760B`，KDA slot=159 页与 MLA 128/256 页重叠）best-fit 确有收益：
+  512 页整批"空闲够但无连续块"的比例 ~5 点下降（20.6/24.2/22.6 → 15.0/18.0/16.4，6 个 case 中 5 个同向），
+  代价是 ≤1.6 点占用、**空闲 run 数翻倍**（46–66 → 103–123）、KDA 碎片 0.06–0.11% → 0.24–0.41%。
+- 端内 best-fit（`two_ended_bf`）不稳定：real 几何接近 best-fit，server 几何 KDA-heavy 反而更差
+  （53.8% vs 两端 31.6%），等于"保留分端又把两端内部打散"，丢掉了紧凑性收益。
+- MemCache 的双端阈值不可直接移植：按字节（默认 1 MiB）分端，而我们最小请求 16 页 = 1.47 MB（真实口径）
+  / 434 MB（mock 口径）、KDA slot 14.65 MB，**全部 > 1 MiB → 全部落尾端**，退化成单端 best-fit；
+  阈值掃描 @16/@64/@159 之间最多差 6–10 点，与其文档 §7.1 的"阈值敏感"一致。
+  我们类别在调用点已知（`MLAView`/`KDAView`），不需要阈值参数。
+- 与零碎片上界 `ideal_compact` 比，任何策略都差 1.5–7.1 点占用，且"整批可放置"是 0% vs 30–55%（server 口径）→
+  下一步应优先做**粒度**（分批写、KDA slot 页粒度/减少 46% 页内浪费），而不是换 allocator。
+
+**顺带确认 MemCache 源码现状**：`src/memcache/csrc/meta_service/mmc_blob_allocator.cpp` 的 `Alloc`
+是纯 best-fit（`sizeTree_.lower_bound` + 从低地址切分），`addressTree_` 只管地址；
+双端（`DualEndedAllocConfig` / `GetFreeSegments` / `GetMaxContiguousFreeSize` 等）
+只存在于 `docs/zh/one_pool_dual_ended_alloc.md` 和未跟踪的 `test/ut/.../dual_ended_allocator_test.cpp`，**源码尚未实现**。
+
+**文档**：`K3_L2UnifiedDRAMPool_Design.md` 新增 §8.4（方法/表/解读/结论），§4.2 与 §11.1 补引用。
+**决策**：保留两端 first-fit 为默认；不切全局 best-fit；端内 best-fit 只作为可选 research policy（默认关）。

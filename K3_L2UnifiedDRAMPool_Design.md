@@ -106,7 +106,7 @@ page_bytes = HISIM_L2_PAGE_TOKENS × mla_token_bytes
 
 - 一次请求 = 一段**连续页**（DMA/`copy_` 需要连续）。
 - 空闲空间用地址有序 run 列表维护；分配 first-fit 从 run 头部切；`free` 时按地址插入并与左右相邻 run 合并（coalescing）。
-- **两端分配（two-ended）**：MLA 从空闲 run 的**头部**（低地址）取，KDA 从**尾部**（高地址）取。两种对象形状（KDA 恒为 `slot_pages`，MLA 16–512 页）于是从两端向中间生长，只在相遇处互相干扰，避免长寿命 KDA extent 把 MLA 的空闲空间切碎（§8 实测：同样负载下 one_pool 占用率因此从 85–93% 提升到 96–98%）。
+- **两端分配（two-ended）**：MLA 从空闲 run 的**头部**（低地址）取，KDA 从**尾部**（高地址）取。两种对象形状（KDA 恒为 `slot_pages`，MLA 16–512 页）于是从两端向中间生长，只在相遇处互相干扰，避免长寿命 KDA extent 把 MLA 的空闲空间切碎（§8 实测：同样负载下 one_pool 占用率因此从 85–93% 提升到 96–98%；与 MemCache best-fit / 双端阈值的对拍见 §8.4）。
 - 因此 `free_pages` 足够但 `largest_free_run` 不足时，大请求会失败——这就是外部碎片的物理含义。
 
 ### 4.3 Size Class
@@ -242,6 +242,79 @@ mla_pages  = total_pages − kda_pages
 | 想复现 size-class 对照实验 | `HISIM_L2_ALLOC_POLICY=pow2`（仅用于研究） |
 
 
+### 8.4 分配策略对拍：两端 first-fit vs MemCache best-fit
+
+§4.2 的两端分配是"按对象类别切分地址空间"，MemCache 的 `MmcBlobAllocator::Alloc`
+是"在全部空闲 run 里选尺寸最接近的块"（best-fit）。两者不是同一层的取舍，可以组合，
+所以需要分别回答：**要不要换掉两端？要不要在端内换 best-fit？**
+
+脚本：`benchmark/collection/l2_pool_alloc_policy_study.py`，结果
+`l2_pool_alloc_policy_results.json`（96 行聚合 + 480 行原始数据）。
+
+方法（开环，避免闭环 harness 的伪差异）：分配/释放序列由指数到达 + 指数寿命生成，
+与策略无关，**不做淘汰换空间**——放不下的请求直接丢弃，丢弃就是碎片代价。
+每个 case 跑 5 个 seed 取均值（闭环"边分配边淘汰"的写法里，淘汰谁依赖策略本身，
+各策略的活跃集不同，占用率不可横向比较；早期闭环数据已废弃）。
+预算/几何取两组：
+
+* `server_1656KB`：服务端 mock 口径，page 27.1 MB，3132 页（85 GB），KDA slot = 1 页；
+  池里只有 ~20–30 个对象。
+* `real_5760B`：真实 entry 口径（5,760 B/token），page 92 KB，86,805 页（8 GB），
+  KDA slot = 159 页，池里 ~500–700 个活跃 extent。
+
+负载 ρ=0.95（offered bytes / 池容量），MLA:KDA 字节比 70/50/30 三档；
+`frag MLA%` = 空闲足够但没有连续块而失败的 MLA 请求占比；`big-blocked%` =
+采样时刻"空闲 ≥512 页但最大空闲 run <512 页"（即整批写会被挡）的比例。
+
+| geometry | workload | policy | used% | frag MLA% | frag KDA% | big-blocked% | runs |
+|---|---|---|---|---|---|---|---|
+| server | mla_heavy | two_ended_ff | 72.9 | 8.26 | 0.00 | 50.4 | 25 |
+| server | mla_heavy | best_fit | 73.5 | 7.73 | 0.00 | 48.2 | 23 |
+| server | balanced | two_ended_ff | 77.6 | 8.13 | 0.00 | **45.6** | 30 |
+| server | balanced | best_fit | 78.3 | 9.06 | 0.00 | 49.8 | 29 |
+| server | kda_heavy | two_ended_ff | **83.4** | **8.54** | 0.00 | **31.6** | 34 |
+| server | kda_heavy | best_fit | 82.1 | 8.75 | 0.00 | 46.1 | 31 |
+| server | 任一 | ideal_compact | +1.8~7.1 | 0 | 0 | 0.0 | 0 |
+| real | mla_heavy | two_ended_ff | 90.5 | 1.28 | **0.11** | 20.6 | **66** |
+| real | mla_heavy | best_fit | **91.6** | **1.01** | 0.24 | **15.0** | 103 |
+| real | balanced | two_ended_ff | 91.4 | 1.49 | **0.06** | 24.2 | **57** |
+| real | balanced | best_fit | 91.4 | 1.31 | 0.41 | 18.0 | 120 |
+| real | kda_heavy | two_ended_ff | **92.0** | 1.47 | **0.08** | 22.6 | **46** |
+| real | kda_heavy | best_fit | 91.1 | **1.23** | 0.31 | **16.4** | 123 |
+| real | 任一 | ideal_compact | +1.5~3.4 | 0 | 0 | 0.0 | 0 |
+
+解读：
+
+1. **部署几何（server）下，换 best-fit 不划算**：差异 0.6–1.3 点占用、<1 点 MLA
+   碎片，多数落在 seed 噪声内（`big-blocked%` 的 seed 标准差 4–13 点，池里只有 20–30
+   个对象）。逐 seed 看，KDA-heavy 档两端的占用率 5/5 领先（83.0–84.0 vs 81.4–82.9），
+   整批被挡 4/5 更低；balanced 档 3/5 更低。**没有可复现的 best-fit 优势。**
+2. **best-fit 只在"两类尺寸重叠"的真实口径下有稳定收益**：`real_5760B` 里 KDA slot
+   =159 页，正好卡在 MLA 的 128/256 页之间，两类同场竞争。best-fit 的"保大洞"把整批
+   可放置率抬高约 5 个点（20.6/24.2/22.6 → 15.0/18.0/16.4，6 个 case 里 5 个同向，
+   只有 KDA-heavy@0.99 反向），代价是 ≤1.6 点占用、**空闲 run 数翻倍**
+   （46–66 → 103–123）、KDA 自身碎片 0.06–0.11% → 0.24–0.41%（best-fit 会把 159 页的
+   KDA 塞进 MLA 中段的洞）。
+3. **端内 best-fit（MemCache 文档方案 D）没有稳定收益**：`two_ended_bf` 在 real 几何
+   接近 best-fit，但在 server 几何 KDA-heavy 档反而更差（53.8% vs 46.1% vs 两端 31.6%）——
+   它一边保留分端、一边又把两个端内部打散，等于丢掉两端唯一的紧凑性收益。
+4. **MemCache 的双端阈值不可直接移植**：它按字节阈值（默认 1 MiB）分端，
+   "≤1 MiB → 头，>1 MiB → 尾"。我们最小的请求就是 16 页 = 1.47 MB（真实口径）/
+   434 MB（mock 口径），KDA slot 14.65 MB，**全部 > 1 MiB** → 照搬会全部走去尾端，
+   退化成单端 best-fit。阈值扫描 @16/@64/@159 之间最多差 6–10 个点，也印证其文档
+   §7.1 "阈值位置敏感"的结论。我们的类别在调用点已知（`MLAView` / `KDAView`），
+   不需要这个参数。
+5. **最大差距不在策略，在粒度**：`ideal_compact`（零外部碎片上界）比任何策略好
+   1.5–7.1 点占用，且"整批可放置"是 0% vs 30–55%（server 口径）。和我们服务端观测一致
+   （mock 口径 KDA slot 只占 1 页却浪费 46%，MLA 一批 13.9 GB），下一步应该先做
+   "分批写 + 更细的 KDA slot 粒度"，再谈 allocator 换代。
+
+结论：**保留两端 first-fit 作为默认**（无参数、KDA 碎片最低、run 数最少、
+部署几何下逐 seed 不落后），不切 MemCache 的全局 best-fit。端内 best-fit 暂不实现；
+若将来切到 `real_5760B` 这类"两类尺寸重叠"的口径，再在 `PageExtentAllocator` 上
+加一个默认关闭的 `policy="best_fit"` 开关即可（改动局限在 `_pick` 一处）。
+
+
 ---
 
 ## 9. 开关与 metrics
@@ -361,7 +434,7 @@ KDA 常驻 46 slots（物理 1.248 GB / 逻辑 0.674 GB），e2e 418.0 ms。
 
 ## 11. 限制与后续
 
-1. **外部碎片没有治理**：first-fit + 合并 + 两端分配只保证不泄漏、减少相互切碎，不保证紧凑；page=16 时 two_pools 外部碎片仍可达空闲的 ~24%，one_pool 相遇处剩 1–4% 的占用率损失。可选后续：best-fit、页迁移/压缩（超出最小版本）。
+1. **外部碎片没有治理**：first-fit + 合并 + 两端分配只保证不泄漏、减少相互切碎，不保证紧凑；page=16 时 two_pools 外部碎片仍可达空闲的 ~24%，one_pool 相遇处剩 1–4% 的占用率损失。§8.4 对 best-fit 做过对拍：在真实 5,760 B/token 口径下整批可放置率高 ~5 点，但 run 数翻倍、KDA 碎片上升，部署口径下无稳定收益，故未采用；页迁移/压缩仍超出最小版本。
 2. **不区分视图碎片**：`stats()` 在 Two Pools 下给出两区域之和；若要"谁在浪费"，需按区域拆 `internal/external`。
 3. **One Pool 的切分不是公平调度**：`self_first` 让切分在预热期定形，`other_first` 是最后写入者赢；两者都没有权重/水位线，唯一的保护是 `HISIM_L2_MAMBA_MIN_SLOTS`（且只在 MLA 触到 cap 时生效，本轮实测负载下未触顶）。
 4. **KDA←MLA 回收依赖 L3**：`enable_storage=False` 时不做 MLA 回收，KDA 准入失败即只留 L3（这是安全的，但会降低 L2 命中）。
