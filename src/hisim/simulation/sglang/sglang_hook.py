@@ -41,9 +41,28 @@ from hisim.simulation.utils import (
     estimate_kv_cache_pool_capacity,
 )
 from hisim.simulation.sglang.version import VersionDispatcher
+from hisim.simulation.sglang.hisparse_sim import (
+    HiSparseSimulator,
+    load_hisparse_config,
+    model_info_kv_geometry,
+)
 
 
 logger = get_logger("hisim")
+
+
+def _req_is_finished(req) -> bool:
+    """sglang uses both an attribute (legacy) and a method (>= 0.5.6) for
+    `finished`; resolve either without importing Req."""
+    finished = getattr(req, "finished", None)
+    if callable(finished):
+        try:
+            return bool(finished())
+        except Exception:
+            return False
+    if finished:
+        return True
+    return getattr(req, "finished_status", None) is not None
 
 
 def _is_legacy_sglang() -> bool:
@@ -264,6 +283,62 @@ class C_ModelRunnerHook(BaseHook):
             self.start_layer = getattr(self.model, "start_layer", 0)
             self.end_layer = getattr(self.model, "end_layer", model_num_layers)
             self.num_effective_layers = self.end_layer - self.start_layer
+
+            # --- HiSparse (sparse KV) simulation -------------------------
+            # The scheduler-visible pool becomes the *logical* pool
+            # (physical hot pool * host_to_device_ratio); the physical hot
+            # pool stays the HBM budget computed above.  Concurrency is
+            # capped by the number of padded device buffers that fit in the
+            # hot pool, exactly like sglang's hisparse_req_budget.
+            hisparse_cfg = load_hisparse_config()
+            if hisparse_cfg.enable:
+                if getattr(self.server_args, "enable_hierarchical_cache", False):
+                    logger.warning(
+                        "HiSparse simulation is mutually exclusive with the "
+                        "hierarchical cache (L2/L3) model in sglang; both are "
+                        "enabled, so KV transfer accounting may be counted "
+                        "twice.  Set enable_hierarchical_cache=False when "
+                        "validating HiSparse."
+                    )
+                physical_tokens = int(self.max_total_num_tokens)
+                try:
+                    import torch as _torch
+
+                    kv_itemsize = _torch._utils._element_size(self.kv_cache_dtype)
+                except Exception:
+                    kv_itemsize = 2
+                _, kv_bytes_per_layer = model_info_kv_geometry(
+                    model,
+                    tp_size=getattr(config, "tp_size", 1),
+                    itemsize=kv_itemsize,
+                )
+                sim = HiSparseSimulator.configure(
+                    hisparse_cfg,
+                    num_layers=self.num_effective_layers,
+                    bytes_per_token_per_layer=kv_bytes_per_layer,
+                    physical_pool_tokens=physical_tokens,
+                    page_size=self.page_size,
+                    max_num_reqs=max_num_reqs,
+                )
+                logical_tokens = sim.logical_pool_tokens
+                self.max_total_num_tokens = logical_tokens
+                self.full_max_total_num_tokens = logical_tokens
+                self.swa_max_total_num_tokens = logical_tokens
+                # Each resident request reserves padded_buffer_size slots in
+                # the physical hot pool, so cap concurrency accordingly.
+                max_num_reqs = sim.max_num_reqs
+                logger.info(
+                    "HiSparse simulation: logical KV pool %d tokens "
+                    "(physical %d x ratio %d), max_num_reqs=%d",
+                    logical_tokens,
+                    physical_tokens,
+                    hisparse_cfg.host_to_device_ratio,
+                    max_num_reqs,
+                )
+            else:
+                # A process may be reused across baseline/sparse runs; drop
+                # any stale simulator state when the feature is off.
+                HiSparseSimulator.reset()
 
             self.req_to_token_pool = MockReqToTokenPool(
                 size=max_num_reqs,
@@ -1759,6 +1834,15 @@ class C_SchedulerHook(BaseHook):
                 StateManager.set_global_clock(queue_start)
             req_stats.queue_start = StateManager.get_global_clock()
 
+        # HiSparse: the prompt KV is staged to the host pool when the request
+        # is admitted for prefill.
+        _hisparse_sim = HiSparseSimulator.instance()
+        if _hisparse_sim is not None:
+            _hisparse_sim.on_request_start(
+                req.rid,
+                len(req.input_ids) + len(getattr(req, "output_ids", []) or []),
+            )
+
     @classmethod
     def _offline_collect_and_release(cls, scheduler, recv_reqs, dispatch):
         """OFFLINE-mode buffering for sglang >= 0.5.10.
@@ -1868,9 +1952,23 @@ class C_SchedulerHook(BaseHook):
             metrics = calc_metrics(metrics_stats)
             metrics["time_cost"] = time.time() - cls.LAST_FLUSH_TS
 
+            # HiSparse sparse-KV simulation metrics (host/hot pool geometry,
+            # top-k hit rate, swap-in/backup traffic and latency).
+            _hisparse_sim = HiSparseSimulator.instance()
+            if _hisparse_sim is not None:
+                hisparse_metrics = _hisparse_sim.metrics()
+                metrics.update(hisparse_metrics)
+
             try:
                 with open(f"{output_dir}/metrics.json", "w") as f:
                     f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
+
+                if _hisparse_sim is not None:
+                    with open(f"{output_dir}/hisparse.json", "w") as f:
+                        f.write(
+                            json.dumps(hisparse_metrics, cls=CustomJsonEncoder)
+                            + "\n"
+                        )
 
                 with open(f"{output_dir}/iteration.jsonl", "w") as f:
                     for item in cls.ITERATION_STATS:
@@ -2327,6 +2425,30 @@ class C_SchedulerHook(BaseHook):
                                 + len(req.output_ids),
                             )
                         )
+                    # HiSparse: simulate the indexer top-k swap-in for this
+                    # decode step (misses are copied host->device inside the
+                    # forward, so they are on the critical path).
+                    sim = HiSparseSimulator.instance()
+                    if sim is not None:
+                        cost = sim.on_decode_batch(
+                            [
+                                (
+                                    req.rid,
+                                    len(req.prefix_indices) + len(req.output_ids),
+                                )
+                                for req in batch.reqs
+                            ]
+                        )
+                        StateManager.inc_hisparse_load_dur(cost.load_dur)
+                        if sim.config.backup_on_critical:
+                            StateManager.inc_hisparse_backup_dur(cost.backup_dur)
+                        else:
+                            # Eager backup runs on a side stream: account the
+                            # bytes/latency without adding it to the step.
+                            sim.backup_hidden_dur += cost.backup_dur
+                        StateManager.inc_hisparse_counters(
+                            cost.hits, cost.misses, cost.h2d_bytes, cost.d2h_bytes
+                        )
 
                 if not hisim_batch.is_empty():
                     StateManager.inc_iteration()
@@ -2367,6 +2489,9 @@ class C_SchedulerHook(BaseHook):
                 hicache_l2_load_dur = StateManager.pop_hicache_l2_load_dur()
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
                 hicache_l3_backup_dur = StateManager.pop_hicache_l3_backup_dur()
+                hisparse_load_dur = StateManager.pop_hisparse_load_dur()
+                hisparse_backup_dur = StateManager.pop_hisparse_backup_dur()
+                hisparse_counters = StateManager.pop_hisparse_counters()
                 current_inference_dur = StateManager.get_current_inference_dur()
 
                 try:
@@ -2391,11 +2516,17 @@ class C_SchedulerHook(BaseHook):
                 StateManager.set_last_l3_write_overflow(l3_write_overflow)
 
                 if C_SchedulerHook.OVERLAP_SCHEDULE:
+                    # HiSparse swap-in and (when enabled) eager backup are
+                    # inside the forward, so they extend the critical path
+                    # even in the overlapped timing model.  L2 backup stays
+                    # off-clock (write-through on a side stream).
                     StateManager.step_global_clock(
                         max(
                             hicache_l2_load_dur - StateManager.get_last_inference_dur(),
                             0,
                         )
+                        + hisparse_load_dur
+                        + hisparse_backup_dur
                     )
                     StateManager.step_global_clock(current_inference_dur)
                     request_response_time = (
@@ -2409,6 +2540,8 @@ class C_SchedulerHook(BaseHook):
                         + current_inference_dur
                         + hicache_l2_backup_dur
                         + l3_write_overflow
+                        + hisparse_load_dur
+                        + hisparse_backup_dur
                     )
                     request_response_time = StateManager.get_global_clock()
                 # Request statistics
@@ -2423,6 +2556,13 @@ class C_SchedulerHook(BaseHook):
                     else:
                         # Chunked request: nothing to do
                         pass
+                # HiSparse: release the per-request host-pool accounting once
+                # the request has produced its last token.
+                _hisparse_sim = HiSparseSimulator.instance()
+                if _hisparse_sim is not None:
+                    for req in batch.reqs:
+                        if _req_is_finished(req):
+                            _hisparse_sim.on_request_finish(req.rid)
                 # Dynamic completion feedback: when a session round finishes,
                 # release its parked successor rounds with the accumulated
                 # virtual delay (actual finish - recorded finish) applied.
@@ -2460,6 +2600,12 @@ class C_SchedulerHook(BaseHook):
                         "l2_load_latency": hicache_l2_load_dur,
                         "l2_backup_latency": hicache_l2_backup_dur,
                         "l3_backup_latency": hicache_l3_backup_dur,
+                        "hisparse_load_latency": hisparse_load_dur,
+                        "hisparse_backup_latency": hisparse_backup_dur,
+                        "hisparse_hits": hisparse_counters["hits"],
+                        "hisparse_misses": hisparse_counters["misses"],
+                        "hisparse_h2d_bytes": hisparse_counters["h2d_bytes"],
+                        "hisparse_d2h_bytes": hisparse_counters["d2h_bytes"],
                     }
                 )
             C_SchedulerHook.LAST_CPU_TS = time.time()

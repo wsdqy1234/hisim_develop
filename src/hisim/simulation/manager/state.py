@@ -11,6 +11,13 @@ class StateManager:
     _last_l3_write_overflow: float = 0
     _l3_direct_load_count: int = 0
     _hicache_l3_direct_load_dur: float = 0
+    # HiSparse (sparse KV) per-iteration accumulators.
+    _hisparse_load_dur: float = 0
+    _hisparse_backup_dur: float = 0
+    _hisparse_hits: int = 0
+    _hisparse_misses: int = 0
+    _hisparse_h2d_bytes: int = 0
+    _hisparse_d2h_bytes: int = 0
 
     @classmethod
     def reset(cls):
@@ -26,6 +33,12 @@ class StateManager:
         cls._last_l3_write_overflow = 0
         cls._l3_direct_load_count = 0
         cls._hicache_l3_direct_load_dur = 0
+        cls._hisparse_load_dur = 0
+        cls._hisparse_backup_dur = 0
+        cls._hisparse_hits = 0
+        cls._hisparse_misses = 0
+        cls._hisparse_h2d_bytes = 0
+        cls._hisparse_d2h_bytes = 0
 
     @classmethod
     def inc_iteration(cls) -> None:
@@ -137,3 +150,48 @@ class StateManager:
         dur = cls._hicache_l3_direct_load_dur
         cls._hicache_l3_direct_load_dur = 0
         return dur
+
+    # -- HiSparse / sparse KV ------------------------------------------------
+
+    @classmethod
+    def inc_hisparse_load_dur(cls, dur: float) -> None:
+        cls._hisparse_load_dur += dur
+
+    @classmethod
+    def pop_hisparse_load_dur(cls) -> float:
+        dur = cls._hisparse_load_dur
+        cls._hisparse_load_dur = 0
+        return dur
+
+    @classmethod
+    def inc_hisparse_backup_dur(cls, dur: float) -> None:
+        cls._hisparse_backup_dur += dur
+
+    @classmethod
+    def pop_hisparse_backup_dur(cls) -> float:
+        dur = cls._hisparse_backup_dur
+        cls._hisparse_backup_dur = 0
+        return dur
+
+    @classmethod
+    def inc_hisparse_counters(
+        cls, hits: int, misses: int, h2d_bytes: int, d2h_bytes: int
+    ) -> None:
+        cls._hisparse_hits += hits
+        cls._hisparse_misses += misses
+        cls._hisparse_h2d_bytes += h2d_bytes
+        cls._hisparse_d2h_bytes += d2h_bytes
+
+    @classmethod
+    def pop_hisparse_counters(cls) -> dict:
+        counters = {
+            "hits": cls._hisparse_hits,
+            "misses": cls._hisparse_misses,
+            "h2d_bytes": cls._hisparse_h2d_bytes,
+            "d2h_bytes": cls._hisparse_d2h_bytes,
+        }
+        cls._hisparse_hits = 0
+        cls._hisparse_misses = 0
+        cls._hisparse_h2d_bytes = 0
+        cls._hisparse_d2h_bytes = 0
+        return counters

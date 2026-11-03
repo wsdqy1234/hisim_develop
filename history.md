@@ -1439,3 +1439,39 @@ V3 原把 prefetch buffer 记为跨请求占用的 L2（下一请求才释放）
 3. gather 后统计失败请求并打印；simulation 模式下任何失败直接 `RuntimeError`（快速失败，杜绝"挂死半小时查不到错"）
 
 **验证**（develop_dqy 上 18×40K 突发，K3 mock 模型 + 910C 配置）：18/18 到达并完成（`All requests received. Starting simulation now.`），总输入 token 724,500 与 trace 逐位一致（3×(40000+40100+…+40500)），prefix_cache_reused_ratio=0.9376（逐轮 cached-token 32768/40064/40192…），chunked prefill（16384 分块）与 `Proactive evict → L2` 降级链路正常，virtual 时长 93.5s。
+
+## 2026-11-03 — 移植 sglang HiSparse 稀疏 KV 为 hisim 仿真能力（develop_lfz_sparse_kv）
+
+**背景**：sglang 的 HiSparse 把全量 KV 放 pinned host DRAM，HBM 只留每请求 `device_buffer_size` 的 hot buffer，decode 时由 DSA indexer 选 top-k、miss 的从 host 搬入。它依赖真实 indexer 分数、`sgl_kernel.kvcacheio` 和稀疏 MLA backend，CPU-only 的 hisim 无法执行 `--enable-hisparse`。本次做**仿真级移植**：不执行 sglang 的 kernel，但把容量结构、top-k 访问→搬运量、关键路径时延建模进 replay 循环。源码分析见 `docs/sparse_kv_sglang_vllm.md`，设计/假设见 `docs/hisparse_simulation.md`。
+
+**语义复刻**（对齐 `managers/hisparse_coordinator.py`）：
+- `padded_buffer_size = device_buffer_size + page_size`；每请求预留这么多 hot slot。
+- `logical = physical × host_to_device_ratio`，scheduler 的 `max_total_num_tokens` 放大成逻辑池，物理池仍是 HBM 预算。
+- 并发上限 `min(原上限, physical // padded_buffer_size)`。
+- prefill KV 整体 D2H staging（计字节）；decode 每步 top-k miss 计 H2D；新 token 每步 eager D2H backup（默认侧流，不计关键路径）；`shared_index_freq>1` 时只有 anchor 层 IO 计入关键路径。
+- top-k 访问流可配置：`sticky`（默认，recent window + 按 `churn` 替换的旧集合）、`recency`、`uniform`；`churn` 是校准主旋钮。
+
+**改动文件**：
+- 新增 `src/hisim/simulation/sglang/hisparse_sim.py`：`HiSparseSimConfig` / `HiSparseSimulator` / `_WorkingSet`（LRU hot buffer）/ 时延函数 / `model_info_kv_geometry`。
+- `src/hisim/simulation/sglang/sglang_hook.py`：`C_ModelRunnerHook.override_initialize` 放大逻辑池并 cap `max_num_reqs`；`wrapped_run_batch` 驱动 decode 仿真；`wrapped_process_batch_result` 注入 load/backup 时延、写 iteration 字段、请求完成时释放 host 记账；`record_request_stats` 触发 `on_request_start`；`dump_profile_results` 合并 metrics 并写 `hisparse.json`。同时修复 overlap 时序模型下 swap-in 时延被 per-request 时间戳“抵消”的问题（load 进入 `step_global_clock`，backup 仍按侧流）。
+- `src/hisim/simulation/manager/state.py`：HiSparse per-iteration 时延/命中/字节累加器与 pop 接口。
+- 新增 `src/hisim/time_predictor/constant.py`（`predictor.name=constant`），`time_predictor/__init__.py` 把 aiconfigurator 改为可选导入，`manager/config.py` 增加 constant 分支，`simulation/utils.py` 的 `get_perf_model` 改为函数内延迟导入——用于无 AIC 数据库的 CPU 验证；默认配置不变。
+- 新增 `test/test_hisparse_sim.py`（18 个单测）、`test/assets/mock/config_hisparse.json`（constant predictor + `top_k=256`/`device_buffer=512`/`ratio=2`）。
+- 新增 `benchmark/hisparse/hisparse_bench.py`（`bench` / `sweep`）、`run_validation.sh`、`README.md`；结果存 `benchmark/hisparse/results/`。
+
+**验证**：
+- 单测：`PYTHONPATH=src python -m pytest test/test_hisparse_sim.py -q` → 18 passed。
+- 端到端（Qwen3-0.6B mock 权重，constant predictor，20 请求 × 1024 prompt + 64 output，`top_k=256`、`device_buffer=512`、`ratio=2`、`churn=0.05`）：
+  - HBM=20000（容量压力）：baseline 289.9 req/s / TTFT 5.75ms / TPOT 0.525ms；HiSparse（logical=40000）403.7 req/s / TTFT 2.40ms / TPOT 0.748ms。命中率 98.0%，H2D 741MB，D2H 142MB，staging 2.35GB，每 batch-step load 223µs，host 峰值 21740 < 40000。即**吞吐 +39%、TPOT +42%**。
+  - HBM=40000（无容量压力，隔离开销）：baseline TPOT 0.525ms / 563.4 req/s vs sparse 0.748ms / 403.7 req/s——swap-in 在关键路径上，无容量压力时 HiSparse 更慢，是拿带宽换容量。
+  - HBM=40000 + `shared_index_freq=4`（shared-index 预取，只有 1/4 字节在关键路径）：TPOT 0.586ms / 508.6 req/s，mean load 60.8µs。
+- 解析 sweep（DeepSeek-V3.2 几何：61 层、576B/token/layer、物理 2.27M tokens、top_k=2048、device_buffer=4096、64 请求 × 32k prompt）：churn 0.05/0.2/0.5 → 命中率 97.6%/90.6%/77.0%，H2D 56.7/220.5/542.5GB，单请求每步 load 38.5/130.4/311.0µs；HBM KV 79.8GB / host KV 159.5GB，hot 池并发 554。
+
+**复现**：`PYTHONPATH=src BENCHMARK_TEST_MODEL_PATH=/path/to/Qwen3-0.6B bash benchmark/hisparse/run_validation.sh`。
+
+**注意**：
+- `HISIM_HISPARSE=1` 开启；其余 knobs 见 `docs/hisparse_simulation.md` §6。默认关闭，对既有仿真零影响。
+- 端到端脚本里 hisim/sglang 的 hook 必须在**模块顶层**导入、入口用 `if __name__ == "__main__":`；否则 spawn 的 scheduler 子进程不会安装 hook。
+- `sglang_bench.py` 强制 `HISIM_OUTPUT_DIR=/tmp/hisim/simulation`，验证脚本自行拷贝 metrics；baseline/sparse 必须分进程跑。
+- constant predictor 只用于功能/统计口径验证，不代表真实时延；真实时延需 `predictor.name=aiconfigurator` + AIC 数据。
+- 限制：无真实 indexer（`churn` 需实测校准）、token 粒度 IO（`page_size` 只进 buffer 容量）、无 L2/L3 与 radix 共享、PD direct 路径未建模。H2D/D2H 按 batch 一次启动开销（`t0`）计算，`hisparse_mean_load_us` 为每 batch-step。

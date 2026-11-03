@@ -11,6 +11,7 @@ from hisim.simulation.utils import (
 from hisim.time_predictor import (
     InferTimePredictor,
     AIConfiguratorTimePredictor,
+    ConstantTimePredictor,
 )
 from hisim.utils import get_logger
 
@@ -216,6 +217,12 @@ class ConfigManager:
             config: dict = json.load(f)
         predictor_config = config.get("predictor", {})
         if predictor_config.get("name") == "aiconfigurator":
+            if AIConfiguratorTimePredictor is None:
+                raise RuntimeError(
+                    "predictor.name=aiconfigurator but the aiconfigurator package "
+                    "is not installed; install it or use predictor.name=constant "
+                    "for cache/sparse-KV validation."
+                )
             device_name = predictor_config.get("device_name")
             hw.name = device_name
             database_mode = predictor_config.get("database_mode", "SILICON")
@@ -231,6 +238,23 @@ class ConfigManager:
                 prefill_scale_factor=prefill_scale_factor,
                 decode_scale_factor=decode_scale_factor,
                 xgb_model_path=xgb_model_path,
+            )
+        elif predictor_config.get("name") in ("constant", "mock"):
+            # A deterministic predictor is useful for cache/sparse-KV
+            # correctness validation and does not require an AIC database or
+            # real model weights.
+            return ConstantTimePredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                prefill_ms=predictor_config.get("prefill_ms", 1.0),
+                decode_ms=predictor_config.get("decode_ms", 0.1),
+                prefill_us_per_token=predictor_config.get(
+                    "prefill_us_per_token", 0.0
+                ),
+                decode_us_per_token=predictor_config.get(
+                    "decode_us_per_token", 0.0
+                ),
             )
         else:
             raise ValueError(f"Unknown predictor name: {predictor_config.get('name')}")

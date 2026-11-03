@@ -1,7 +1,6 @@
 from hisim.spec.model import ModelInfo
 from hisim.spec.accelerator import AcceleratorInfo
 from hisim.simulation.types import SchedulerConfig, RequestStats
-from hisim.time_predictor.aiconfigurator import get_perf_model
 import numpy as np
 
 
@@ -41,6 +40,8 @@ def estimate_kv_cache_pool_capacity(
 ) -> int:
     # TODO
     # Ref: https://github.com/sgl-project/sglang/blob/v0.4.8/python/sglang/srt/model_executor/model_runner.py#L817
+    from hisim.time_predictor.aiconfigurator import get_perf_model
+
     perf_model = get_perf_model(scheduler_config, model)
     weights = 0
     for op in perf_model.context_ops:

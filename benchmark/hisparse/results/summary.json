@@ -1,0 +1,119 @@
+{
+  "runs": [
+    {
+      "run": "baseline_capacity",
+      "completed": 20,
+      "ttft_ms": 5.75,
+      "tpot_ms": 0.525,
+      "req_per_s": 289.86,
+      "hit_rate": 0.0,
+      "h2d_gb": 0.0,
+      "d2h_gb": 0.0,
+      "staging_gb": 0.0,
+      "mean_load_us": 0.0,
+      "hbm_kv_gb": 0.0,
+      "host_kv_gb": 0.0
+    },
+    {
+      "run": "sparse_capacity",
+      "completed": 20,
+      "ttft_ms": 2.4,
+      "tpot_ms": 0.748,
+      "req_per_s": 403.65,
+      "hit_rate": 0.98,
+      "h2d_gb": 0.741,
+      "d2h_gb": 0.142,
+      "staging_gb": 2.349,
+      "mean_load_us": 222.98,
+      "hbm_kv_gb": 2.29,
+      "host_kv_gb": 4.59
+    },
+    {
+      "run": "baseline_roomy",
+      "completed": 20,
+      "ttft_ms": 2.4,
+      "tpot_ms": 0.525,
+      "req_per_s": 563.38,
+      "hit_rate": 0.0,
+      "h2d_gb": 0.0,
+      "d2h_gb": 0.0,
+      "staging_gb": 0.0,
+      "mean_load_us": 0.0,
+      "hbm_kv_gb": 0.0,
+      "host_kv_gb": 0.0
+    },
+    {
+      "run": "sparse_roomy",
+      "completed": 20,
+      "ttft_ms": 2.4,
+      "tpot_ms": 0.748,
+      "req_per_s": 403.65,
+      "hit_rate": 0.98,
+      "h2d_gb": 0.741,
+      "d2h_gb": 0.142,
+      "staging_gb": 2.349,
+      "mean_load_us": 222.98,
+      "hbm_kv_gb": 4.59,
+      "host_kv_gb": 9.18
+    },
+    {
+      "run": "sparse_roomy_freq4",
+      "completed": 20,
+      "ttft_ms": 2.4,
+      "tpot_ms": 0.586,
+      "req_per_s": 508.55,
+      "hit_rate": 0.98,
+      "h2d_gb": 0.741,
+      "d2h_gb": 0.142,
+      "staging_gb": 2.349,
+      "mean_load_us": 60.75,
+      "hbm_kv_gb": 4.59,
+      "host_kv_gb": 9.18
+    }
+  ],
+  "sweep": {
+    "geometry": {
+      "num_layers": 61,
+      "bytes_per_token_per_layer": 576.0,
+      "physical_tokens": 2270000,
+      "top_k": 2048,
+      "device_buffer_size": 4096,
+      "host_to_device_ratio": 2,
+      "num_prompts": 64,
+      "input_len": 32768,
+      "output_len": 512
+    },
+    "sweep": [
+      {
+        "churn": 0.05,
+        "hit_rate": 0.9759420156478882,
+        "h2d_gb": 56.727212544,
+        "staging_gb": 73.685532672,
+        "mean_load_us": 38.49310920265874,
+        "hbm_kv_gb": 79.75872,
+        "host_kv_gb": 159.51744,
+        "max_reqs_hot_pool": 554
+      },
+      {
+        "churn": 0.2,
+        "hit_rate": 0.9064683765172958,
+        "h2d_gb": 220.541679936,
+        "staging_gb": 73.685532672,
+        "mean_load_us": 130.39055050114683,
+        "hbm_kv_gb": 79.75872,
+        "host_kv_gb": 159.51744,
+        "max_reqs_hot_pool": 554
+      },
+      {
+        "churn": 0.5,
+        "hit_rate": 0.7699198573827744,
+        "h2d_gb": 542.514491712,
+        "staging_gb": 73.685532672,
+        "mean_load_us": 311.0124335434406,
+        "hbm_kv_gb": 79.75872,
+        "host_kv_gb": 159.51744,
+        "max_reqs_hot_pool": 554
+      }
+    ]
+  }
+}

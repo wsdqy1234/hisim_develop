@@ -1,0 +1,38 @@
+{
+    "platform": {
+        "accelerator": {
+            "name": "H20"
+        },
+        "disk_read_bandwidth_gb": 8,
+        "disk_write_bandwidth_gb": 8,
+        "memory_read_bandwidth_gb": 64,
+        "memory_write_bandwidth_gb": 64,
+        "num_device_per_node": 8
+    },
+    "predictor": {
+        "name": "constant",
+        "prefill_ms": 2.0,
+        "decode_ms": 0.5
+    },
+    "scheduler": {
+        "tp_size": 1,
+        "ep_size": 1,
+        "dp_size": 1,
+        "data_type": "FP16",
+        "kv_cache_data_type": "FP16",
+        "backend_name": "sglang",
+        "backend_version": "0.5.6.post2"
+    },
+    "hisparse": {
+        "enable": false,
+        "top_k": 256,
+        "device_buffer_size": 512,
+        "host_to_device_ratio": 2,
+        "page_size": 1,
+        "access_model": "sticky",
+        "churn": 0.05,
+        "recent_ratio": 0.5,
+        "shared_index_freq": 1,
+        "backup_on_critical": false
+    }
+}

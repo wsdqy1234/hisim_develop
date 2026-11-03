@@ -3,9 +3,18 @@ from hisim.time_predictor.base import (
     FakeRequest,
     ScheduleBatch,
 )
-from hisim.time_predictor.aiconfigurator import (
-    AIConfiguratorTimePredictor,
-)
+
+# AIC is an optional import: cache/sparse-KV validation runs use the
+# dependency-free ConstantTimePredictor and only need the AIC *database* for
+# the pool-capacity estimate, not for importing hisim.
+try:
+    from hisim.time_predictor.aiconfigurator import (
+        AIConfiguratorTimePredictor,
+    )
+except ImportError:  # pragma: no cover - exercised in minimal containers
+    AIConfiguratorTimePredictor = None
+
+from hisim.time_predictor.constant import ConstantTimePredictor
 
 
 __all__ = (
@@ -13,4 +22,5 @@ __all__ = (
     ScheduleBatch,
     InferTimePredictor,
     AIConfiguratorTimePredictor,
+    ConstantTimePredictor,
 )
