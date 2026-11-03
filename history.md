@@ -1231,3 +1231,55 @@ pop_l3_direct_load_count()  # 复位
 
 **文档**：`K3_L2UnifiedDRAMPool_Design.md` 新增 §8.4（方法/表/解读/结论），§4.2 与 §11.1 补引用。
 **决策**：保留两端 first-fit 为默认；不切全局 best-fit；端内 best-fit 只作为可选 research policy（默认关）。
+
+## 2026-11-03 三类 block：N>2 时的池结构对拍
+
+**动机**：两端只能在地址空间两端各锚定一个同质段，第三类对象（sglang tri-pool 形状：
+full-attention KV + SWA KV + mamba/SSM state）没有"端"可站。问题是：加专用中段、硬切分、
+全局 best-fit，还是让第三类溢出？
+
+**判型（不要按模型名猜）**：sglang 0.5.19 `kv_cache_configurator.py:415-440` 只有
+`mambaish_config is not None and is_hybrid_swa and not is_dsv4` 才走
+`init_unified_mamba_swa_pools`（Inkling-class）；只有滑窗没有 SSM 的是 2 池。
+上游 tri-pool 链序 `[mamba(up) | swa(float) | full(down)]`，注释写明"两端从不搬迁、
+SWA 窗口受限 span 最便宜搬"，弹性靠 `FloatMultiEndedAllocator.make_room` 的按需搬迁
+（依赖 v2p 表 `virtual_to_physical`，我们没有这一层）。tri-pool 另外**不支持 PD 分离**。
+本地没有 GLM-5.3-Flash 的 config，无法确认它是否真落在这个分支，落地前需按
+`hf_config`（`sliding_window`/`layer_types` + mamba/linear 层）判一次。
+
+**方法**：新增 `benchmark/collection/l2_pool_multiclass_study.py`（结果
+`l2_pool_multiclass_results.json`，24 行聚合 + 120 行原始，5 seeds）。沿用 §8.4 的开环
+trace（失败即丢弃），三类字节份额 MLA/SWA/state = 60/15/25，MLA 16–512 页、state 恒 159 页，
+第三类按 4–16 / 32–128 / 128–512 页三种口径扫；每类独立指数寿命（300/800/3000 步），ρ=0.95。
+8 个策略：`ends2_ff`（第三类再挂低端）/ `ends2_spill`（第三类 best-fit 任意空洞）/
+`global_bf` / `chain3`（三段，边界只推进到邻段空闲边缘，不搬）/ `chain3_move`（段内压缩）/
+`chain3_cascade`（sglang make_room 式级联搬迁）/ `static3`（按 60/15/25 硬切，比例已知上界）/
+`ideal`。指标加入 512 页 MLA 请求失败率（整批写能不能放）与搬迁页/次分配。
+
+**结论**（real 口径，三种第三类尺寸的区间）：
+- **专用中段 + 不搬 = 最差**：512 页失败 36.1–53.2%、used 83.3–86.4%。结构性原因：
+  中段夹在两端之间，端类无法跨越它互相借用，而我们的池没有 flush 对端的手段。
+- **搬整个 extent 不贵，但搬不来容量**：`chain3_move` 把 used 拉到 89.9–90.9（与溢出打平）、
+  512 页失败 10.9–18.6%（也与溢出打平），代价只有 0.67–3.99 页/次分配（92 KB/页 →
+  60–370 KB/次 host 拷贝）；但长寿命端类被饿到 STATE 失败 2.35–4.41%——中段在端类的
+  空闲边缘上只做"单向棘轮"，端类让出的前沿它不会还。
+- **级联搬迁（make_room 式）能把 512 页压到 7.9–12.1%（全场最好），但端类饿得更狠**：
+  STATE 失败 4.45–10.2%，搬迁 0.82–3.95 页/次。中段能一路把端类前沿往外推，端类推不回来——
+  正是上游"ends never relocate"要防的；上游靠"端类永不被搬 + 中段是窗口有界 SWA"把损失
+  限制在一个类，代价是假设三类比例长期稳定。
+- **硬切分只对比例敏感**：比例给对（60/15/25）仍把第三类饿到 0.31–6.09%、STATE 2.18–3.33%。
+- **全局 best-fit 容量最好**（512p 7.62–12.75%、used 90.7–91.7），但 run 数 95–154（两端 63–89），
+  且 §8.4 已测它把 KDA 塞进 MLA 中段洞（KDA 碎片 0.06–0.11% → 0.24–0.41%）。
+- **溢出几乎免费**：`ends2_spill` 与 `ends2_ff` 容量打平（used 89.8–91.0、512p 10.6–16.6%），
+  run 数 65–130 → 63–89，且保住两端语义（KDA 碎片 0.00–0.14%）。
+- 与 ideal 仍差 1.3–3.4 点 used、512 页 7.6–12.8% → 1.9–2.7%，粒度仍是最大杠杆。
+
+**决策**：默认两个端不动，第三类及以后全部当"溢出类"（不新增端/中段、不引入搬迁、
+不把全局 best-fit 设默认）。端/溢出按"单对象页数 + 寿命"排：最大的两个占两端，
+最小最灵活的（SWA）溢出；若第三类又大又长寿，它占一端、原 KDA 降级溢出。
+启动期加 bs=1 可行性 floor（对应上游 `_check_bs1_feasibility_floor`），运行期用软下限
+（`HISIM_L2_*_MIN_PAGES`，默认 0）而不是硬切分。N>3 同一规则；溢出类多到互相干扰时先"减档"
+（MemCache I′ 的 4 档/octave），而不是继续加段。
+
+**文档**：`K3_L2UnifiedDRAMPool_Design.md` 新增 §8.5（判型/上游对照/方法/表/解读/结论），
+§4.2 与 §11 补引用。**未改任何产品代码。**
