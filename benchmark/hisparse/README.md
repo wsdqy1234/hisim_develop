@@ -37,6 +37,27 @@ PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py bench --enable \
 注意 `bench` 在**不带** `--enable` 时会主动清掉 `HISIM_HISPARSE`，以免基线进程
 继承到稀疏配置——所以稀疏运行必须显式加 `--enable`（不要只 export 环境变量）。
 
+## DeepSeek-V4.1（L0/L1）
+
+DSV4.1 使用 `test/assets/mock/config_hisparse_dsv41.json`（`kv_profile=dsv41`、
+890 B/token、`top_k=512`、`device_buffer=1024`、host ratio=8），设计和验证结果见
+[`docs/hisparse_dsv41_simulation.md`](../../docs/hisparse_dsv41_simulation.md)。
+
+```bash
+# DSV4.1 解析 sweep
+PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py sweep --kv-profile dsv41
+
+# DSV4.1 端到端（baseline/sparse 用同一个配置，靠 --enable 切换）
+PYTHONPATH=src BENCHMARK_TEST_MODEL_PATH=/path/to/Qwen3-0.6B \
+HISIM_CONFIG_PATH=test/assets/mock/config_hisparse_dsv41.json \
+HISIM_VALIDATION_OUT_DIR=/tmp/hisparse_dsv41_results \
+    bash benchmark/hisparse/run_validation.sh
+```
+
+`run_validation.sh` 自带的 sweep 仍是 legacy 几何；DSV4.1 sweep 请用上面的
+`--kv-profile dsv41` 单跑。长上下文 L1 验证（8 × 8192 prompt + 64 output）的命令见
+DSV4.1 文档 §7。
+
 ## 复现注意事项
 
 - hisim / sglang hook 必须在**模块顶层**导入：sglang 用 spawn 启动 scheduler 子进程，

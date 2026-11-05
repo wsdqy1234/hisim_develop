@@ -319,6 +319,7 @@ class C_ModelRunnerHook(BaseHook):
                     physical_pool_tokens=physical_tokens,
                     page_size=self.page_size,
                     max_num_reqs=max_num_reqs,
+                    tp_size=getattr(config, "tp_size", 1),
                 )
                 logical_tokens = sim.logical_pool_tokens
                 self.max_total_num_tokens = logical_tokens

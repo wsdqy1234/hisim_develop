@@ -3,6 +3,7 @@
 日期：2026-11-03
 分支：`develop_lfz_sparse_kv`（基于 `develop_lfz_0.5.19`）
 依赖分析：[`docs/sparse_kv_sglang_vllm.md`](./sparse_kv_sglang_vllm.md)
+DSV4.1 L0/L1 扩展：[`docs/hisparse_dsv41_simulation.md`](./hisparse_dsv41_simulation.md)
 
 ---
 

@@ -111,24 +111,44 @@ def _run_bench(args) -> dict:
 
 
 def _run_sweep(args) -> dict:
-    """DeepSeek-V3.2-like geometry; no sglang/model needed."""
+    """Analytic decode sweep; no sglang/model needed.
+
+    ``legacy`` uses the DeepSeek-V3.2 MLA geometry, ``dsv41`` uses the
+    DeepSeek-V4.1 L0/L1 profile (890 B/token, top_k=512, compressed groups).
+    """
     from hisim.simulation.sglang.hisparse_sim import (
         HiSparseSimConfig,
         HiSparseSimulator,
     )
 
-    num_layers = 61
-    # DeepSeek-V3.2 MLA, FP8 KV: (512 + 64) bytes per token per layer.
-    bytes_per_token_per_layer = 576.0
-    # 80 GB HBM budget / (576 B * 61 layers) ~= 2.27M hot tokens.
-    physical_tokens = 2_270_000
+    profile = getattr(args, "kv_profile", "legacy")
+    if profile == "dsv41":
+        num_layers = 40
+        bytes_per_token_per_layer = 0.0
+        # 80 GB HBM budget / 890 B/token ~= 89.9M hot tokens.
+        physical_tokens = int(80e9 / 890.0)
+        top_k = 512
+        device_buffer_size = 1024
+        host_ratio = 8
+        kv_profile = "dsv41"
+    else:
+        num_layers = 61
+        # DeepSeek-V3.2 MLA, FP8 KV: (512 + 64) bytes per token per layer.
+        bytes_per_token_per_layer = 576.0
+        # 80 GB HBM budget / (576 B * 61 layers) ~= 2.27M hot tokens.
+        physical_tokens = 2_270_000
+        top_k = 2048
+        device_buffer_size = 4096
+        host_ratio = 2
+        kv_profile = None
     results = []
     for churn in (0.05, 0.2, 0.5):
         cfg = HiSparseSimConfig(
             enable=True,
-            top_k=2048,
-            device_buffer_size=4096,
-            host_to_device_ratio=2,
+            kv_profile=kv_profile,
+            top_k=top_k,
+            device_buffer_size=device_buffer_size,
+            host_to_device_ratio=host_ratio,
             churn=churn,
             recent_ratio=0.5,
             access_model="sticky",
@@ -150,22 +170,27 @@ def _run_sweep(args) -> dict:
             {
                 "churn": churn,
                 "hit_rate": m["hisparse_hit_rate"],
+                "hit_rate_bytes": m["hisparse_hit_rate_bytes"],
                 "h2d_gb": m["hisparse_h2d_bytes"] / 1e9,
+                "d2h_gb": m["hisparse_d2h_bytes"] / 1e9,
                 "staging_gb": m["hisparse_staging_bytes"] / 1e9,
                 "mean_load_us": m["hisparse_mean_load_us"],
                 "hbm_kv_gb": m["hisparse_hbm_kv_bytes"] / 1e9,
                 "host_kv_gb": m["hisparse_host_kv_bytes"] / 1e9,
                 "max_reqs_hot_pool": m["hisparse_max_reqs_hot_pool"],
+                "new_compressed_entries": m["hisparse_new_compressed_entries"],
+                "h2d_bytes_by_ratio": m["hisparse_h2d_bytes_by_ratio"],
             }
         )
     payload = {
+        "profile": profile,
         "geometry": {
             "num_layers": num_layers,
             "bytes_per_token_per_layer": bytes_per_token_per_layer,
             "physical_tokens": physical_tokens,
-            "top_k": 2048,
-            "device_buffer_size": 4096,
-            "host_to_device_ratio": 2,
+            "top_k": top_k,
+            "device_buffer_size": device_buffer_size,
+            "host_to_device_ratio": host_ratio,
             "num_prompts": args.num_prompts,
             "input_len": args.input_len,
             "output_len": args.output_len,
@@ -197,8 +222,10 @@ def main() -> None:
     bench.add_argument("--request-rate", type=float, default=100.0)
     bench.set_defaults(func=_run_bench)
 
-    sweep = sub.add_parser("sweep", help="DeepSeek-V3.2-sized analytic sweep")
+    sweep = sub.add_parser("sweep", help="analytic decode sweep")
     sweep.add_argument("--output", default=None)
+    sweep.add_argument("--kv-profile", choices=("legacy", "dsv41"), default="legacy",
+                       help="KV geometry: DeepSeek-V3.2 legacy or DSV4.1 L0/L1")
     sweep.add_argument("--num-prompts", type=int, default=64)
     sweep.add_argument("--input-len", type=int, default=32768)
     sweep.add_argument("--output-len", type=int, default=512)

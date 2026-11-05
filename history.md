@@ -1475,3 +1475,36 @@ V3 原把 prefetch buffer 记为跨请求占用的 L2（下一请求才释放）
 - `sglang_bench.py` 强制 `HISIM_OUTPUT_DIR=/tmp/hisim/simulation`，验证脚本自行拷贝 metrics；baseline/sparse 必须分进程跑。
 - constant predictor 只用于功能/统计口径验证，不代表真实时延；真实时延需 `predictor.name=aiconfigurator` + AIC 数据。
 - 限制：无真实 indexer（`churn` 需实测校准）、token 粒度 IO（`page_size` 只进 buffer 容量）、无 L2/L3 与 radix 共享、PD direct 路径未建模。H2D/D2H 按 batch 一次启动开销（`t0`）计算，`hisparse_mean_load_us` 为每 batch-step。
+
+---
+
+## 2026-11-05 — DeepSeek-V4.1 HiSparse 仿真 L0/L1（develop_lfz_sparse_kv，未提交）
+
+**背景**：V4.1-Flash 没有 `kv_lora_rank`，legacy HiSparse 几何会走 GQA 分支，按 `2×1×512×2×40 = 81,920 B/token` 估算，比真实全局 KV（约 890 B/token，FP4 + CSA2 跨层复用）高估约 92×。128K context 的持久 KV 正确约 116.6 MB，legacy 约 10.7 GB。
+
+**完成的事项**：
+
+1. **L0 几何校正**（`src/hisim/simulation/sglang/hisparse_sim.py`）：
+   - 新增 `KVProfile` / `DSV41_PROFILE`（890 B/token、`source_layer_ratios=(2,2,2,1)`、`layer_groups=((2,0),(18,2),(20,1))`、`index_topk=512`、`indexer_bytes_per_token=0`、`swa_window_tokens=128`）。
+   - `HiSparseSimConfig` 增加 `kv_profile`（JSON `"dsv41"` / dict / env `HISIM_HISPARSE_KV_PROFILE`）；profile 生效时 `top_k = min(top_k, index_topk)`，`device_buffer_size` 默认 `2*top_k`。
+   - profile 模式：`HBM = physical × (offload + indexer) + SWA`，`host = logical × offload`，`logical = physical × host_to_device_ratio`；staging/H2D/D2H 全部按 890 B/token 或压缩条目字节计；支持 `tp_size` 均分。
+2. **L1 压缩位置空间/节奏**：
+   - 每个 ratio 组独立 `_WorkingSet`，候选长度 `ceil(seq_len/ratio)`，top-k 在压缩候选上选。
+   - ratio=2 每 2 个 decode step 产生一条新压缩条目；未跨压缩边界的 step 不推进、不 churn、无 H2D；新条目才计 D2H。
+   - 条目字节：ratio 2 = 1335 B（3 个 source layer × 222.5 × 2），ratio 1 = 222.5 B。
+   - 新增 `hisparse_hits_bytes` / `hisparse_misses_bytes` / `hisparse_hit_rate_bytes`、`h2d/d2h_bytes_by_ratio`、`new_compressed_entries`、`io_groups` 等 metrics。
+3. **测试/工具**：
+   - 新增 `test/test_hisparse_dsv41.py`（16 个单测）与 `test/assets/mock/config_hisparse_dsv41.json`（`enable=false`、`kv_profile=dsv41`、top_k=512、device_buffer=1024、host ratio=8）。
+   - `benchmark/hisparse/hisparse_bench.py` 的 `sweep` 增加 `--kv-profile legacy|dsv41`。
+   - `sglang_hook.py` 的 `configure` 传入 `tp_size`。
+   - 新建 `docs/hisparse_dsv41_simulation.md`（L0/L1 修改、几何假设、测试结果、L2 待办）。
+
+**验证**：
+- 单测：`pytest test/test_hisparse_sim.py test/test_hisparse_dsv41.py -q` → 34 passed（原 18 + 新 16），legacy 零回归。
+- DSV4.1 sweep（64×32K prompt + 512 output，80GB HBM，top_k=512/host ratio=8）：churn 0.05/0.2/0.5 → byte hit rate 98.50%/94.39%/86.13%，H2D 0.392/1.465/3.626 GB，mean load 6.89/7.49/8.70 µs。
+- 端到端（Qwen3-0.6B mock，20×1024+64，constant predictor）：physical 20K 时 baseline 289.86 req/s / TTFT 5.75ms / TPOT 0.525ms；sparse 287.34 req/s / TTFT 4.095ms / TPOT 0.531ms，byte hit 99.98%，H2D 0.20MB，staging 18.23MB。physical 40K roomy：baseline 563.38 req/s，sparse 557.15 req/s。
+- 长上下文（8×8192+64）：baseline physical 80K → TPOT 0.5476ms / 202.53 req/s；sparse physical 20K（logical 160K）→ TPOT 0.5565ms / 199.70 req/s，byte hit 98.11%，H2D 7.61MB，D2H 0.44MB，staging 58.33MB，mean load 8.89µs；H2D ratio2:ratio1 ≈ 3.3×，符合“条目 6×、频率 1/2”。
+
+**注意 / L2 待办**：
+- 当前 L1 仍按 ratio 组而非逐 source/indexer layer 建工作集；未计 8 层 indexer 常驻 HBM（FP4 544 B/token、FP8 1056 B/token）、SWA ring、MTP/DSpark、CSA2/C4/C128 块语义、PD/direct RDMA。
+- `kv_profile` 默认 None；不配置时完全走 legacy。真实 V4.1 校准应使用独立 `vllm-ascend:v0.30.0-a3` 容器，勿与当前 sglang 0.5.19 栈混装。

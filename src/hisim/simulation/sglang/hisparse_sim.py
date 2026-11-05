@@ -50,6 +50,115 @@ logger = get_logger("hisim")
 
 
 # ---------------------------------------------------------------------------
+# Static KV layout profiles (L0/L1)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class KVProfile:
+    """Static KV layout for a model family.
+
+    The legacy HiSparse model assumes a uniform layout
+    (``num_layers * bytes_per_token_per_layer``).  Models such as
+    DeepSeek-V4.1 store a much smaller *global* KV (FP4 + cross-layer reuse),
+    so that formula overestimates capacity and IO by ~90x.
+
+    ``offload_bytes_per_token`` is the **total** per-token KV footprint of the
+    offloadable source layers.  ``source_layer_ratios`` splits that total over
+    the source layers; a source layer with ``ratio=r`` produces one compressed
+    entry every ``r`` tokens, so a compressed entry costs
+    ``per_layer_bytes * r``.
+
+    L0 uses only ``offload_bytes_per_token`` for capacity and total IO.  L1
+    additionally uses ``source_layer_ratios`` to run one compressed working
+    set per ratio group.  ``indexer_bytes_per_token`` and
+    ``swa_bytes_per_token`` are reserved for L2 (HBM-resident indexer pool and
+    SWA ring); they default to 0 so L0/L1 results stay comparable.
+    """
+
+    name: str = "generic"
+    offload_bytes_per_token: float = 0.0
+    # Ratios of the KV source layers, e.g. (2, 2, 2, 1) for DSV4.1.
+    source_layer_ratios: Tuple[int, ...] = ()
+    # (layer_count, compress_ratio) for metadata, e.g. ((2, 0), (18, 2), (20, 1)).
+    layer_groups: Tuple[Tuple[int, int], ...] = ()
+    # sglang's index_topk: number of compressed positions selected per step.
+    index_topk: int = 0
+    # L2: HBM-resident indexer pool, bytes per token (FP4 68 / FP8 132 per layer).
+    indexer_bytes_per_token: float = 0.0
+    # L2: SWA ring, per-request window (tokens) and bytes per token.
+    swa_window_tokens: int = 0
+    swa_bytes_per_token: float = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.offload_bytes_per_token > 0
+
+    def io_groups(self) -> List[Tuple[int, float]]:
+        """Return ``[(ratio, bytes_per_compressed_entry), ...]``.
+
+        The per-token total is split evenly over the source layers.  For
+        DSV4.1 (``890 B/token``, ratios ``(2, 2, 2, 1)``) this yields
+        ``[(1, 222.5), (2, 1335.0)]``.  A profile without source ratios is
+        treated as a single ratio-1 group (L0-only geometry).
+        """
+        if not self.enabled:
+            return []
+        ratios = tuple(int(r) for r in self.source_layer_ratios if int(r) > 0)
+        if not ratios:
+            return [(1, float(self.offload_bytes_per_token))]
+        per_layer = float(self.offload_bytes_per_token) / len(ratios)
+        groups: List[Tuple[int, float]] = []
+        for ratio in sorted(set(ratios)):
+            layer_bytes = sum(per_layer for r in ratios if r == ratio)
+            groups.append((ratio, float(layer_bytes * ratio)))
+        return groups
+
+    @classmethod
+    def from_value(cls, value) -> Optional["KVProfile"]:
+        if value is None:
+            return None
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            key = value.strip().lower()
+            if key in ("", "none", "legacy", "generic"):
+                return None
+            if key in ("dsv41", "dsv4.1", "deepseek_v41", "deepseek-v4.1"):
+                return DSV41_PROFILE
+            raise ValueError(f"Unknown KV profile {value!r}")
+        if isinstance(value, dict):
+            raw = dict(value)
+            if "source_layer_ratios" in raw:
+                raw["source_layer_ratios"] = tuple(
+                    int(x) for x in raw["source_layer_ratios"]
+                )
+            if "layer_groups" in raw:
+                raw["layer_groups"] = tuple(
+                    (int(a), int(b)) for a, b in raw["layer_groups"]
+                )
+            return cls(**raw)
+        raise TypeError(f"Unsupported KV profile value: {type(value)!r}")
+
+
+# DeepSeek-V4.1-Flash (config.json):
+#   40 layers: 2 SWA (ratio 0) + 18 CSA (ratio 2) + 20 HCA (ratio 1)
+#   kv_source_layer_ids=[2, 8, 14, 20] -> 3 x ratio 2 + 1 x ratio 1
+#   index_topk=512, index_head_dim=128
+#   official global KV footprint: 890 B/token (FP4 + CSA2 cross-layer reuse)
+DSV41_PROFILE = KVProfile(
+    name="dsv41",
+    offload_bytes_per_token=890.0,
+    source_layer_ratios=(2, 2, 2, 1),
+    layer_groups=((2, 0), (18, 2), (20, 1)),
+    index_topk=512,
+    indexer_bytes_per_token=0.0,  # L2: 544 B (FP4) or 1056 B (FP8)
+    swa_window_tokens=128,
+    swa_bytes_per_token=0.0,  # L2
+)
+
+
+# ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
@@ -88,11 +197,19 @@ class HiSparseSimConfig:
     # stream, so by default it is accounted but not added to the step latency.
     backup_on_critical: bool = False
     seed: int = 0
+    # Static KV layout for models whose global KV is not
+    # ``num_layers * bytes_per_token_per_layer`` (e.g. DeepSeek-V4.1).
+    # None/"" keeps the legacy geometry exactly as before.
+    kv_profile: Optional[KVProfile] = None
 
     def __post_init__(self) -> None:
+        self.kv_profile = KVProfile.from_value(self.kv_profile)
+        self.top_k = max(1, int(self.top_k))
+        # The indexer physically cannot select more than index_topk positions.
+        if self.kv_profile is not None and self.kv_profile.index_topk > 0:
+            self.top_k = min(self.top_k, int(self.kv_profile.index_topk))
         if self.device_buffer_size <= 0:
             self.device_buffer_size = 2 * self.top_k
-        self.top_k = max(1, int(self.top_k))
         self.device_buffer_size = max(self.top_k, int(self.device_buffer_size))
         self.host_to_device_ratio = max(1, int(self.host_to_device_ratio))
         self.page_size = max(1, int(self.page_size))
@@ -132,6 +249,7 @@ class HiSparseSimConfig:
             "shared_index_freq": "shared_index_freq",
             "backup_on_critical": "backup_on_critical",
             "seed": "seed",
+            "kv_profile": "kv_profile",
         }
         kwargs = {}
         for key, attr in aliases.items():
@@ -185,6 +303,7 @@ def load_hisparse_config() -> HiSparseSimConfig:
         "shared_index_freq": os.getenv("HISIM_HISPARSE_SHARED_INDEX_FREQ"),
         "backup_on_critical": os.getenv("HISIM_HISPARSE_BACKUP_ON_CRITICAL"),
         "seed": os.getenv("HISIM_HISPARSE_SEED"),
+        "kv_profile": os.getenv("HISIM_HISPARSE_KV_PROFILE"),
     }
     return HiSparseSimConfig.from_mapping(raw, env)
 
@@ -414,10 +533,25 @@ class StepCost:
 
 
 @dataclass
+class _RequestGroupState:
+    """Per-ratio compressed working set for one request (L1)."""
+
+    ratio: int
+    entry_bytes: float
+    working: _WorkingSet
+    prev_comp_len: int = 0
+    hits: int = 0
+    misses: int = 0
+    h2d_bytes: int = 0
+    d2h_bytes: int = 0
+    new_entries: int = 0
+
+
+@dataclass
 class _RequestState:
     rid: str
     host_tokens: int
-    working: _WorkingSet
+    working: Optional[_WorkingSet]
     steps: int = 0
     hits: int = 0
     misses: int = 0
@@ -425,6 +559,7 @@ class _RequestState:
     d2h_bytes: int = 0
     staged_bytes: int = 0
     finished: bool = False
+    groups: List[_RequestGroupState] = field(default_factory=list)
 
 
 class HiSparseSimulator:
@@ -448,6 +583,8 @@ class HiSparseSimulator:
         max_num_reqs: Optional[int] = None,
         read_bandwidth: Optional[float] = None,
         write_bandwidth: Optional[float] = None,
+        kv_profile: Optional[KVProfile] = None,
+        tp_size: int = 1,
     ) -> None:
         self.config = config
         self.num_layers = max(1, int(num_layers))
@@ -457,6 +594,34 @@ class HiSparseSimulator:
         self.padded_buffer_size = config.padded_buffer_size
         self.read_bandwidth = read_bandwidth
         self.write_bandwidth = write_bandwidth
+        self.tp_size = max(1, int(tp_size))
+
+        self.kv_profile = (
+            KVProfile.from_value(kv_profile)
+            if kv_profile is not None
+            else KVProfile.from_value(config.kv_profile)
+        )
+        self.profile_enabled = bool(
+            self.kv_profile is not None and self.kv_profile.enabled
+        )
+        self.offload_bytes_per_token = (
+            float(self.kv_profile.offload_bytes_per_token) / self.tp_size
+            if self.profile_enabled
+            else 0.0
+        )
+        self.indexer_bytes_per_token = (
+            float(self.kv_profile.indexer_bytes_per_token) / self.tp_size
+            if self.profile_enabled
+            else 0.0
+        )
+        self.io_groups: List[Tuple[int, float]] = (
+            [
+                (int(ratio), float(entry_bytes) / self.tp_size)
+                for ratio, entry_bytes in self.kv_profile.io_groups()
+            ]
+            if self.profile_enabled
+            else []
+        )
 
         self.logical_pool_tokens = int(
             self.physical_pool_tokens * config.host_to_device_ratio
@@ -471,6 +636,16 @@ class HiSparseSimulator:
             if max_num_reqs
             else self.max_reqs_by_hot_pool
         )
+        self.hbm_swa_bytes = (
+            self.max_num_reqs
+            * int(self.kv_profile.swa_window_tokens)
+            * float(self.kv_profile.swa_bytes_per_token)
+            / self.tp_size
+            if self.profile_enabled
+            and self.kv_profile.swa_window_tokens
+            and self.kv_profile.swa_bytes_per_token
+            else 0.0
+        )
 
         self.requests: Dict[str, _RequestState] = {}
         self.finished_requests = 0
@@ -478,6 +653,11 @@ class HiSparseSimulator:
         self.decode_batches = 0
         self.hits = 0
         self.misses = 0
+        self.hits_bytes = 0
+        self.misses_bytes = 0
+        self.new_compressed_entries = 0
+        self.h2d_bytes_by_ratio: Dict[int, int] = {}
+        self.d2h_bytes_by_ratio: Dict[int, int] = {}
         self.h2d_bytes = 0
         self.d2h_bytes = 0
         self.staging_bytes = 0
@@ -506,6 +686,8 @@ class HiSparseSimulator:
         physical_pool_tokens: int,
         page_size: int = 1,
         max_num_reqs: Optional[int] = None,
+        kv_profile: Optional[KVProfile] = None,
+        tp_size: int = 1,
     ) -> "HiSparseSimulator":
         cls._instance = cls(
             config,
@@ -514,12 +696,15 @@ class HiSparseSimulator:
             physical_pool_tokens=physical_pool_tokens,
             page_size=page_size,
             max_num_reqs=max_num_reqs,
+            kv_profile=kv_profile,
+            tp_size=tp_size,
         )
         logger.info(
-            "HiSparse simulation enabled: top_k=%d device_buffer=%d "
+            "HiSparse simulation enabled: profile=%s top_k=%d device_buffer=%d "
             "padded_buffer=%d host_to_device_ratio=%d "
             "physical_tokens=%d logical_tokens=%d max_reqs_hot_pool=%d "
             "hbm_kv=%.2fGB host_kv=%.2fGB",
+            cls._instance.kv_profile.name if cls._instance.profile_enabled else "legacy",
             config.top_k,
             config.device_buffer_size,
             config.padded_buffer_size,
@@ -542,6 +727,12 @@ class HiSparseSimulator:
 
     @property
     def hbm_kv_bytes(self) -> float:
+        if self.profile_enabled:
+            return (
+                self.physical_pool_tokens
+                * (self.offload_bytes_per_token + self.indexer_bytes_per_token)
+                + self.hbm_swa_bytes
+            )
         return (
             self.physical_pool_tokens
             * self.num_layers
@@ -550,6 +741,22 @@ class HiSparseSimulator:
 
     @property
     def host_kv_bytes(self) -> float:
+        if self.profile_enabled:
+            return self.logical_pool_tokens * self.offload_bytes_per_token
+        return (
+            self.logical_pool_tokens
+            * self.num_layers
+            * self.bytes_per_token_per_layer
+        )
+
+    @property
+    def baseline_hbm_kv_bytes(self) -> float:
+        if self.profile_enabled:
+            return (
+                self.logical_pool_tokens
+                * (self.offload_bytes_per_token + self.indexer_bytes_per_token)
+                + self.hbm_swa_bytes
+            )
         return (
             self.logical_pool_tokens
             * self.num_layers
@@ -560,21 +767,49 @@ class HiSparseSimulator:
         prompt_len = max(0, int(prompt_len))
         if rid in self.requests:
             return
-        working = _WorkingSet(
-            top_k=self.config.top_k,
-            capacity=self.padded_buffer_size,
-            access_model=self.config.access_model,
-            churn=self.config.churn,
-            recent_ratio=self.config.recent_ratio,
-            rng=random.Random(self._rng.random()),
-        )
-        staged = prompt_len * self.num_layers * self.bytes_per_token_per_layer
-        state = _RequestState(
-            rid=rid,
-            host_tokens=prompt_len,
-            working=working,
-            staged_bytes=int(staged),
-        )
+        if self.profile_enabled:
+            groups: List[_RequestGroupState] = []
+            staged = 0.0
+            for ratio, entry_bytes in self.io_groups:
+                comp_prompt = (prompt_len + ratio - 1) // ratio
+                staged += comp_prompt * entry_bytes
+                groups.append(
+                    _RequestGroupState(
+                        ratio=ratio,
+                        entry_bytes=entry_bytes,
+                        working=_WorkingSet(
+                            top_k=self.config.top_k,
+                            capacity=self.padded_buffer_size,
+                            access_model=self.config.access_model,
+                            churn=self.config.churn,
+                            recent_ratio=self.config.recent_ratio,
+                            rng=random.Random(self._rng.random()),
+                        ),
+                    )
+                )
+            state = _RequestState(
+                rid=rid,
+                host_tokens=prompt_len,
+                working=None,
+                staged_bytes=int(staged),
+                groups=groups,
+            )
+        else:
+            working = _WorkingSet(
+                top_k=self.config.top_k,
+                capacity=self.padded_buffer_size,
+                access_model=self.config.access_model,
+                churn=self.config.churn,
+                recent_ratio=self.config.recent_ratio,
+                rng=random.Random(self._rng.random()),
+            )
+            staged = prompt_len * self.num_layers * self.bytes_per_token_per_layer
+            state = _RequestState(
+                rid=rid,
+                host_tokens=prompt_len,
+                working=working,
+                staged_bytes=int(staged),
+            )
         self.requests[rid] = state
         self.staging_bytes += int(staged)
         self.cur_host_tokens += prompt_len
@@ -604,6 +839,8 @@ class HiSparseSimulator:
         state = self.requests.get(rid)
         if state is None:
             return StepCost()
+        if self.profile_enabled:
+            return self._decode_one_profile(state, past_len)
         past_len = max(1, int(past_len))
         hits, misses = state.working.step(past_len)
 
@@ -613,6 +850,8 @@ class HiSparseSimulator:
         # to host; the first decode step is skipped (nothing to back up yet).
         backup_tokens = 1 if state.steps > 0 else 0
         d2h = int(backup_tokens * n_layers * self.bytes_per_token_per_layer)
+        hit_bytes = hits * n_layers * self.bytes_per_token_per_layer
+        miss_bytes = misses * n_layers * self.bytes_per_token_per_layer
 
         state.steps += 1
         state.hits += hits * n_layers
@@ -626,6 +865,8 @@ class HiSparseSimulator:
         self.decode_steps += 1
         self.hits += hits * n_layers
         self.misses += misses * n_layers
+        self.hits_bytes += hit_bytes
+        self.misses_bytes += miss_bytes
         self.h2d_bytes += h2d
         self.d2h_bytes += d2h
         self.peak_host_tokens = max(self.peak_host_tokens, self.cur_host_tokens)
@@ -637,6 +878,88 @@ class HiSparseSimulator:
         return StepCost(
             hits=hits * n_layers,
             misses=misses * n_layers,
+            h2d_bytes=h2d,
+            d2h_bytes=d2h,
+        )
+
+    def _decode_one_profile(self, state: _RequestState, past_len: int) -> StepCost:
+        """L1 decode step: one compressed working set per KV ratio group.
+
+        A ratio-``r`` source layer emits one compressed entry every ``r``
+        tokens.  The indexer selects ``top_k`` compressed positions, so on a
+        step that does not cross a compression boundary the selected set is
+        unchanged and every selected entry is still hot (no IO).
+        """
+        past_len = max(1, int(past_len))
+        hits = misses = h2d = d2h = 0
+        hit_bytes = miss_bytes = 0
+        new_entries = 0
+        for group in state.groups:
+            ratio = group.ratio
+            comp_len = max(1, (past_len + ratio - 1) // ratio)
+            ws = group.working
+            if ws.sticky is None:
+                gh, gm = ws.first_step(comp_len)
+                new = 0  # prompt entries were already staged
+            elif comp_len > group.prev_comp_len:
+                gh, gm = ws.step(comp_len)
+                new = comp_len - group.prev_comp_len
+            else:
+                # No new compressed entry: the top-k set does not change.
+                gh, gm = min(ws.top_k, comp_len), 0
+                new = 0
+            group.prev_comp_len = comp_len
+
+            group_h2d = int(gm * group.entry_bytes)
+            group_d2h = int(new * group.entry_bytes) if state.steps > 0 else 0
+            group_hit_bytes = gh * group.entry_bytes
+            group_miss_bytes = gm * group.entry_bytes
+
+            group.hits += gh
+            group.misses += gm
+            group.h2d_bytes += group_h2d
+            group.d2h_bytes += group_d2h
+            group.new_entries += new if state.steps > 0 else 0
+
+            hits += gh
+            misses += gm
+            h2d += group_h2d
+            d2h += group_d2h
+            hit_bytes += group_hit_bytes
+            miss_bytes += group_miss_bytes
+            new_entries += new if state.steps > 0 else 0
+            self.h2d_bytes_by_ratio[ratio] = (
+                self.h2d_bytes_by_ratio.get(ratio, 0) + group_h2d
+            )
+            self.d2h_bytes_by_ratio[ratio] = (
+                self.d2h_bytes_by_ratio.get(ratio, 0) + group_d2h
+            )
+
+        state.steps += 1
+        state.hits += hits
+        state.misses += misses
+        state.h2d_bytes += h2d
+        state.d2h_bytes += d2h
+        state.host_tokens += 1
+        self.cur_host_tokens += 1
+
+        self.decode_steps += 1
+        self.hits += hits
+        self.misses += misses
+        self.hits_bytes += hit_bytes
+        self.misses_bytes += miss_bytes
+        self.new_compressed_entries += new_entries
+        self.h2d_bytes += h2d
+        self.d2h_bytes += d2h
+        self.peak_host_tokens = max(self.peak_host_tokens, self.cur_host_tokens)
+        if self.cur_host_tokens > self.host_pool_tokens:
+            self.host_overcommit_tokens = max(
+                self.host_overcommit_tokens, self.cur_host_tokens - self.host_pool_tokens
+            )
+
+        return StepCost(
+            hits=hits,
+            misses=misses,
             h2d_bytes=h2d,
             d2h_bytes=d2h,
         )
@@ -688,11 +1011,44 @@ class HiSparseSimulator:
 
     def metrics(self) -> dict:
         touched = self.hits + self.misses
+        touched_bytes = self.hits_bytes + self.misses_bytes
         hbm = self.hbm_kv_bytes
         host = self.host_kv_bytes
-        baseline_hbm = self.logical_pool_tokens * self.num_layers * self.bytes_per_token_per_layer
+        baseline_hbm = self.baseline_hbm_kv_bytes
         return {
             "hisparse_enabled": 1,
+            "hisparse_kv_profile": (
+                self.kv_profile.name if self.profile_enabled else "legacy"
+            ),
+            "hisparse_tp_size": self.tp_size,
+            "hisparse_offload_bytes_per_token": self.offload_bytes_per_token,
+            "hisparse_source_layer_ratios": (
+                list(self.kv_profile.source_layer_ratios)
+                if self.profile_enabled
+                else []
+            ),
+            "hisparse_layer_groups": (
+                [list(group) for group in self.kv_profile.layer_groups]
+                if self.profile_enabled
+                else []
+            ),
+            "hisparse_profile_num_layers": (
+                sum(int(count) for count, _ in self.kv_profile.layer_groups)
+                if self.profile_enabled and self.kv_profile.layer_groups
+                else 0
+            ),
+            "hisparse_index_topk": (
+                int(self.kv_profile.index_topk)
+                if self.profile_enabled
+                else 0
+            ),
+            "hisparse_indexer_bytes_per_token": self.indexer_bytes_per_token,
+            "hisparse_hbm_swa_bytes": int(self.hbm_swa_bytes),
+            "hisparse_io_groups": (
+                [[ratio, entry_bytes] for ratio, entry_bytes in self.io_groups]
+                if self.profile_enabled
+                else []
+            ),
             "hisparse_top_k": self.config.top_k,
             "hisparse_device_buffer_size": self.config.device_buffer_size,
             "hisparse_padded_buffer_size": self.padded_buffer_size,
@@ -719,6 +1075,18 @@ class HiSparseSimulator:
             "hisparse_hits": self.hits,
             "hisparse_misses": self.misses,
             "hisparse_hit_rate": (self.hits / touched) if touched else 0.0,
+            "hisparse_hits_bytes": int(self.hits_bytes),
+            "hisparse_misses_bytes": int(self.misses_bytes),
+            "hisparse_hit_rate_bytes": (
+                self.hits_bytes / touched_bytes if touched_bytes else 0.0
+            ),
+            "hisparse_new_compressed_entries": self.new_compressed_entries,
+            "hisparse_h2d_bytes_by_ratio": {
+                str(k): int(v) for k, v in sorted(self.h2d_bytes_by_ratio.items())
+            },
+            "hisparse_d2h_bytes_by_ratio": {
+                str(k): int(v) for k, v in sorted(self.d2h_bytes_by_ratio.items())
+            },
             "hisparse_h2d_bytes": int(self.h2d_bytes),
             "hisparse_d2h_bytes": int(self.d2h_bytes),
             "hisparse_staging_bytes": int(self.staging_bytes),
