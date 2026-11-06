@@ -12,7 +12,9 @@ import math
 import pytest
 
 from hisim.simulation.sglang.hisparse_sim import (
+    DSV41_FP4_PROFILE,
     DSV41_PROFILE,
+    DSV41_VLLM_BF16_PROFILE,
     HiSparseSimConfig,
     HiSparseSimulator,
     KVProfile,
@@ -260,6 +262,202 @@ def test_hit_rate_is_byte_weighted():
     assert metrics["hisparse_io_groups"] == [[1, 222.5], [2, 1335.0]]
     assert metrics["hisparse_kv_profile"] == "dsv41"
     assert metrics["hisparse_profile_num_layers"] == 40
+
+
+# ---------------------------------------------------------------------------
+# L2: .22 vLLM-Ascend BF16 measured layout
+# ---------------------------------------------------------------------------
+
+
+def test_vllm_bf16_profile_geometry():
+    profile = DSV41_VLLM_BF16_PROFILE
+    assert profile.offload_bytes_per_token == 2885.0
+    assert profile.bytes_scope == "per_rank"
+    assert profile.source_layer_ids == (2, 8, 14, 20)
+    assert profile.source_layer_bytes_per_token == (577.0, 577.0, 577.0, 1154.0)
+    assert profile.source_layer_bytes_sum == 2885.0
+    # ratio-2 group: 3 * 577 * 2; ratio-1 group: 1154.
+    assert profile.io_groups() == [(1, 1154.0), (2, 3462.0)]
+    assert profile.main_kv_bytes_per_token == 2560.0
+    assert profile.index_bytes_per_token == 325.0
+    # The index is embedded in 2885, so there is no separate HBM indexer.
+    assert profile.indexer_bytes_per_token == 0.0
+    assert profile.scheduler_block_tokens == 128
+    assert profile.page_bytes == 131072
+    assert profile.slot_count == 4
+    assert profile.allocator_bytes_per_token == 4096.0
+    assert profile.payload_bytes_per_block == 369280.0
+
+
+def test_vllm_bf16_source_to_consumer_topology():
+    profile = DSV41_VLLM_BF16_PROFILE
+    consumers = dict(profile.source_consumers)
+    assert consumers[2] == (2, 3, 4, 5, 6, 7)
+    assert consumers[8] == (8, 9, 10, 11, 12, 13)
+    assert consumers[14] == (14, 15, 16, 17, 18, 19)
+    assert consumers[20] == tuple(range(20, 40))
+    assert profile.index_storage_layers == (2, 8, 14, 20)
+    assert profile.index_compute_layers == (2, 8, 14, 20, 24, 28, 32, 36)
+    assert profile.candidate_blocks == 2048
+    assert profile.candidate_block_tokens == 8
+    assert profile.candidate_source_layer == 20
+    assert profile.candidate_filter_layers == (24, 28, 32, 36)
+
+
+@pytest.mark.parametrize(
+    "tokens,blocks,byte_count",
+    [
+        (128, 22, 22 * 524288),
+        (8192, 405, 405 * 524288),
+        (1048576, 8533, 4473749504),
+    ],
+)
+def test_vllm_bf16_admission_formula(tokens, blocks, byte_count):
+    profile = DSV41_VLLM_BF16_PROFILE
+    assert profile.admission_blocks(tokens) == blocks
+    assert profile.admission_bytes(tokens) == byte_count
+    # The steady-state overhead (10 SWA groups + compressor + null block)
+    # is independent of context once L >= swa_admission_tokens.
+    expected_overhead = (blocks - math.ceil(tokens / 128)) * 524288
+    assert profile.admission_overhead_bytes(tokens) == expected_overhead
+
+
+def test_vllm_bf16_admission_overhead_is_341_blocks_at_4223():
+    profile = DSV41_VLLM_BF16_PROFILE
+    assert profile.swa_admission_tokens == 128 - 1 + 2 * 2048
+    assert profile.admission_blocks(4223) == 374
+    assert profile.admission_overhead_bytes(4223) == 341 * 524288
+
+
+@pytest.mark.parametrize("tp_size", [1, 8])
+def test_vllm_bf16_bytes_are_per_rank_not_divided_by_tp(tp_size):
+    cfg = _dsv41_config(kv_profile="dsv41_vllm_bf16")
+    sim = _make_sim(
+        cfg,
+        physical_tokens=20_000,
+        tp_size=tp_size,
+        max_num_reqs=8,
+    )
+    assert sim.bytes_scope == "per_rank"
+    assert sim.offload_bytes_per_token == pytest.approx(2885.0)
+    assert sim.indexer_bytes_per_token == 0.0
+    assert sim.io_groups == [(1, pytest.approx(1154.0)), (2, pytest.approx(3462.0))]
+
+    # Steady SWA ring and compressor state are separate from the long-KV
+    # payload and are also per rank.
+    assert sim.hbm_swa_bytes == pytest.approx(8 * 128 * 40960.0)
+    assert sim.hbm_compressor_bytes == pytest.approx(8 * 393216.0)
+    expected_hbm = (
+        20_000 * 2885.0
+        + 8 * 128 * 40960.0
+        + 8 * 393216.0
+    )
+    assert sim.hbm_kv_bytes == pytest.approx(expected_hbm)
+    assert sim.host_kv_bytes == pytest.approx(20_000 * 8 * 2885.0)
+
+    sim.on_request_start("r0", 1024)
+    assert sim.staging_bytes == int(1024 * 2885.0)
+
+
+def test_vllm_bf16_io_is_charged_per_source_layer_group():
+    cfg = _dsv41_config(
+        kv_profile="dsv41_vllm_bf16",
+        churn=1.0,
+        top_k=64,
+        device_buffer_size=64,
+        host_to_device_ratio=8,
+    )
+    sim = _make_sim(cfg, physical_tokens=10_000, tp_size=8, max_num_reqs=8)
+    prompt = 4096
+    sim.on_request_start("r0", prompt)
+    sim.on_decode_step("r0", prompt)
+    groups = {g.ratio: g for g in sim.requests["r0"].groups}
+    assert groups[1].entry_bytes == pytest.approx(1154.0)
+    assert groups[2].entry_bytes == pytest.approx(3462.0)
+    assert groups[1].misses > 0 and groups[2].misses > 0
+    assert sim.h2d_bytes == sum(int(g.misses * g.entry_bytes) for g in groups.values())
+    assert sim.h2d_bytes_by_ratio == {
+        1: int(groups[1].misses * 1154.0),
+        2: int(groups[2].misses * 3462.0),
+    }
+    assert sim.staging_bytes == int(prompt * 2885.0)
+
+    metrics = sim.metrics()
+    assert metrics["hisparse_kv_profile"] == "dsv41_vllm_bf16"
+    assert metrics["hisparse_bytes_scope"] == "per_rank"
+    assert metrics["hisparse_source_layer_bytes_per_token"] == [
+        577.0,
+        577.0,
+        577.0,
+        1154.0,
+    ]
+    assert metrics["hisparse_source_layer_bytes_sum"] == 2885.0
+    assert metrics["hisparse_admission_128_blocks"] == 22
+    assert metrics["hisparse_admission_8192_blocks"] == 405
+    assert metrics["hisparse_admission_1m_blocks"] == 8533
+    assert metrics["hisparse_admission_1m_bytes"] == 4473749504
+    assert metrics["hisparse_hbm_admission_overhead_bytes"] == 8 * 341 * 524288
+    assert metrics["hisparse_io_groups"] == [[1, 1154.0], [2, 3462.0]]
+
+
+# ---------------------------------------------------------------------------
+# L2: FP4/CSA2 topology reuse (bytes still approximate)
+# ---------------------------------------------------------------------------
+
+
+def test_fp4_csa2_profile_uses_known_topology_and_indexer_assumption():
+    profile = DSV41_FP4_PROFILE
+    assert profile.name == "dsv41_fp4_csa2"
+    assert profile.bytes_scope == "global"
+    assert profile.offload_bytes_per_token == 890.0
+    assert profile.indexer_bytes_per_token == 544.0
+    assert profile.io_groups() == [(1, 222.5), (2, 1335.0)]
+    assert profile.source_layer_ids == (2, 8, 14, 20)
+    assert profile.source_consumers == DSV41_VLLM_BF16_PROFILE.source_consumers
+    assert profile.index_storage_layers == (2, 8, 14, 20)
+    assert profile.index_compute_layers == (2, 8, 14, 20, 24, 28, 32, 36)
+    assert profile.candidate_blocks == 2048
+    assert profile.candidate_block_tokens == 8
+    assert profile.candidate_source_layer == 20
+    assert profile.swa_layers == 40
+    assert profile.swa_bytes_per_token == 0.0  # FP4 SWA bytes not measured yet
+    assert profile.compressor_layers == (2, 8, 14)
+    assert profile.compressor_bytes_per_request == 0.0
+    assert profile.admission_bytes(1_048_576) == 0  # allocator layout unknown
+
+
+def test_fp4_csa2_global_bytes_scale_with_tp():
+    cfg = _dsv41_config(kv_profile="dsv41_fp4_csa2")
+    sim = _make_sim(cfg, physical_tokens=20_000, tp_size=2)
+    assert sim.bytes_scope == "global"
+    assert sim.offload_bytes_per_token == pytest.approx(445.0)
+    assert sim.indexer_bytes_per_token == pytest.approx(272.0)
+    assert sim.io_groups == [
+        (1, pytest.approx(111.25)),
+        (2, pytest.approx(667.5)),
+    ]
+    assert sim.hbm_kv_bytes == pytest.approx(20_000 * (445.0 + 272.0))
+    assert sim.host_kv_bytes == pytest.approx(20_000 * 8 * 445.0)
+    assert sim.hbm_swa_bytes == 0.0
+    assert sim.hbm_compressor_bytes == 0.0
+
+    metrics = sim.metrics()
+    assert metrics["hisparse_kv_profile"] == "dsv41_fp4_csa2"
+    assert metrics["hisparse_bytes_scope"] == "global"
+    assert metrics["hisparse_source_layer_ids"] == [2, 8, 14, 20]
+    assert metrics["hisparse_indexer_bytes_per_token"] == pytest.approx(272.0)
+    assert metrics["hisparse_admission_1m_bytes"] == 0
+
+
+def test_new_profile_string_aliases():
+    assert (
+        HiSparseSimConfig.from_mapping({"kv_profile": "dsv41_vllm_bf16"}).kv_profile
+        is DSV41_VLLM_BF16_PROFILE
+    )
+    assert (
+        HiSparseSimConfig.from_mapping({"kv_profile": "dsv41_fp4_csa2"}).kv_profile
+        is DSV41_FP4_PROFILE
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -114,14 +114,19 @@ def _run_sweep(args) -> dict:
     """Analytic decode sweep; no sglang/model needed.
 
     ``legacy`` uses the DeepSeek-V3.2 MLA geometry, ``dsv41`` uses the
-    DeepSeek-V4.1 L0/L1 profile (890 B/token, top_k=512, compressed groups).
+    DeepSeek-V4.1 L0/L1 profile (890 B/token, top_k=512, compressed groups),
+    ``dsv41_fp4_csa2`` adds the known FP4/CSA2 L2 topology + optional indexer,
+    and ``dsv41_vllm_bf16`` uses the .22 vLLM-Ascend per-rank BF16 layout.
     """
     from hisim.simulation.sglang.hisparse_sim import (
+        DSV41_FP4_PROFILE,
+        DSV41_VLLM_BF16_PROFILE,
         HiSparseSimConfig,
         HiSparseSimulator,
     )
 
     profile = getattr(args, "kv_profile", "legacy")
+    max_num_reqs = None
     if profile == "dsv41":
         num_layers = 40
         bytes_per_token_per_layer = 0.0
@@ -131,6 +136,30 @@ def _run_sweep(args) -> dict:
         device_buffer_size = 1024
         host_ratio = 8
         kv_profile = "dsv41"
+    elif profile in ("dsv41_fp4_csa2", "dsv41_vllm_bf16"):
+        num_layers = 40
+        bytes_per_token_per_layer = 0.0
+        top_k = 512
+        device_buffer_size = 1024
+        host_ratio = 8
+        max_num_reqs = 8
+        if profile == "dsv41_vllm_bf16":
+            p = DSV41_VLLM_BF16_PROFILE
+            kv_profile = p.name
+            # Per-rank bytes; subtract steady SWA/compressor from the 80 GB
+            # budget before sizing the long-KV hot pool.
+            swa_bytes = max_num_reqs * p.swa_window_tokens * p.swa_bytes_per_token
+            compressor_bytes = max_num_reqs * p.compressor_bytes_per_request
+            physical_tokens = int(
+                (80e9 - swa_bytes - compressor_bytes)
+                / (p.offload_bytes_per_token + p.indexer_bytes_per_token)
+            )
+        else:
+            p = DSV41_FP4_PROFILE
+            kv_profile = p.name
+            physical_tokens = int(
+                80e9 / (p.offload_bytes_per_token + p.indexer_bytes_per_token)
+            )
     else:
         num_layers = 61
         # DeepSeek-V3.2 MLA, FP8 KV: (512 + 64) bytes per token per layer.
@@ -160,6 +189,7 @@ def _run_sweep(args) -> dict:
             num_layers=num_layers,
             bytes_per_token_per_layer=bytes_per_token_per_layer,
             physical_pool_tokens=physical_tokens,
+            max_num_reqs=max_num_reqs,
         )
         for i in range(args.num_prompts):
             sim.on_request_start(f"r{i}", args.input_len)
@@ -176,8 +206,15 @@ def _run_sweep(args) -> dict:
                 "staging_gb": m["hisparse_staging_bytes"] / 1e9,
                 "mean_load_us": m["hisparse_mean_load_us"],
                 "hbm_kv_gb": m["hisparse_hbm_kv_bytes"] / 1e9,
+                "hbm_swa_gb": m["hisparse_hbm_swa_bytes"] / 1e9,
+                "hbm_compressor_gb": m["hisparse_hbm_compressor_bytes"] / 1e9,
                 "host_kv_gb": m["hisparse_host_kv_bytes"] / 1e9,
                 "max_reqs_hot_pool": m["hisparse_max_reqs_hot_pool"],
+                "admission_1m_blocks": m["hisparse_admission_1m_blocks"],
+                "admission_1m_gb": m["hisparse_admission_1m_bytes"] / 1e9,
+                "admission_4223_overhead_gb": (
+                    m["hisparse_admission_4223_overhead_bytes"] / 1e9
+                ),
                 "new_compressed_entries": m["hisparse_new_compressed_entries"],
                 "h2d_bytes_by_ratio": m["hisparse_h2d_bytes_by_ratio"],
             }
@@ -188,6 +225,7 @@ def _run_sweep(args) -> dict:
             "num_layers": num_layers,
             "bytes_per_token_per_layer": bytes_per_token_per_layer,
             "physical_tokens": physical_tokens,
+            "max_num_reqs": max_num_reqs,
             "top_k": top_k,
             "device_buffer_size": device_buffer_size,
             "host_to_device_ratio": host_ratio,
@@ -224,8 +262,20 @@ def main() -> None:
 
     sweep = sub.add_parser("sweep", help="analytic decode sweep")
     sweep.add_argument("--output", default=None)
-    sweep.add_argument("--kv-profile", choices=("legacy", "dsv41"), default="legacy",
-                       help="KV geometry: DeepSeek-V3.2 legacy or DSV4.1 L0/L1")
+    sweep.add_argument(
+        "--kv-profile",
+        choices=(
+            "legacy",
+            "dsv41",
+            "dsv41_fp4_csa2",
+            "dsv41_vllm_bf16",
+        ),
+        default="legacy",
+        help=(
+            "KV geometry: DeepSeek-V3.2 legacy, DSV4.1 L0/L1, FP4/CSA2 L2 "
+            "topology, or .22 vLLM-Ascend BF16 L2"
+        ),
+    )
     sweep.add_argument("--num-prompts", type=int, default=64)
     sweep.add_argument("--input-len", type=int, default=32768)
     sweep.add_argument("--output-len", type=int, default=512)

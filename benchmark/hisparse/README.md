@@ -37,26 +37,46 @@ PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py bench --enable \
 注意 `bench` 在**不带** `--enable` 时会主动清掉 `HISIM_HISPARSE`，以免基线进程
 继承到稀疏配置——所以稀疏运行必须显式加 `--enable`（不要只 export 环境变量）。
 
-## DeepSeek-V4.1（L0/L1）
+## DeepSeek-V4.1（L0/L1/L2）
 
-DSV4.1 使用 `test/assets/mock/config_hisparse_dsv41.json`（`kv_profile=dsv41`、
-890 B/token、`top_k=512`、`device_buffer=1024`、host ratio=8），设计和验证结果见
-[`docs/hisparse_dsv41_simulation.md`](../../docs/hisparse_dsv41_simulation.md)。
+DSV4.1 使用 `test/assets/mock/config_hisparse_dsv41.json`（`top_k=512`、
+`device_buffer=1024`、host ratio=8），通过 `--kv-profile` 或
+`HISIM_HISPARSE_KV_PROFILE` 选择口径。设计和验证结果见
+[`docs/hisparse_dsv41_simulation.md`](../../docs/hisparse_dsv41_simulation.md)：
+
+- `dsv41`：890 B/token，四层均分，L0/L1 兼容；
+- `dsv41_fp4_csa2`：890 B/token + 544 B/token indexer 假设 + L2 拓扑；
+  绝对 page/allocator/SWA/compressor/admission 字节未知；
+- `dsv41_vllm_bf16`：`.22` vLLM-Ascend BF16 的 **2885 B/token/rank** 实测布局，
+  逐 source layer `(577,577,577,1154)`、allocator 4096、SWA/compressor 和
+  admission 公式已落地；TP8 不再除 8。
 
 ```bash
-# DSV4.1 解析 sweep
+# 三个 profile 的解析 sweep
 PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py sweep --kv-profile dsv41
+PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py sweep \
+    --kv-profile dsv41_fp4_csa2
+PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py sweep \
+    --kv-profile dsv41_vllm_bf16
 
 # DSV4.1 端到端（baseline/sparse 用同一个配置，靠 --enable 切换）
 PYTHONPATH=src BENCHMARK_TEST_MODEL_PATH=/path/to/Qwen3-0.6B \
 HISIM_CONFIG_PATH=test/assets/mock/config_hisparse_dsv41.json \
 HISIM_VALIDATION_OUT_DIR=/tmp/hisparse_dsv41_results \
     bash benchmark/hisparse/run_validation.sh
+
+# 用环境变量把同一份配置切到 BF16 L2 布局
+HISIM_HISPARSE_KV_PROFILE=dsv41_vllm_bf16 \
+PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py bench --enable \
+    --config test/assets/mock/config_hisparse_dsv41.json \
+    --max-total-tokens 20000 --num-prompts 8 --input-len 8192 --output-len 64 \
+    --output /tmp/hisparse_dsv41_results/sparse_bf16.json
 ```
 
 `run_validation.sh` 自带的 sweep 仍是 legacy 几何；DSV4.1 sweep 请用上面的
-`--kv-profile dsv41` 单跑。长上下文 L1 验证（8 × 8192 prompt + 64 output）的命令见
-DSV4.1 文档 §7。
+`--kv-profile` 单跑。注意 `.22` 的 2885 B/token/rank 与官方 FP4/CSA2 的
+890 B/token 是两个场景，不能混用；FP4 的 544 只是 indexer 设计假设。
+长上下文 L1 验证命令见 DSV4.1 文档 §9 的复现命令。
 
 ## 复现注意事项
 

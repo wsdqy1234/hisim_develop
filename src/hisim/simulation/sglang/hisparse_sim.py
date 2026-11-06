@@ -50,7 +50,7 @@ logger = get_logger("hisim")
 
 
 # ---------------------------------------------------------------------------
-# Static KV layout profiles (L0/L1)
+# Static KV layout profiles (L0/L1/L2)
 # ---------------------------------------------------------------------------
 
 
@@ -60,8 +60,8 @@ class KVProfile:
 
     The legacy HiSparse model assumes a uniform layout
     (``num_layers * bytes_per_token_per_layer``).  Models such as
-    DeepSeek-V4.1 store a much smaller *global* KV (FP4 + cross-layer reuse),
-    so that formula overestimates capacity and IO by ~90x.
+    DeepSeek-V4.1 store a much smaller KV (FP4 + cross-layer reuse), so that
+    formula overestimates capacity and IO by orders of magnitude.
 
     ``offload_bytes_per_token`` is the **total** per-token KV footprint of the
     offloadable source layers.  ``source_layer_ratios`` splits that total over
@@ -71,9 +71,15 @@ class KVProfile:
 
     L0 uses only ``offload_bytes_per_token`` for capacity and total IO.  L1
     additionally uses ``source_layer_ratios`` to run one compressed working
-    set per ratio group.  ``indexer_bytes_per_token`` and
-    ``swa_bytes_per_token`` are reserved for L2 (HBM-resident indexer pool and
-    SWA ring); they default to 0 so L0/L1 results stay comparable.
+    set per ratio group.  L2 uses the optional fields below to model the
+    deployed per-source-layer layout, page/allocator geometry, indexer,
+    SWA/compressor residency and the admission upper bound.
+
+    ``bytes_scope`` controls whether the byte fields are already **per rank**
+    (``"per_rank"``) or a model/global value that is divided by ``tp_size``
+    (``"global"``).  This matters for MLA: with DCP=1 and one KV head per rank,
+    the eight TP ranks hold replicas and the per-rank bytes must not be divided
+    again.
     """
 
     name: str = "generic"
@@ -84,35 +90,136 @@ class KVProfile:
     layer_groups: Tuple[Tuple[int, int], ...] = ()
     # sglang's index_topk: number of compressed positions selected per step.
     index_topk: int = 0
-    # L2: HBM-resident indexer pool, bytes per token (FP4 68 / FP8 132 per layer).
+    # L2: HBM-resident indexer pool, bytes per token.  This is *separate* from
+    # ``offload_bytes_per_token``; use 0 when the index is embedded in the
+    # source-layer payload (as in the .22 BF16 profile).
     indexer_bytes_per_token: float = 0.0
-    # L2: SWA ring, per-request window (tokens) and bytes per token.
+    # L2: SWA ring, per-request window (tokens) and total bytes per token
+    # across all SWA layers.
     swa_window_tokens: int = 0
     swa_bytes_per_token: float = 0.0
+
+    # -- L2 topology / layout metadata -------------------------------------
+    # "global" divides byte fields by tp_size; "per_rank" does not.
+    bytes_scope: str = "global"
+    source_layer_ids: Tuple[int, ...] = ()
+    # Per original token, per source layer, e.g. (577, 577, 577, 1154).
+    source_layer_bytes_per_token: Tuple[float, ...] = ()
+    # ((source_layer, (consumer_layer, ...)), ...).
+    source_consumers: Tuple[Tuple[int, Tuple[int, ...]], ...] = ()
+    index_storage_layers: Tuple[int, ...] = ()
+    index_compute_layers: Tuple[int, ...] = ()
+    # Index payload embedded in offload bytes, for reporting only.
+    index_bytes_per_token: float = 0.0
+    main_kv_bytes_per_token: float = 0.0
+    scheduler_block_tokens: int = 0
+    page_bytes: int = 0
+    slot_count: int = 0
+    allocator_bytes_per_token: float = 0.0
+    payload_bytes_per_block: float = 0.0
+    candidate_blocks: int = 0
+    candidate_block_tokens: int = 0
+    candidate_source_layer: int = -1
+    candidate_filter_layers: Tuple[int, ...] = ()
+    swa_layers: int = 0
+    # Token window used by the admission formula; includes in-flight prefill.
+    swa_admission_tokens: int = 0
+    compressor_layers: Tuple[int, ...] = ()
+    compressor_page_bytes: int = 0
+    compressor_bytes_per_request: float = 0.0
+    admission_swa_groups: int = 0
+    admission_extra_groups: int = 0
+    admission_bytes_per_block: int = 0
 
     @property
     def enabled(self) -> bool:
         return self.offload_bytes_per_token > 0
 
+    @property
+    def per_rank(self) -> bool:
+        return self.bytes_scope.strip().lower() == "per_rank"
+
+    @property
+    def source_layer_bytes_sum(self) -> float:
+        return float(sum(self.source_layer_bytes_per_token))
+
     def io_groups(self) -> List[Tuple[int, float]]:
         """Return ``[(ratio, bytes_per_compressed_entry), ...]``.
 
-        The per-token total is split evenly over the source layers.  For
-        DSV4.1 (``890 B/token``, ratios ``(2, 2, 2, 1)``) this yields
-        ``[(1, 222.5), (2, 1335.0)]``.  A profile without source ratios is
-        treated as a single ratio-1 group (L0-only geometry).
+        If ``source_layer_bytes_per_token`` is set, the byte weight of each
+        source layer is used directly.  Otherwise the legacy behaviour splits
+        ``offload_bytes_per_token`` evenly over the source layers.  For the
+        FP4/CSA2 profile (890 B/token, ratios ``(2, 2, 2, 1)``) that yields
+        ``[(1, 222.5), (2, 1335.0)]``; for the `.22` BF16 profile it yields
+        ``[(1, 1154.0), (2, 3462.0)]``.
         """
         if not self.enabled:
             return []
         ratios = tuple(int(r) for r in self.source_layer_ratios if int(r) > 0)
         if not ratios:
             return [(1, float(self.offload_bytes_per_token))]
+
+        if self.source_layer_bytes_per_token:
+            if len(self.source_layer_bytes_per_token) == len(ratios):
+                grouped: Dict[int, float] = {}
+                for ratio, bytes_per_token in zip(
+                    ratios, self.source_layer_bytes_per_token
+                ):
+                    grouped[ratio] = grouped.get(ratio, 0.0) + (
+                        float(bytes_per_token) * ratio
+                    )
+                return [(ratio, grouped[ratio]) for ratio in sorted(grouped)]
+            logger.warning(
+                "KV profile %s has %d source ratios but %d per-layer byte "
+                "values; falling back to an even split.",
+                self.name,
+                len(ratios),
+                len(self.source_layer_bytes_per_token),
+            )
+
         per_layer = float(self.offload_bytes_per_token) / len(ratios)
         groups: List[Tuple[int, float]] = []
         for ratio in sorted(set(ratios)):
             layer_bytes = sum(per_layer for r in ratios if r == ratio)
             groups.append((ratio, float(layer_bytes * ratio)))
         return groups
+
+    def admission_blocks(self, tokens: int) -> int:
+        """Return the installed vLLM-Ascend admission block count.
+
+        ``B(L) = ceil(L/block) + extra_groups +
+                   swa_groups * (ceil(min(L, swa_admission_tokens)/block) + 1)``
+
+        This is an **upper bound** for one request, not steady-state decode
+        occupancy.  Profiles without an allocator layout return 0.
+        """
+        block = int(self.scheduler_block_tokens)
+        if block <= 0 or int(self.admission_bytes_per_block) <= 0:
+            return 0
+        length = max(0, int(tokens))
+        long_blocks = (length + block - 1) // block
+        swa_tokens = self.swa_admission_tokens or self.swa_window_tokens or length
+        swa_tokens = min(length, int(swa_tokens))
+        swa_blocks = (swa_tokens + block - 1) // block if swa_tokens > 0 else 0
+        return (
+            long_blocks
+            + int(self.admission_extra_groups)
+            + int(self.admission_swa_groups) * (swa_blocks + 1)
+        )
+
+    def admission_bytes(self, tokens: int) -> int:
+        blocks = self.admission_blocks(tokens)
+        return int(blocks * int(self.admission_bytes_per_block))
+
+    def admission_overhead_bytes(self, tokens: int) -> int:
+        """Admission bytes not attributable to long-KV blocks."""
+        block = int(self.scheduler_block_tokens)
+        if block <= 0 or int(self.admission_bytes_per_block) <= 0:
+            return 0
+        length = max(0, int(tokens))
+        long_blocks = (length + block - 1) // block
+        blocks = self.admission_blocks(length)
+        return int(max(0, blocks - long_blocks) * int(self.admission_bytes_per_block))
 
     @classmethod
     def from_value(cls, value) -> Optional["KVProfile"]:
@@ -126,35 +233,161 @@ class KVProfile:
                 return None
             if key in ("dsv41", "dsv4.1", "deepseek_v41", "deepseek-v4.1"):
                 return DSV41_PROFILE
+            if key in (
+                "dsv41_fp4_csa2",
+                "dsv41-fp4",
+                "dsv41_fp4",
+                "fp4_csa2",
+            ):
+                return DSV41_FP4_PROFILE
+            if key in (
+                "dsv41_vllm_bf16",
+                "dsv41-bf16",
+                "dsv41_bf16",
+                "vllm_bf16",
+            ):
+                return DSV41_VLLM_BF16_PROFILE
             raise ValueError(f"Unknown KV profile {value!r}")
         if isinstance(value, dict):
             raw = dict(value)
-            if "source_layer_ratios" in raw:
-                raw["source_layer_ratios"] = tuple(
-                    int(x) for x in raw["source_layer_ratios"]
+            int_tuple_fields = (
+                "source_layer_ratios",
+                "source_layer_ids",
+                "index_storage_layers",
+                "index_compute_layers",
+                "candidate_filter_layers",
+                "compressor_layers",
+            )
+            for key in int_tuple_fields:
+                if key in raw:
+                    raw[key] = tuple(int(x) for x in raw[key])
+            if "source_layer_bytes_per_token" in raw:
+                raw["source_layer_bytes_per_token"] = tuple(
+                    float(x) for x in raw["source_layer_bytes_per_token"]
                 )
             if "layer_groups" in raw:
                 raw["layer_groups"] = tuple(
                     (int(a), int(b)) for a, b in raw["layer_groups"]
                 )
+            if "source_consumers" in raw:
+                consumers = raw["source_consumers"]
+                items = consumers.items() if isinstance(consumers, dict) else consumers
+                raw["source_consumers"] = tuple(
+                    (int(source), tuple(int(x) for x in layers))
+                    for source, layers in items
+                )
             return cls(**raw)
         raise TypeError(f"Unsupported KV profile value: {type(value)!r}")
 
+
+# Source -> consumer map from the installed .22 vLLM-Ascend layout.  It is a
+# model-level topology, so the FP4/CSA2 profile can reuse it even though its
+# byte layout is different.
+DSV41_SOURCE_CONSUMERS: Tuple[Tuple[int, Tuple[int, ...]], ...] = (
+    (2, (2, 3, 4, 5, 6, 7)),
+    (8, (8, 9, 10, 11, 12, 13)),
+    (14, (14, 15, 16, 17, 18, 19)),
+    (20, tuple(range(20, 40))),
+)
 
 # DeepSeek-V4.1-Flash (config.json):
 #   40 layers: 2 SWA (ratio 0) + 18 CSA (ratio 2) + 20 HCA (ratio 1)
 #   kv_source_layer_ids=[2, 8, 14, 20] -> 3 x ratio 2 + 1 x ratio 1
 #   index_topk=512, index_head_dim=128
 #   official global KV footprint: 890 B/token (FP4 + CSA2 cross-layer reuse)
+#
+# This remains the L0/L1-compatible profile: byte layout is the official
+# 890 B/token global figure, and L2 byte-only fields stay 0.  The structural
+# fields are shared with the FP4/CSA2 L2 profile below.
 DSV41_PROFILE = KVProfile(
     name="dsv41",
     offload_bytes_per_token=890.0,
     source_layer_ratios=(2, 2, 2, 1),
     layer_groups=((2, 0), (18, 2), (20, 1)),
     index_topk=512,
-    indexer_bytes_per_token=0.0,  # L2: 544 B (FP4) or 1056 B (FP8)
+    indexer_bytes_per_token=0.0,  # set to 544 in dsv41_fp4_csa2
     swa_window_tokens=128,
-    swa_bytes_per_token=0.0,  # L2
+    swa_bytes_per_token=0.0,  # unknown for the FP4/CSA2 target
+    source_layer_ids=(2, 8, 14, 20),
+    source_consumers=DSV41_SOURCE_CONSUMERS,
+    index_storage_layers=(2, 8, 14, 20),
+    index_compute_layers=(2, 8, 14, 20, 24, 28, 32, 36),
+    candidate_blocks=2048,
+    candidate_block_tokens=8,
+    candidate_source_layer=20,
+    candidate_filter_layers=(24, 28, 32, 36),
+    scheduler_block_tokens=128,
+    swa_layers=40,
+    swa_admission_tokens=4223,
+    compressor_layers=(2, 8, 14),
+)
+
+# FP4/CSA2 L2 approximation.  The model topology (source layers, consumers,
+# index candidate path, SWA/compressor layers, 128-token scheduler block) is
+# known; the absolute FP4 page/allocator and SWA/compressor bytes are not.
+# ``indexer_bytes_per_token=544`` is the FP4 8-layer index assumption from the
+# design notes, kept separate so it can be overridden by a custom dict.
+DSV41_FP4_PROFILE = KVProfile(
+    name="dsv41_fp4_csa2",
+    offload_bytes_per_token=890.0,
+    source_layer_ratios=(2, 2, 2, 1),
+    layer_groups=((2, 0), (18, 2), (20, 1)),
+    index_topk=512,
+    indexer_bytes_per_token=544.0,
+    swa_window_tokens=128,
+    swa_bytes_per_token=0.0,
+    bytes_scope="global",
+    source_layer_ids=(2, 8, 14, 20),
+    source_consumers=DSV41_SOURCE_CONSUMERS,
+    index_storage_layers=(2, 8, 14, 20),
+    index_compute_layers=(2, 8, 14, 20, 24, 28, 32, 36),
+    candidate_blocks=2048,
+    candidate_block_tokens=8,
+    candidate_source_layer=20,
+    candidate_filter_layers=(24, 28, 32, 36),
+    scheduler_block_tokens=128,
+    swa_layers=40,
+    swa_admission_tokens=4223,
+    compressor_layers=(2, 8, 14),
+)
+
+# .22 BF16 vLLM-Ascend layout (source/layout-derived, not live tensor
+# introspection).  All byte fields are per rank; DCP=1 and each rank holds one
+# KV head, so TP8 must not divide them again.
+DSV41_VLLM_BF16_PROFILE = KVProfile(
+    name="dsv41_vllm_bf16",
+    offload_bytes_per_token=2885.0,
+    source_layer_ratios=(2, 2, 2, 1),
+    layer_groups=((2, 0), (18, 2), (20, 1)),
+    index_topk=512,
+    indexer_bytes_per_token=0.0,  # index is embedded in 2885
+    swa_window_tokens=128,
+    swa_bytes_per_token=40 * 512 * 2,  # 40 layers, BF16, 512-wide
+    bytes_scope="per_rank",
+    source_layer_ids=(2, 8, 14, 20),
+    source_layer_bytes_per_token=(577.0, 577.0, 577.0, 1154.0),
+    source_consumers=DSV41_SOURCE_CONSUMERS,
+    index_storage_layers=(2, 8, 14, 20),
+    index_compute_layers=(2, 8, 14, 20, 24, 28, 32, 36),
+    index_bytes_per_token=325.0,
+    main_kv_bytes_per_token=2560.0,
+    scheduler_block_tokens=128,
+    page_bytes=131072,
+    slot_count=4,
+    allocator_bytes_per_token=4096.0,
+    payload_bytes_per_block=369280.0,
+    candidate_blocks=2048,
+    candidate_block_tokens=8,
+    candidate_source_layer=20,
+    candidate_filter_layers=(24, 28, 32, 36),
+    swa_layers=40,
+    swa_admission_tokens=128 - 1 + 2 * 2048,
+    compressor_layers=(2, 8, 14),
+    compressor_page_bytes=32 * 1024 * 4,
+    compressor_bytes_per_request=3 * 32 * 1024 * 4,
+    admission_swa_groups=10,
+    admission_extra_groups=1,
+    admission_bytes_per_block=524288,
 )
 
 
@@ -604,19 +837,30 @@ class HiSparseSimulator:
         self.profile_enabled = bool(
             self.kv_profile is not None and self.kv_profile.enabled
         )
+        self.bytes_scope = (
+            self.kv_profile.bytes_scope if self.profile_enabled else "legacy"
+        )
+        # ``per_rank`` profiles already carry one rank's bytes (DCP=1, one KV
+        # head per rank); ``global`` profiles keep the pre-L2 behaviour and are
+        # divided by TP.
+        self._tp_scale = (
+            1.0
+            if self.profile_enabled and self.kv_profile.per_rank
+            else 1.0 / self.tp_size
+        )
         self.offload_bytes_per_token = (
-            float(self.kv_profile.offload_bytes_per_token) / self.tp_size
+            float(self.kv_profile.offload_bytes_per_token) * self._tp_scale
             if self.profile_enabled
             else 0.0
         )
         self.indexer_bytes_per_token = (
-            float(self.kv_profile.indexer_bytes_per_token) / self.tp_size
+            float(self.kv_profile.indexer_bytes_per_token) * self._tp_scale
             if self.profile_enabled
             else 0.0
         )
         self.io_groups: List[Tuple[int, float]] = (
             [
-                (int(ratio), float(entry_bytes) / self.tp_size)
+                (int(ratio), float(entry_bytes) * self._tp_scale)
                 for ratio, entry_bytes in self.kv_profile.io_groups()
             ]
             if self.profile_enabled
@@ -640,10 +884,33 @@ class HiSparseSimulator:
             self.max_num_reqs
             * int(self.kv_profile.swa_window_tokens)
             * float(self.kv_profile.swa_bytes_per_token)
-            / self.tp_size
+            * self._tp_scale
             if self.profile_enabled
             and self.kv_profile.swa_window_tokens
             and self.kv_profile.swa_bytes_per_token
+            else 0.0
+        )
+        self.hbm_compressor_bytes = (
+            self.max_num_reqs
+            * float(self.kv_profile.compressor_bytes_per_request)
+            * self._tp_scale
+            if self.profile_enabled
+            and self.kv_profile.compressor_bytes_per_request
+            else 0.0
+        )
+        # Worst-case per-request admission overhead (SWA + compressor + null
+        # block).  Kept separate from steady-state ``hbm_kv_bytes``: it is an
+        # admission upper bound, not decode occupancy.
+        self.hbm_admission_overhead_bytes = (
+            self.max_num_reqs
+            * float(
+                self.kv_profile.admission_overhead_bytes(
+                    self.kv_profile.swa_admission_tokens
+                )
+            )
+            * self._tp_scale
+            if self.profile_enabled
+            and self.kv_profile.admission_bytes_per_block
             else 0.0
         )
 
@@ -732,6 +999,7 @@ class HiSparseSimulator:
                 self.physical_pool_tokens
                 * (self.offload_bytes_per_token + self.indexer_bytes_per_token)
                 + self.hbm_swa_bytes
+                + self.hbm_compressor_bytes
             )
         return (
             self.physical_pool_tokens
@@ -756,6 +1024,7 @@ class HiSparseSimulator:
                 self.logical_pool_tokens
                 * (self.offload_bytes_per_token + self.indexer_bytes_per_token)
                 + self.hbm_swa_bytes
+                + self.hbm_compressor_bytes
             )
         return (
             self.logical_pool_tokens
@@ -1015,35 +1284,114 @@ class HiSparseSimulator:
         hbm = self.hbm_kv_bytes
         host = self.host_kv_bytes
         baseline_hbm = self.baseline_hbm_kv_bytes
+        p = self.kv_profile if self.profile_enabled else None
         return {
             "hisparse_enabled": 1,
             "hisparse_kv_profile": (
                 self.kv_profile.name if self.profile_enabled else "legacy"
             ),
             "hisparse_tp_size": self.tp_size,
+            "hisparse_bytes_scope": self.bytes_scope,
             "hisparse_offload_bytes_per_token": self.offload_bytes_per_token,
             "hisparse_source_layer_ratios": (
-                list(self.kv_profile.source_layer_ratios)
-                if self.profile_enabled
+                list(p.source_layer_ratios) if p else []
+            ),
+            "hisparse_source_layer_ids": (
+                list(p.source_layer_ids) if p else []
+            ),
+            "hisparse_source_layer_bytes_per_token": (
+                list(p.source_layer_bytes_per_token) if p else []
+            ),
+            "hisparse_source_layer_bytes_sum": (
+                p.source_layer_bytes_sum if p else 0.0
+            ),
+            "hisparse_source_consumers": (
+                [[source, list(consumers)] for source, consumers in p.source_consumers]
+                if p
                 else []
             ),
             "hisparse_layer_groups": (
-                [list(group) for group in self.kv_profile.layer_groups]
-                if self.profile_enabled
-                else []
+                [list(group) for group in p.layer_groups] if p else []
             ),
             "hisparse_profile_num_layers": (
-                sum(int(count) for count, _ in self.kv_profile.layer_groups)
-                if self.profile_enabled and self.kv_profile.layer_groups
+                sum(int(count) for count, _ in p.layer_groups)
+                if p and p.layer_groups
                 else 0
             ),
-            "hisparse_index_topk": (
-                int(self.kv_profile.index_topk)
-                if self.profile_enabled
-                else 0
+            "hisparse_index_topk": int(p.index_topk) if p else 0,
+            "hisparse_index_storage_layers": (
+                list(p.index_storage_layers) if p else []
+            ),
+            "hisparse_index_compute_layers": (
+                list(p.index_compute_layers) if p else []
+            ),
+            "hisparse_main_kv_bytes_per_token": (
+                p.main_kv_bytes_per_token if p else 0.0
+            ),
+            "hisparse_index_bytes_per_token": (
+                p.index_bytes_per_token if p else 0.0
             ),
             "hisparse_indexer_bytes_per_token": self.indexer_bytes_per_token,
+            "hisparse_scheduler_block_tokens": (
+                int(p.scheduler_block_tokens) if p else 0
+            ),
+            "hisparse_page_bytes": int(p.page_bytes) if p else 0,
+            "hisparse_slot_count": int(p.slot_count) if p else 0,
+            "hisparse_allocator_bytes_per_token": (
+                p.allocator_bytes_per_token if p else 0.0
+            ),
+            "hisparse_payload_bytes_per_block": (
+                p.payload_bytes_per_block if p else 0.0
+            ),
+            "hisparse_candidate_blocks": int(p.candidate_blocks) if p else 0,
+            "hisparse_candidate_block_tokens": (
+                int(p.candidate_block_tokens) if p else 0
+            ),
+            "hisparse_candidate_source_layer": (
+                int(p.candidate_source_layer) if p else -1
+            ),
+            "hisparse_candidate_filter_layers": (
+                list(p.candidate_filter_layers) if p else []
+            ),
+            "hisparse_swa_layers": int(p.swa_layers) if p else 0,
+            "hisparse_swa_window_tokens": (
+                int(p.swa_window_tokens) if p else 0
+            ),
+            "hisparse_swa_admission_tokens": (
+                int(p.swa_admission_tokens) if p else 0
+            ),
             "hisparse_hbm_swa_bytes": int(self.hbm_swa_bytes),
+            "hisparse_hbm_compressor_bytes": int(self.hbm_compressor_bytes),
+            "hisparse_compressor_layers": (
+                list(p.compressor_layers) if p else []
+            ),
+            "hisparse_compressor_page_bytes": (
+                int(p.compressor_page_bytes) if p else 0
+            ),
+            "hisparse_compressor_bytes_per_request": (
+                p.compressor_bytes_per_request if p else 0.0
+            ),
+            "hisparse_admission_bytes_per_block": (
+                int(p.admission_bytes_per_block) if p else 0
+            ),
+            "hisparse_admission_4223_overhead_bytes": (
+                p.admission_overhead_bytes(p.swa_admission_tokens) if p else 0
+            ),
+            "hisparse_admission_128_blocks": (
+                p.admission_blocks(128) if p else 0
+            ),
+            "hisparse_admission_8192_blocks": (
+                p.admission_blocks(8192) if p else 0
+            ),
+            "hisparse_admission_1m_blocks": (
+                p.admission_blocks(1_048_576) if p else 0
+            ),
+            "hisparse_admission_1m_bytes": (
+                p.admission_bytes(1_048_576) if p else 0
+            ),
+            "hisparse_hbm_admission_overhead_bytes": int(
+                self.hbm_admission_overhead_bytes
+            ),
             "hisparse_io_groups": (
                 [[ratio, entry_bytes] for ratio, entry_bytes in self.io_groups]
                 if self.profile_enabled

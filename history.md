@@ -1508,3 +1508,35 @@ V3 原把 prefetch buffer 记为跨请求占用的 L2（下一请求才释放）
 **注意 / L2 待办**：
 - 当前 L1 仍按 ratio 组而非逐 source/indexer layer 建工作集；未计 8 层 indexer 常驻 HBM（FP4 544 B/token、FP8 1056 B/token）、SWA ring、MTP/DSpark、CSA2/C4/C128 块语义、PD/direct RDMA。
 - `kv_profile` 默认 None；不配置时完全走 legacy。真实 V4.1 校准应使用独立 `vllm-ascend:v0.30.0-a3` 容器，勿与当前 sglang 0.5.19 栈混装。
+
+---
+
+## 2026-11-06 — DeepSeek-V4.1 HiSparse L2：`.22` BF16 布局 + FP4/CSA2 拓扑
+
+**背景**：L0/L1 只有 890 B/token 的均分近似，无法表达 `.22` vLLM-Ascend 实测的 BF16 逐 source layer 布局、page/allocator、SWA/compressor 和 admission；同时官方 FP4/CSA2 目标只能复用模型拓扑，不能复用 BF16 绝对字节。两种场景必须在同一套仿真里**分开口径**。
+
+**完成的事项**：
+
+1. **`KVProfile` L2 字段/方法**（`src/hisim/simulation/sglang/hisparse_sim.py`）：
+   - 新增 `bytes_scope`、逐 source layer 字节、source→consumer、index storage/compute 层、candidate 块元数据、page/slot/allocator、SWA/compressor、admission 字段。
+   - `io_groups()` 有逐层字节时按层计，否则保持旧均分；新增 `admission_blocks()` / `admission_bytes()` / `admission_overhead_bytes()`。
+   - `from_value()` 支持 `dsv41_vllm_bf16`、`dsv41_fp4_csa2` 及 dict 形式。
+2. **新增 profile**：
+   - `DSV41_VLLM_BF16_PROFILE`：`2885 B/token/rank`（main 2560 + index 325）、逐层 `(577,577,577,1154)`、`io_groups=[(1,1154),(2,3462)]`、allocator 4096、page 131072/4 slots、SWA 40×128×40960、compressor 3×131072、admission 公式；`bytes_scope="per_rank"`，TP8 不再除 8。
+   - `DSV41_FP4_PROFILE`：890 + 544 indexer 假设 + 已知拓扑；SWA/compressor/page/allocator/admission 绝对字节保留 0，明确标为未知。
+   - `DSV41_PROFILE` 仍为 890 B/token 均分，补结构字段，保持 L0/L1 兼容。
+3. **Simulator/metrics**：`_tp_scale` 区分 global/per-rank；`hbm_compressor_bytes` 纳入 `hbm_kv_bytes`；admission 开销单独输出，不混入稳态；新增逐层字节、source→consumer、index/candidate、page/allocator、SWA/compressor、admission 128/8192/1M 表等 metrics。
+4. **Benchmark/文档**：
+   - `benchmark/hisparse/hisparse_bench.py` 的 `--kv-profile` 增加 `dsv41_fp4_csa2`、`dsv41_vllm_bf16`；BF16/FP4 sweep 设 `max_num_reqs=8`，BF16 从 80GB 预算扣除稳态 SWA/compressor。
+   - 重写 `docs/hisparse_dsv41_simulation.md`，区分 `.22` BF16 实测参考与官方 FP4/CSA2 目标；最后分别列出两个场景缺的数据/实验。
+   - `benchmark/hisparse/README.md` 增加两个 L2 profile 的命令。
+
+**验证**：
+- 单测：`pytest test/test_hisparse_sim.py test/test_hisparse_dsv41.py -q` → **46 passed**（新增 12 个 L2 测试；legacy/L0/L1 零回归）。
+- BF16 关键值：20K physical、`max_num_reqs=8`、tp8 → `hbm_kv=102,788,768 B`、`host=461,600,000 B`、SWA `41,943,040 B`、compressor `3,145,728 B`、admission 1M `8533 blocks / 4,473,749,504 B`、4223 非 long-KV 开销 `341 blocks / 178,782,208 B`。
+- Sweep（64×32K+512，80GB 通用预算）：BF16 / FP4 / dsv41 的 byte hit 在 churn 0.05/0.2/0.5 分别为 98.36/93.86/84.79%、98.50/94.39/86.13%、98.50/94.39/86.13%；BF16 H2D 1.268/4.755/11.779 GB（≈890 路径的 3.2×），staging 6.050 GB；FP4 physical tokens 55.79M、host 397.21GB（indexer 544 计入 HBM）。
+
+**注意**：
+- `.22` 是 vLLM-Ascend BF16 静态布局重建，不是 sglang HiSparse online trace；page/allocator/SWA/compressor/admission 仍缺 live worker 验证。
+- FP4/CSA2 只复用模型拓扑 + 544 B/token index 假设；逐层 FP4 字节、page/allocator、SWA/compressor 量化字节、admission 全部未知，不能套用 BF16 的 2885/4096/524288 等数值。
+- 两个场景共同缺：逐步 top-k ID/分数、hot-buffer hit/miss/swap 字节、host/SSU 带宽延迟、真实 1M、graph/SPEC/MTP/DCP>1、连续到达、真实 LRU 物理淘汰、生产全局去重/生命周期。
