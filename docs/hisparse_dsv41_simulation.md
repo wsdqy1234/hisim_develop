@@ -873,7 +873,11 @@ D 生命周期与实测校准**。不建议先改带宽或调 churn，因为那�
 12.1-12.6 是 2026-11-09 的评审结论，最初未修改代码；修复落地、重跑结果和
 仍缺的实测项见下一节。
 
-### 12.7 修复落地（2026-11-09）
+### 12.7 第一次修复落地（2026-11-09）
+
+> 本节保留第一次修复及其复现记录。二次评审发现的 prefix 调用时机、direct-short、
+> 奇数 prompt 边界、LRU 混合顺序和并发口径问题已在 §12.8 修正；动态结果以 §12.8
+> 为准，§12.7.2 仅用于解释修复前后差异。
 
 #### 12.7.1 已完成
 
@@ -965,3 +969,76 @@ index H2D 在三个 churn 下相同，因为每步选中的 index entry 数不�
 
 因此本轮修复解决了容量分母、cadence、churn、初始化/LRU 和 IO 分账等
 **确定性错误**；绝对吞吐/TPOT 结论仍需真实 indexer/hot-buffer/SSU trace 后才能恢复。
+
+### 12.8 第二次修复（2026-11-10）
+
+#### 12.8.1 修复内容
+
+二次评审在 `555fe9d` 上确认了以下确定性问题，并已修正：
+
+| 项 | 修复 |
+| --- | --- |
+| prefix 调用时机 | 不再在 `TokenizedGenerateReqInput` 进入 dispatcher 前读取 `prefix_indices`；改为 prefill 批次生成后、radix 匹配已完成时启动 staging |
+| direct-short | newest page 老化时无 IO 进入 regular LRU；压缩长度不超过 device buffer 时不再产生虚假主 KV H2D |
+| 奇数 prompt | staging 改用 `floor(prompt_len/ratio)`；与 decode 的 floor 压缩长度对齐，partial entry 不再先 staging 后重复 D2H |
+| 混合 hit/miss LRU | 先处理 hits 到 MRU，再把 misses 插到 hit block 之前；不再按 token position 交错 |
+| recency 对照 | `access_model=recency` 固定选择最近 `top_k`，不再被 `recent_ratio` 缩短 |
+| DP/显式容量并发 | server 的全局 `max_running_requests` 先换算为 per-worker；显式 `max_total_tokens` 也使用最终 worker 并发 |
+| hot-pool clamp | 物理 token 数与请求 overhead 联立求解，clamp 后的并发就是实际预留 SWA/compressor 的并发 |
+
+direct-short 的“无 IO”指主 KV swap-in 为零；BF16 中 `index_read_on_hit=True` 的
+resident index 读取仍按选定 entry 计费，不是免费。
+
+新增回归覆盖：redispatcher 后 prefix、direct-short/newest aging、mixed hit/miss
+LRU 顺序、奇数与小于一个压缩块的 prompt、recency 选满 top_k、DP per-worker
+并发和 hot-pool 固定点。目标测试：
+
+```text
+PYTHONPATH=src python -m pytest test/test_hisparse_sim.py test/test_hisparse_dsv41.py -q
+60 passed
+```
+
+#### 12.8.2 重跑结果
+
+公共 workload 不变：64 请求 × 32K prompt + 512 output、80 GB 预算、
+`top_k=512`、`device_buffer=1024`、host ratio 8、`recent_ratio=0.5`。
+以下数字取代 §12.7.2。
+
+`dsv41`（890 B/token）：
+
+| churn | 命中率（条目/字节） | H2D | D2H | staging | mean load |
+| --- | --- | --- | --- | --- | --- |
+| 0.05 | 97.34% / 97.35% | 0.6918 GB | 0.0290 GB | 1.8665 GB | 7.06 µs |
+| 0.20 | 90.10% / 90.16% | 2.5707 GB | 0.0290 GB | 1.8665 GB | 8.11 µs |
+| 0.50 | 75.46% / 75.60% | 6.3749 GB | 0.0290 GB | 1.8665 GB | 10.25 µs |
+
+physical tokens = 89,887,640；host = 640 GB；`max_reqs_hot_pool=87,695`。
+
+`dsv41_fp4_csa2`（890 + 544 假设）：
+
+| churn | 命中率（条目/字节） | H2D | mean load |
+| --- | --- | --- | --- |
+| 0.05 | 97.34% / 97.35% | 0.6918 GB | 7.06 µs |
+| 0.20 | 90.10% / 90.16% | 2.5707 GB | 8.11 µs |
+| 0.50 | 75.46% / 75.60% | 6.3749 GB | 10.25 µs |
+
+physical tokens = 55,788,005；host = 397.21 GB；`max_reqs_hot_pool=54,427`。
+FP4 page/allocator/SWA/compressor/SSU 参数仍未测。
+
+`dsv41_vllm_bf16`（4096 B/token/rank 容量）：
+
+| churn | 命中率（条目/字节） | main H2D | index H2D | D2H | staging | mean load |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.05 | 97.34% / 97.35% | 1.8226 GB | 8.7242 GB | 0.0942 GB | 6.0503 GB | 19.26 µs |
+| 0.20 | 90.10% / 90.14% | 6.7725 GB | 8.7242 GB | 0.0942 GB | 6.0503 GB | 22.03 µs |
+| 0.50 | 75.46% / 75.56% | 16.7953 GB | 8.7242 GB | 0.0942 GB | 6.0503 GB | 27.66 µs |
+
+physical tokens = **19,520,242**；host = 450.53 GB；`max_reqs_hot_pool=19,044`；
+admission 1M 仍为 8533 blocks / 4.4737 GB。index H2D 在三个 churn 下相同，因为
+选中 entry 数不变；它仍是 selected-payload 下界，不是全候选扫描。
+
+#### 12.8.3 仍未验证
+
+§12.7.3 列出的真实 Top-K/hot-buffer/SSU 校准、C4/C128 独立池、candidate/filter
+路径、anchor/follower 事件、shared prefix 生命周期和 backup backpressure 仍未完成。
+§12.8.2 仍是合成 access model 的敏感性结果，不能当作真实模型命中率或实测 TPOT。

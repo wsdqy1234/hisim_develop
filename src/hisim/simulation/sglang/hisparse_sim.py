@@ -20,7 +20,8 @@ The implemented hierarchy is:
   Selection cadence is independent of compression and backup cadence.  Misses
   are copied host->device on the critical path; hits can still read index
   payload.  The regular hot slots use hit-to-MRU LRU, and the newest token has
-  a separate reserved slot outside that LRU.
+  a separate reserved slot outside that LRU.  When that page ages, it enters the
+  regular LRU without an H2D transfer, so direct-short replay has no main-KV IO.
 * Prefill KV is staged device->host once.  Reused prefix tokens are not staged
   again.  Each newly decoded compressed entry is eagerly backed up device->host
   on a side stream (hidden from the critical path by default, but the bytes and
@@ -485,6 +486,50 @@ def physical_pool_tokens_for_budget(
     return max(1, int(remaining // capacity_per_token))
 
 
+def hot_pool_geometry_for_budget(
+    profile: KVProfile,
+    budget_bytes: float,
+    requested_reqs: int,
+    padded_buffer_size: int,
+    tp_size: int = 1,
+) -> Tuple[int, int]:
+    """Return ``(physical_tokens, max_reqs)`` for one HBM budget.
+
+    The number of request-overhead reservations and the physical-token count
+    depend on each other: the hot-pool concurrency cap limits how many requests
+    can actually run, while each running request consumes SWA/compressor bytes.
+    Resolve that fixed point so the final ``max_reqs`` is the one used by the
+    simulator and by ``HiSparseSimulator.hbm_kv_bytes``.
+    """
+    requested = max(1, int(requested_reqs))
+    padded = max(1, int(padded_buffer_size))
+
+    def fits(reqs: int) -> bool:
+        tokens = physical_pool_tokens_for_budget(
+            profile, budget_bytes, reqs, tp_size=tp_size
+        )
+        return reqs <= max(1, tokens // padded)
+
+    # Lower concurrency frees request overhead and can only increase the number
+    # of hot-pool buffers, so feasibility is monotone.  Find the largest
+    # concurrency not exceeding the requested cap instead of stopping at the
+    # first clamp; otherwise a clamped value can waste budget and understate the
+    # final scheduler limit.
+    lo, hi = 1, requested
+    best = 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if fits(mid):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    physical_tokens = physical_pool_tokens_for_budget(
+        profile, budget_bytes, best, tp_size=tp_size
+    )
+    return physical_tokens, best
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -749,6 +794,11 @@ class _WorkingSet:
         self.prev_seq_len = 0
         self.prev_recent_start = 0
         self.prev_n = 0
+        # The previous step's newest page.  Its data is already in HBM, so when
+        # it ages out of the reserved page it must enter the regular LRU without
+        # an H2D transfer.  This also gives the direct-short path a zero-IO
+        # history as long as the whole sequence fits the device buffer.
+        self.prev_newest: Optional[int] = None
 
     def _recent_count(self, n: int) -> int:
         if n <= 0 or self.recent_ratio <= 0:
@@ -759,7 +809,9 @@ class _WorkingSet:
 
     def _window(self, seq_len: int) -> Tuple[int, int, int]:
         n = min(self.top_k, seq_len)
-        n_recent = self._recent_count(n)
+        # ``recency`` means the most recent top_k positions, independent of the
+        # sticky model's recent-window ratio.
+        n_recent = n if self.access_model == "recency" else self._recent_count(n)
         recent_start = seq_len - n_recent
         return n, n_recent, recent_start
 
@@ -846,10 +898,26 @@ class _WorkingSet:
                 continue
 
     def _access_selected(self, selected: set, seq_len: int) -> Tuple[int, int]:
-        """Resolve one selected set against the regular LRU + newest page."""
+        """Resolve one selected set against the regular LRU + newest page.
+
+        The swap kernel moves the current hits to MRU and inserts misses before
+        the hit block.  The previous newest page is already resident in HBM; when
+        it ages, insert it into the regular LRU without charging an H2D miss.
+        """
         hits = 0
         misses = 0
         newest = seq_len - 1
+        if (
+            self.newest_page
+            and self.prev_newest is not None
+            and self.prev_newest >= 0
+            and self.prev_newest != newest
+            and self.prev_newest not in self.hot
+        ):
+            self.hot[self.prev_newest] = None
+
+        hit_positions: List[int] = []
+        miss_positions: List[int] = []
         for pos in sorted(selected):
             if self.newest_page and pos == newest:
                 # The newest token lives in the reserved page, outside the
@@ -860,12 +928,27 @@ class _WorkingSet:
                 continue
             if pos in self.hot:
                 hits += 1
-                self.hot.move_to_end(pos)
+                hit_positions.append(pos)
             else:
                 misses += 1
-                self.hot[pos] = None
+                miss_positions.append(pos)
+
+        for pos in hit_positions:
+            self.hot.move_to_end(pos)
+        if miss_positions:
+            # Keep misses just below the hit block, matching hit-to-MRU +
+            # miss-insert-before-hits rather than token-position ordering.
+            insert_at = max(0, len(self.hot) - len(hit_positions))
+            items = list(self.hot.items())
+            self.hot = OrderedDict(
+                items[:insert_at]
+                + [(pos, None) for pos in miss_positions]
+                + items[insert_at:]
+            )
         while len(self.hot) > self.capacity:
             self.hot.popitem(last=False)
+        if self.newest_page and newest >= 0:
+            self.prev_newest = newest
         return hits, misses
 
     def _advance_sticky(self, seq_len: int) -> Tuple[int, int, int]:
@@ -1309,7 +1392,10 @@ class HiSparseSimulator:
             for (ratio, entry_bytes), (_, main_bytes, index_bytes) in zip(
                 self.io_groups, self.io_channel_groups
             ):
-                full_comp = (prompt_len + ratio - 1) // ratio
+                # Compression emits only complete entries.  Using ceil here
+                # would stage a partial final entry and then charge it again as
+                # a new D2H entry when the next token completes it.
+                full_comp = prompt_len // ratio
                 prefix_comp = prefix_len // ratio
                 stage_comp = max(0, full_comp - prefix_comp)
                 staged += stage_comp * entry_bytes
@@ -1319,6 +1405,9 @@ class HiSparseSimulator:
                         entry_bytes=entry_bytes,
                         main_entry_bytes=main_bytes,
                         index_entry_bytes=index_bytes,
+                        # Every complete prompt entry up to here is already in
+                        # the host pool (freshly staged or a reused prefix).
+                        prev_comp_len=full_comp,
                         working=_WorkingSet(
                             top_k=self.config.top_k,
                             capacity=self.config.device_buffer_size,
@@ -1443,7 +1532,7 @@ class HiSparseSimulator:
         are intentionally separate.  A new query can select a different Top-K
         even when no new compressed entry was produced.
         """
-        past_len = max(1, int(past_len))
+        past_len = max(0, int(past_len))
         hits = misses = h2d = d2h = 0
         main_h2d = index_h2d = 0
         main_d2h = index_d2h = 0
@@ -1451,34 +1540,29 @@ class HiSparseSimulator:
         new_entries = 0
         for group in state.groups:
             ratio = group.ratio
-            comp_len = max(1, past_len // ratio)
+            comp_len = past_len // ratio
+            # Entries up to prev_comp_len are already staged.  The first hook
+            # decode can legitimately report past_len=P+1 (prompt plus the first
+            # generated token), in which case that new completed entry still
+            # needs its one D2H backup on this first step.
+            new = max(0, comp_len - group.prev_comp_len)
             ws = group.working
             if ws.sticky is None:
                 gh, gm = ws.first_step(comp_len)
-                new = 0  # prompt entries were already staged
+            elif self.config.selection_cadence == "every_step" or new > 0:
+                gh, gm = ws.step(comp_len)
             else:
-                new = max(0, comp_len - group.prev_comp_len)
-                if (
-                    self.config.selection_cadence == "every_step"
-                    or new > 0
-                ):
-                    gh, gm = ws.step(comp_len)
-                else:
-                    # Explicit sensitivity mode: hold the selected set between
-                    # compression boundaries.  Not the default semantics.
-                    gh, gm = min(ws.top_k, comp_len), 0
+                # Explicit sensitivity mode: hold the selected set between
+                # compression boundaries.  Not the default semantics.
+                gh, gm = min(ws.top_k, comp_len), 0
             group.prev_comp_len = comp_len
 
             group_main_h2d = int(gm * group.main_entry_bytes)
             index_reads = gh + gm if self.config.index_read_on_hit else gm
             group_index_h2d = int(index_reads * group.index_entry_bytes)
             group_h2d = group_main_h2d + group_index_h2d
-            group_main_d2h = (
-                int(new * group.main_entry_bytes) if state.steps > 0 else 0
-            )
-            group_index_d2h = (
-                int(new * group.index_entry_bytes) if state.steps > 0 else 0
-            )
+            group_main_d2h = int(new * group.main_entry_bytes)
+            group_index_d2h = int(new * group.index_entry_bytes)
             group_d2h = group_main_d2h + group_index_d2h
             group_hit_bytes = gh * group.entry_bytes
             group_miss_bytes = gm * group.entry_bytes
@@ -1491,7 +1575,7 @@ class HiSparseSimulator:
             group.index_h2d_bytes += group_index_h2d
             group.main_d2h_bytes += group_main_d2h
             group.index_d2h_bytes += group_index_d2h
-            group.new_entries += new if state.steps > 0 else 0
+            group.new_entries += new
 
             hits += gh
             misses += gm
@@ -1503,7 +1587,7 @@ class HiSparseSimulator:
             index_d2h += group_index_d2h
             hit_bytes += group_hit_bytes
             miss_bytes += group_miss_bytes
-            new_entries += new if state.steps > 0 else 0
+            new_entries += new
             self.h2d_bytes_by_ratio[ratio] = (
                 self.h2d_bytes_by_ratio.get(ratio, 0) + group_h2d
             )

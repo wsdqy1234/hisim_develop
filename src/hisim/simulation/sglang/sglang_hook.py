@@ -44,14 +44,61 @@ from hisim.simulation.sglang.version import VersionDispatcher
 from hisim.simulation.sglang.hisparse_sim import (
     HiSparseSimulator,
     KVProfile,
+    hot_pool_geometry_for_budget,
     load_hisparse_config,
     model_info_kv_geometry,
-    physical_pool_tokens_for_budget,
     profile_tp_scale,
 )
 
 
 logger = get_logger("hisim")
+
+
+def _requested_reqs_for_profile(server_args, profile, fallback: int) -> int:
+    """Resolve the per-worker request cap used by the HiSparse hot pool."""
+    requested = getattr(server_args, "max_running_requests", None)
+    if (
+        isinstance(requested, bool)
+        or not isinstance(requested, (int, float))
+        or requested <= 0
+        or requested > 1_000_000
+    ):
+        requested = None
+    if requested is not None:
+        requested = max(1, int(requested))
+        if getattr(server_args, "enable_dp_attention", False):
+            requested = max(1, requested // max(1, int(server_args.dp_size)))
+    return int(
+        requested
+        or getattr(profile, "deployment_max_num_reqs", 0)
+        or max(1, int(fallback))
+    )
+
+
+def _request_prompt_len(req) -> int:
+    """Full prompt length before prefix reuse, for prefill staging."""
+    token_ids = getattr(req, "origin_input_ids", None)
+    if token_ids is None:
+        token_ids = getattr(req, "input_ids", None)
+    return 0 if token_ids is None else len(token_ids)
+
+
+def _start_hisparse_request(req) -> None:
+    """Start request accounting after radix matching has filled prefix_ids."""
+    sim = HiSparseSimulator.instance()
+    if sim is None:
+        return
+    # OFFLINE warm-up requests are removed from REQUEST_STATS; keep them out of
+    # the host pool and staging accounting as well.
+    if req.rid not in C_SchedulerHook.REQUEST_STATS:
+        return
+    prefix_indices = getattr(req, "prefix_indices", None)
+    sim.on_request_start(
+        req.rid,
+        _request_prompt_len(req),
+        # sglang stores this as a torch.Tensor; never coerce it via truthiness.
+        prefix_len=0 if prefix_indices is None else len(prefix_indices),
+    )
 
 
 def _req_is_finished(req) -> bool:
@@ -318,45 +365,40 @@ class C_ModelRunnerHook(BaseHook):
                 tp_size = getattr(config, "tp_size", 1)
                 profile = KVProfile.from_value(hisparse_cfg.kv_profile)
                 sim_max_reqs = max_num_reqs
-                if profile is not None and self.server_args.max_total_tokens is None:
-                    # The legacy capacity was sized with the model's native KV
-                    # geometry.  Reuse that byte budget, then size the hot pool
-                    # with the profile's allocator/capacity slope so replay and
-                    # analytic sweep use the same denominator.
-                    budget_bytes = (
-                        float(physical_tokens) * kv_num_layers * kv_bytes_per_layer
+                if profile is not None:
+                    # Resolve the server's global cap to this worker first.  The
+                    # scheduler later divides the same server value by dp_size.
+                    sim_max_reqs = _requested_reqs_for_profile(
+                        self.server_args, profile, max_num_reqs
                     )
-                    requested_reqs = getattr(
-                        self.server_args, "max_running_requests", None
-                    )
-                    if (
-                        not isinstance(requested_reqs, (int, float))
-                        or requested_reqs <= 0
-                        or requested_reqs > 1_000_000
-                    ):
-                        requested_reqs = None
-                    requested_reqs = (
-                        requested_reqs
-                        or profile.deployment_max_num_reqs
-                        or max_num_reqs
-                    )
-                    sim_max_reqs = max(1, int(requested_reqs))
-                    physical_tokens = physical_pool_tokens_for_budget(
-                        profile,
-                        budget_bytes,
-                        sim_max_reqs,
-                        tp_size=tp_size,
-                    )
-                    logger.info(
-                        "HiSparse profile %s: budget=%.2fGB, capacity=%.1f B/token, "
-                        "physical_tokens=%d, requested_reqs=%d",
-                        profile.name,
-                        budget_bytes / 1e9,
-                        profile.capacity_bytes_per_token
-                        * profile_tp_scale(profile, tp_size),
-                        physical_tokens,
-                        sim_max_reqs,
-                    )
+                    if self.server_args.max_total_tokens is None:
+                        # The legacy capacity was sized with the model's native
+                        # KV geometry.  Reuse that byte budget, then solve for
+                        # the hot-pool token count and request cap together so
+                        # the final concurrency is the one whose SWA/compressor
+                        # overhead was reserved.
+                        budget_bytes = (
+                            float(physical_tokens)
+                            * kv_num_layers
+                            * kv_bytes_per_layer
+                        )
+                        physical_tokens, sim_max_reqs = hot_pool_geometry_for_budget(
+                            profile,
+                            budget_bytes,
+                            sim_max_reqs,
+                            hisparse_cfg.padded_buffer_size,
+                            tp_size=tp_size,
+                        )
+                        logger.info(
+                            "HiSparse profile %s: budget=%.2fGB, capacity=%.1f B/token, "
+                            "physical_tokens=%d, requested_reqs=%d",
+                            profile.name,
+                            budget_bytes / 1e9,
+                            profile.capacity_bytes_per_token
+                            * profile_tp_scale(profile, tp_size),
+                            physical_tokens,
+                            sim_max_reqs,
+                        )
                 sim = HiSparseSimulator.configure(
                     hisparse_cfg,
                     num_layers=self.num_effective_layers,
@@ -475,18 +517,15 @@ class C_ModelRunnerHook(BaseHook):
                     max_total_num_tokens=self.max_total_num_tokens
                 )
 
-            self.max_running_requests = min(
-                (
-                    self.max_total_num_tokens // 2
-                    if self.server_args.max_running_requests is None
-                    else self.server_args.max_running_requests
-                    // (
-                        self.server_args.dp_size
-                        if self.server_args.enable_dp_attention
-                        else 1
-                    )
-                ),
-                self.req_to_token_pool.size,
+            requested_max_running = self.server_args.max_running_requests
+            if requested_max_running is None:
+                requested_max_running = self.max_total_num_tokens // 2
+            elif self.server_args.enable_dp_attention:
+                requested_max_running = max(
+                    1, requested_max_running // max(1, self.server_args.dp_size)
+                )
+            self.max_running_requests = max(
+                1, min(requested_max_running, self.req_to_token_pool.size)
             )
 
             return
@@ -1880,16 +1919,6 @@ class C_SchedulerHook(BaseHook):
                 StateManager.set_global_clock(queue_start)
             req_stats.queue_start = StateManager.get_global_clock()
 
-        # HiSparse: the prompt KV is staged to the host pool when the request
-        # is admitted for prefill.
-        _hisparse_sim = HiSparseSimulator.instance()
-        if _hisparse_sim is not None:
-            _hisparse_sim.on_request_start(
-                req.rid,
-                len(req.input_ids) + len(getattr(req, "output_ids", []) or []),
-                prefix_len=len(getattr(req, "prefix_indices", ()) or ()),
-            )
-
     @classmethod
     def _offline_collect_and_release(cls, scheduler, recv_reqs, dispatch):
         """OFFLINE-mode buffering for sglang >= 0.5.10.
@@ -2369,6 +2398,10 @@ class C_SchedulerHook(BaseHook):
             now = time.time()
             if new_batch is not None:
                 for req in new_batch.reqs:
+                    # radix matching and prefix_indices are now populated.  The
+                    # tokenized request object seen before the dispatcher has no
+                    # prefix information yet.
+                    _start_hisparse_request(req)
                     req_stats = C_SchedulerHook.REQUEST_STATS[req.rid]
                     req_stats.final_reused_tokens = req.cached_tokens
                     if req_stats.queue_end == -1:

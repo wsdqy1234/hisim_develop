@@ -10,8 +10,10 @@ emits a new compressed entry every two decode steps.
 import math
 import random
 from collections import OrderedDict
+from types import SimpleNamespace
 
 import pytest
+import torch
 
 from hisim.simulation.sglang.hisparse_sim import (
     DSV41_FP4_PROFILE,
@@ -21,6 +23,7 @@ from hisim.simulation.sglang.hisparse_sim import (
     HiSparseSimulator,
     KVProfile,
     _WorkingSet,
+    hot_pool_geometry_for_budget,
     physical_pool_tokens_for_budget,
 )
 
@@ -155,6 +158,49 @@ def test_bf16_physical_pool_uses_allocator_slope():
     assert tokens < int((80e9 - swa - compressor) // 2885)
 
 
+def test_hot_pool_geometry_resolves_request_clamp_and_overhead():
+    p = DSV41_VLLM_BF16_PROFILE
+    budget = 64 * 1024 * 1024
+    tokens, reqs = hot_pool_geometry_for_budget(
+        p, budget, requested_reqs=8, padded_buffer_size=1025, tp_size=8
+    )
+    assert reqs == 6
+    assert tokens == 8128
+    cfg = _dsv41_config(kv_profile="dsv41_vllm_bf16")
+    sim = _make_sim(
+        cfg,
+        physical_tokens=tokens,
+        tp_size=8,
+        max_num_reqs=reqs,
+    )
+    assert sim.max_num_reqs == reqs
+    assert sim.hbm_kv_bytes == pytest.approx(budget)
+
+
+def test_requested_reqs_are_per_dp_worker():
+    from hisim.simulation.sglang.sglang_hook import _requested_reqs_for_profile
+
+    p = DSV41_VLLM_BF16_PROFILE
+    dp8 = SimpleNamespace(
+        max_running_requests=64,
+        enable_dp_attention=True,
+        dp_size=8,
+    )
+    assert _requested_reqs_for_profile(dp8, p, fallback=4096) == 8
+    no_dp = SimpleNamespace(
+        max_running_requests=64,
+        enable_dp_attention=False,
+        dp_size=8,
+    )
+    assert _requested_reqs_for_profile(no_dp, p, fallback=4096) == 64
+    default = SimpleNamespace(
+        max_running_requests=None,
+        enable_dp_attention=True,
+        dp_size=8,
+    )
+    assert _requested_reqs_for_profile(default, p, fallback=4096) == 8
+
+
 def test_prompt_staging_matches_bytes_per_token():
     sim = _make_sim()
     sim.on_request_start("r0", 1024)
@@ -174,6 +220,77 @@ def test_prompt_staging_subtracts_reused_prefix():
     sim.on_decode_step("r0", 1024)
     assert groups[1].working.prev_seq_len == 1024
     assert groups[2].working.prev_seq_len == 512
+
+
+def test_odd_prompt_staging_uses_floor_compression():
+    profile = KVProfile(
+        name="ratio2-floor",
+        offload_bytes_per_token=10.0,
+        source_layer_ratios=(2,),
+        index_topk=4,
+    )
+    cfg = _dsv41_config(
+        kv_profile=profile,
+        top_k=4,
+        device_buffer_size=8,
+    )
+    sim = _make_sim(cfg, physical_tokens=10_000)
+    sim.on_request_start("r0", 65)
+    assert sim.staging_bytes == 32 * 20
+    assert sim.on_decode_step("r0", 65).d2h_bytes == 0
+    # Entry 32 completes now and is backed up exactly once.
+    assert sim.on_decode_step("r0", 66).d2h_bytes == 20
+    assert sim.staging_bytes + sim.d2h_bytes == 66 * 10
+
+    # The hook can report past_len=P+1 on the first decode after prefill.  That
+    # completed entry must be backed up immediately instead of being mistaken
+    # for part of the staged prompt.
+    hook_like = _make_sim(cfg, physical_tokens=10_000)
+    hook_like.on_request_start("r2", 65)
+    assert hook_like.on_decode_step("r2", 66).d2h_bytes == 20
+    assert hook_like.staging_bytes + hook_like.d2h_bytes == 66 * 10
+
+    # A ratio-2 group below one full entry has no candidate at all; it must not
+    # invent position -1 as a newest page.
+    tiny = _make_sim(cfg, physical_tokens=10_000)
+    tiny.on_request_start("r1", 1)
+    assert tiny.staging_bytes == 0
+    assert tiny.on_decode_step("r1", 1).h2d_bytes == 0
+    assert tiny.on_decode_step("r1", 2).d2h_bytes == 20
+    assert -1 not in tiny.requests["r1"].groups[0].working.hot
+
+
+def test_hook_request_start_uses_resolved_prefix(monkeypatch):
+    from hisim.simulation.sglang.sglang_hook import (
+        C_SchedulerHook,
+        _start_hisparse_request,
+    )
+
+    sim = _make_sim()
+    monkeypatch.setattr(HiSparseSimulator, "_instance", sim)
+    monkeypatch.setitem(C_SchedulerHook.REQUEST_STATS, "prefix-r", None)
+    req = SimpleNamespace(
+        rid="prefix-r",
+        origin_input_ids=list(range(1024)),
+        # Req.prefix_indices is a Tensor in sglang; truthiness must not be used.
+        prefix_indices=torch.arange(512, dtype=torch.int64),
+    )
+    _start_hisparse_request(req)
+    assert sim.staging_bytes == int(512 * 890.0)
+    assert sim.cur_host_tokens == 512
+    assert sim.prefix_reused_tokens == 512
+
+    empty = _make_sim()
+    monkeypatch.setattr(HiSparseSimulator, "_instance", empty)
+    monkeypatch.setitem(C_SchedulerHook.REQUEST_STATS, "empty-r", None)
+    empty_req = SimpleNamespace(
+        rid="empty-r",
+        origin_input_ids=list(range(1024)),
+        prefix_indices=torch.empty(0, dtype=torch.int64),
+    )
+    _start_hisparse_request(empty_req)
+    assert empty.staging_bytes == int(1024 * 890.0)
+    assert empty.prefix_reused_tokens == 0
 
 
 def test_tp_scaling_divides_profile_bytes():
@@ -217,8 +334,11 @@ def test_compressed_working_set_cadence():
 
     # First decode step seeds both groups; the next 9 steps are counted.
     # Compression uses floor(past_len / ratio): ratio 1 emits every step,
-    # ratio 2 emits at 66, 68, 70 and 72.
-    assert sim.h2d_bytes > 0  # prior newest entries are no longer newest-page hits
+    # ratio 2 emits at 66, 68, 70 and 72.  The whole sequence is smaller than
+    # the device buffer, so the direct-short path has no main/index H2D and the
+    # previous newest page ages into the regular LRU for free.
+    assert sim.h2d_bytes == 0
+    assert sim.main_h2d_bytes == 0
     assert sim.d2h_bytes_by_ratio == {
         1: 9 * int(222.5),
         2: 4 * 1335,
@@ -379,6 +499,23 @@ def test_hot_buffer_seed_modes_and_newest_page():
     assert list(ws.hot) == [8]
 
 
+def test_direct_short_has_no_swap_in_and_ages_newest_for_free():
+    ws = _WorkingSet(
+        top_k=2,
+        capacity=4,
+        access_model="recency",
+        churn=0.0,
+        recent_ratio=1.0,
+        rng=random.Random(0),
+        hot_buffer_init="earliest",
+        lru_mode=True,
+        newest_page=True,
+    )
+    for seq_len in (2, 3, 4):
+        assert ws.step(seq_len) == (2, 0)
+    assert ws.prev_newest == 3
+
+
 def test_lru_hit_moves_to_mru():
     ws = _WorkingSet(
         top_k=4,
@@ -395,6 +532,42 @@ def test_lru_hit_moves_to_mru():
     hits, misses = ws._access_selected({0}, seq_len=10)
     assert (hits, misses) == (1, 0)
     assert list(ws.hot) == [1, 2, 3, 0]
+
+
+def test_lru_misses_are_inserted_before_hit_block():
+    ws = _WorkingSet(
+        top_k=2,
+        capacity=4,
+        access_model="sticky",
+        churn=0.0,
+        recent_ratio=0.0,
+        rng=random.Random(1),
+        hot_buffer_init="empty",
+        lru_mode=True,
+        newest_page=False,
+    )
+    ws.hot = OrderedDict((pos, None) for pos in (0, 1, 2, 3))
+    hits, misses = ws._access_selected({0, 4}, seq_len=10)
+    assert (hits, misses) == (1, 1)
+    # Miss 4 sits immediately below hit 0, not after it in token order.
+    assert list(ws.hot) == [2, 3, 4, 0]
+
+
+def test_recency_selects_most_recent_top_k():
+    ws = _WorkingSet(
+        top_k=8,
+        capacity=16,
+        access_model="recency",
+        churn=0.0,
+        recent_ratio=0.5,
+        rng=random.Random(1),
+        hot_buffer_init="latest",
+        lru_mode=True,
+        newest_page=True,
+    )
+    for seq_len in (100, 101):
+        hits, misses = ws.step(seq_len)
+        assert hits + misses == 8
 
 
 def test_recent_ratio_zero_has_no_implicit_recent_entry():

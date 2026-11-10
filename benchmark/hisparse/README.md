@@ -80,8 +80,11 @@ PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py bench --enable \
 
 profile 的动态 access model 默认每个 decode step 都重新选 Top-K
 （`selection_cadence=every_step`），即使压缩长度不变；`compression_boundary`
-只保留为敏感性对照。可用 `HISIM_HISPARSE_SELECTION_CADENCE`、
-`HISIM_HISPARSE_HOT_BUFFER_INIT`、`HISIM_HISPARSE_INDEX_READ_ON_HIT` 覆盖。
+只保留为敏感性对照。hook 在 prefill 的 radix matching 完成后才启动 staging，
+因此 `prefix_indices` 已可读；轮转的 newest page 老化不产生主 KV H2D；
+hot-pool 容量和请求 overhead 使用同一个 per-worker 并发口径。可用
+`HISIM_HISPARSE_SELECTION_CADENCE`、`HISIM_HISPARSE_HOT_BUFFER_INIT`、
+`HISIM_HISPARSE_INDEX_READ_ON_HIT` 覆盖。
 这些 profile 的字节布局属于 vLLM-Ascend/official 口径，不等于当前 sglang
 C4/C128 的逐字节实现；真实 Top-K/hot-buffer/SSU 校准前不要把命中率或绝对
 TPOT 当成实测预测。
