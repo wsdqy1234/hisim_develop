@@ -43,8 +43,11 @@ from hisim.simulation.utils import (
 from hisim.simulation.sglang.version import VersionDispatcher
 from hisim.simulation.sglang.hisparse_sim import (
     HiSparseSimulator,
+    KVProfile,
     load_hisparse_config,
     model_info_kv_geometry,
+    physical_pool_tokens_for_budget,
+    profile_tp_scale,
 )
 
 
@@ -307,19 +310,61 @@ class C_ModelRunnerHook(BaseHook):
                     kv_itemsize = _torch._utils._element_size(self.kv_cache_dtype)
                 except Exception:
                     kv_itemsize = 2
-                _, kv_bytes_per_layer = model_info_kv_geometry(
+                kv_num_layers, kv_bytes_per_layer = model_info_kv_geometry(
                     model,
                     tp_size=getattr(config, "tp_size", 1),
                     itemsize=kv_itemsize,
                 )
+                tp_size = getattr(config, "tp_size", 1)
+                profile = KVProfile.from_value(hisparse_cfg.kv_profile)
+                sim_max_reqs = max_num_reqs
+                if profile is not None and self.server_args.max_total_tokens is None:
+                    # The legacy capacity was sized with the model's native KV
+                    # geometry.  Reuse that byte budget, then size the hot pool
+                    # with the profile's allocator/capacity slope so replay and
+                    # analytic sweep use the same denominator.
+                    budget_bytes = (
+                        float(physical_tokens) * kv_num_layers * kv_bytes_per_layer
+                    )
+                    requested_reqs = getattr(
+                        self.server_args, "max_running_requests", None
+                    )
+                    if (
+                        not isinstance(requested_reqs, (int, float))
+                        or requested_reqs <= 0
+                        or requested_reqs > 1_000_000
+                    ):
+                        requested_reqs = None
+                    requested_reqs = (
+                        requested_reqs
+                        or profile.deployment_max_num_reqs
+                        or max_num_reqs
+                    )
+                    sim_max_reqs = max(1, int(requested_reqs))
+                    physical_tokens = physical_pool_tokens_for_budget(
+                        profile,
+                        budget_bytes,
+                        sim_max_reqs,
+                        tp_size=tp_size,
+                    )
+                    logger.info(
+                        "HiSparse profile %s: budget=%.2fGB, capacity=%.1f B/token, "
+                        "physical_tokens=%d, requested_reqs=%d",
+                        profile.name,
+                        budget_bytes / 1e9,
+                        profile.capacity_bytes_per_token
+                        * profile_tp_scale(profile, tp_size),
+                        physical_tokens,
+                        sim_max_reqs,
+                    )
                 sim = HiSparseSimulator.configure(
                     hisparse_cfg,
                     num_layers=self.num_effective_layers,
                     bytes_per_token_per_layer=kv_bytes_per_layer,
                     physical_pool_tokens=physical_tokens,
                     page_size=self.page_size,
-                    max_num_reqs=max_num_reqs,
-                    tp_size=getattr(config, "tp_size", 1),
+                    max_num_reqs=sim_max_reqs,
+                    tp_size=tp_size,
                 )
                 logical_tokens = sim.logical_pool_tokens
                 self.max_total_num_tokens = logical_tokens
@@ -1842,6 +1887,7 @@ class C_SchedulerHook(BaseHook):
             _hisparse_sim.on_request_start(
                 req.rid,
                 len(req.input_ids) + len(getattr(req, "output_ids", []) or []),
+                prefix_len=len(getattr(req, "prefix_indices", ()) or ()),
             )
 
     @classmethod

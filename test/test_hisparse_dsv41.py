@@ -8,6 +8,8 @@ emits a new compressed entry every two decode steps.
 """
 
 import math
+import random
+from collections import OrderedDict
 
 import pytest
 
@@ -18,6 +20,8 @@ from hisim.simulation.sglang.hisparse_sim import (
     HiSparseSimConfig,
     HiSparseSimulator,
     KVProfile,
+    _WorkingSet,
+    physical_pool_tokens_for_budget,
 )
 
 
@@ -138,11 +142,38 @@ def test_l0_128k_context_is_megabytes_not_gigabytes():
     assert sim.physical_pool_tokens * 890.0 < 20e6
 
 
+def test_bf16_physical_pool_uses_allocator_slope():
+    p = DSV41_VLLM_BF16_PROFILE
+    swa = 8 * p.swa_window_tokens * p.swa_bytes_per_token
+    compressor = 8 * p.compressor_bytes_per_request
+    tokens = physical_pool_tokens_for_budget(
+        p, 80e9, max_num_reqs=8, tp_size=8
+    )
+    assert tokens == int((80e9 - swa - compressor) // 4096)
+    assert tokens == 19_520_242
+    # The old payload denominator would have produced 27,714,007 tokens.
+    assert tokens < int((80e9 - swa - compressor) // 2885)
+
+
 def test_prompt_staging_matches_bytes_per_token():
     sim = _make_sim()
     sim.on_request_start("r0", 1024)
     # ratio-2: 512 entries * 1335 B; ratio-1: 1024 entries * 222.5 B.
     assert sim.staging_bytes == int(1024 * 890.0)
+
+
+def test_prompt_staging_subtracts_reused_prefix():
+    sim = _make_sim()
+    sim.on_request_start("r0", 1024, prefix_len=512)
+    assert sim.staging_bytes == int(512 * 890.0)
+    assert sim.cur_host_tokens == 512
+    assert sim.prefix_reused_tokens == 512
+    # The full prompt still determines the initial compressed candidate count.
+    groups = {g.ratio: g for g in sim.requests["r0"].groups}
+    assert groups[1].working.prev_seq_len == 0
+    sim.on_decode_step("r0", 1024)
+    assert groups[1].working.prev_seq_len == 1024
+    assert groups[2].working.prev_seq_len == 512
 
 
 def test_tp_scaling_divides_profile_bytes():
@@ -185,17 +216,18 @@ def test_compressed_working_set_cadence():
         sim.on_decode_step("r0", prompt + step)
 
     # First decode step seeds both groups; the next 9 steps are counted.
-    # ratio 1 emits an entry every step, ratio 2 every other step.
-    assert sim.h2d_bytes == 0  # buffer (1025) holds both compressed prompts
+    # Compression uses floor(past_len / ratio): ratio 1 emits every step,
+    # ratio 2 emits at 66, 68, 70 and 72.
+    assert sim.h2d_bytes > 0  # prior newest entries are no longer newest-page hits
     assert sim.d2h_bytes_by_ratio == {
         1: 9 * int(222.5),
-        2: 5 * 1335,
+        2: 4 * 1335,
     }
-    assert sim.new_compressed_entries == 9 + 5
+    assert sim.new_compressed_entries == 9 + 4
 
     groups = {g.ratio: g for g in sim.requests["r0"].groups}
     assert groups[1].prev_comp_len == prompt + 9
-    assert groups[2].prev_comp_len == math.ceil((prompt + 9) / 2)
+    assert groups[2].prev_comp_len == (prompt + 9) // 2
 
 
 def test_top_k_is_selected_on_compressed_positions():
@@ -204,27 +236,51 @@ def test_top_k_is_selected_on_compressed_positions():
     sim.on_request_start("r0", prompt)
     sim.on_decode_step("r0", prompt)
     group = {g.ratio: g for g in sim.requests["r0"].groups}[2]
-    # ratio-2 candidates: ceil(4096 / 2) = 2048; top_k is still 512.
+    # ratio-2 candidates: floor(4096 / 2) = 2048; top_k is still 512.
     assert group.working.prev_seq_len == 2048
     assert group.working.prev_n == 512
     assert sim.config.top_k == 512
 
 
-def test_cadence_does_not_churn_on_non_advance_steps():
-    # churn=1.0 would force misses every call; the ratio-2 group must not be
-    # stepped on odd tokens, so its hit count stays flat there.
-    sim = _make_sim(_dsv41_config(churn=1.0), physical_tokens=10_000)
-    prompt = 513
+def test_selection_can_change_when_compression_len_is_unchanged():
+    cfg = _dsv41_config(
+        churn=1.0,
+        top_k=64,
+        device_buffer_size=64,
+        selection_cadence="every_step",
+    )
+    sim = _make_sim(cfg, physical_tokens=10_000)
+    prompt = 4096
     sim.on_request_start("r0", prompt)
-    sim.on_decode_step("r0", prompt)  # ratio-2 comp_len = 257
+    sim.on_decode_step("r0", prompt)
     group = {g.ratio: g for g in sim.requests["r0"].groups}[2]
     before = group.working.prev_seq_len
     before_d2h = group.d2h_bytes
-    cost = sim.on_decode_step("r0", prompt + 1)  # ratio-2 comp_len unchanged
+    cost = sim.on_decode_step("r0", prompt + 1)  # floor(4097/2) unchanged
     assert group.working.prev_seq_len == before
     assert group.d2h_bytes == before_d2h
-    assert cost.misses == 0
-    assert cost.h2d_bytes == 0
+    # The query changed even though no compressed entry was produced.
+    assert cost.misses > 0
+    assert cost.h2d_bytes > 0
+
+
+def test_compression_boundary_cadence_is_explicit_sensitivity_mode():
+    cfg = _dsv41_config(
+        churn=1.0,
+        top_k=64,
+        device_buffer_size=64,
+        selection_cadence="compression_boundary",
+    )
+    sim = _make_sim(cfg, physical_tokens=10_000)
+    prompt = 4096
+    sim.on_request_start("r0", prompt)
+    sim.on_decode_step("r0", prompt)
+    group = {g.ratio: g for g in sim.requests["r0"].groups}[2]
+    before = group.working.prev_seq_len
+    before_misses = group.misses
+    sim.on_decode_step("r0", prompt + 1)
+    assert group.working.prev_seq_len == before
+    assert group.misses == before_misses
 
 
 def test_h2d_bytes_are_charged_per_compressed_entry():
@@ -241,12 +297,13 @@ def test_h2d_bytes_are_charged_per_compressed_entry():
     groups = {g.ratio: g for g in sim.requests["r0"].groups}
     assert groups[1].misses > 0 and groups[2].misses > 0
     expected = sum(int(g.misses * g.entry_bytes) for g in groups.values())
+    expected_bytes = sum(g.misses * g.entry_bytes for g in groups.values())
     assert sim.h2d_bytes == expected
     assert sim.h2d_bytes_by_ratio == {
         1: int(groups[1].misses * 222.5),
         2: int(groups[2].misses * 1335.0),
     }
-    assert sim.misses_bytes == expected
+    assert sim.misses_bytes == pytest.approx(expected_bytes)
 
 
 def test_hit_rate_is_byte_weighted():
@@ -264,6 +321,94 @@ def test_hit_rate_is_byte_weighted():
     assert metrics["hisparse_profile_num_layers"] == 40
 
 
+def test_churn_one_does_not_reselect_dropped_positions():
+    ws = _WorkingSet(
+        top_k=64,
+        capacity=64,
+        access_model="sticky",
+        churn=1.0,
+        recent_ratio=0.5,
+        rng=random.Random(7),
+        hot_buffer_init="earliest",
+        lru_mode=True,
+        newest_page=True,
+    )
+    ws.first_step(4096)
+    before = set(ws.sticky)
+    ws.step(4097)
+    after = set(ws.sticky)
+    assert before and after
+    assert before.isdisjoint(after)
+
+
+def test_hot_buffer_seed_modes_and_newest_page():
+    def seeded(mode):
+        ws = _WorkingSet(
+            top_k=4,
+            capacity=4,
+            access_model="sticky",
+            churn=0.0,
+            recent_ratio=0.5,
+            rng=random.Random(1),
+            hot_buffer_init=mode,
+            lru_mode=True,
+            newest_page=True,
+        )
+        ws._seed_hot_buffer(10)
+        return list(ws.hot)
+
+    assert seeded("earliest") == [0, 1, 2, 3]
+    assert seeded("latest") == [6, 7, 8, 9]
+    assert seeded("empty") == []
+    # The newest entry is served by its reserved page, not the regular LRU.
+    ws = _WorkingSet(
+        top_k=2,
+        capacity=4,
+        access_model="recency",
+        churn=0.0,
+        recent_ratio=1.0,
+        rng=random.Random(1),
+        hot_buffer_init="empty",
+        lru_mode=True,
+        newest_page=True,
+    )
+    hits, misses = ws.first_step(10)
+    assert hits == 1
+    assert misses == 1
+    # Position 8 was loaded; position 9 is represented by the newest page.
+    assert list(ws.hot) == [8]
+
+
+def test_lru_hit_moves_to_mru():
+    ws = _WorkingSet(
+        top_k=4,
+        capacity=4,
+        access_model="sticky",
+        churn=0.0,
+        recent_ratio=0.5,
+        rng=random.Random(1),
+        hot_buffer_init="empty",
+        lru_mode=True,
+        newest_page=False,
+    )
+    ws.hot = OrderedDict((pos, None) for pos in (0, 1, 2, 3))
+    hits, misses = ws._access_selected({0}, seq_len=10)
+    assert (hits, misses) == (1, 0)
+    assert list(ws.hot) == [1, 2, 3, 0]
+
+
+def test_recent_ratio_zero_has_no_implicit_recent_entry():
+    ws = _WorkingSet(
+        top_k=8,
+        capacity=8,
+        access_model="sticky",
+        churn=0.0,
+        recent_ratio=0.0,
+        rng=random.Random(1),
+    )
+    assert ws._recent_count(8) == 0
+
+
 # ---------------------------------------------------------------------------
 # L2: .22 vLLM-Ascend BF16 measured layout
 # ---------------------------------------------------------------------------
@@ -276,12 +421,20 @@ def test_vllm_bf16_profile_geometry():
     assert profile.source_layer_ids == (2, 8, 14, 20)
     assert profile.source_layer_bytes_per_token == (577.0, 577.0, 577.0, 1154.0)
     assert profile.source_layer_bytes_sum == 2885.0
+    assert sum(profile.source_layer_main_kv_bytes_per_token) == 2560.0
+    assert sum(profile.source_layer_index_bytes_per_token) == 325.0
     # ratio-2 group: 3 * 577 * 2; ratio-1 group: 1154.
     assert profile.io_groups() == [(1, 1154.0), (2, 3462.0)]
+    assert profile.io_channel_groups() == [
+        (1, 1024.0, 130.0),
+        (2, 3072.0, 390.0),
+    ]
     assert profile.main_kv_bytes_per_token == 2560.0
     assert profile.index_bytes_per_token == 325.0
     # The index is embedded in 2885, so there is no separate HBM indexer.
     assert profile.indexer_bytes_per_token == 0.0
+    # Capacity uses the allocator slope, not the 2885 payload.
+    assert profile.capacity_bytes_per_token == 4096.0
     assert profile.scheduler_block_tokens == 128
     assert profile.page_bytes == 131072
     assert profile.slot_count == 4
@@ -348,11 +501,12 @@ def test_vllm_bf16_bytes_are_per_rank_not_divided_by_tp(tp_size):
     assert sim.hbm_swa_bytes == pytest.approx(8 * 128 * 40960.0)
     assert sim.hbm_compressor_bytes == pytest.approx(8 * 393216.0)
     expected_hbm = (
-        20_000 * 2885.0
+        20_000 * 4096.0
         + 8 * 128 * 40960.0
         + 8 * 393216.0
     )
     assert sim.hbm_kv_bytes == pytest.approx(expected_hbm)
+    # Host stores the 2885 payload, not the allocator footprint.
     assert sim.host_kv_bytes == pytest.approx(20_000 * 8 * 2885.0)
 
     sim.on_request_start("r0", 1024)
@@ -374,15 +528,40 @@ def test_vllm_bf16_io_is_charged_per_source_layer_group():
     groups = {g.ratio: g for g in sim.requests["r0"].groups}
     assert groups[1].entry_bytes == pytest.approx(1154.0)
     assert groups[2].entry_bytes == pytest.approx(3462.0)
+    assert groups[1].main_entry_bytes == pytest.approx(1024.0)
+    assert groups[1].index_entry_bytes == pytest.approx(130.0)
+    assert groups[2].main_entry_bytes == pytest.approx(3072.0)
+    assert groups[2].index_entry_bytes == pytest.approx(390.0)
     assert groups[1].misses > 0 and groups[2].misses > 0
-    assert sim.h2d_bytes == sum(int(g.misses * g.entry_bytes) for g in groups.values())
+    expected_main = sum(int(g.misses * g.main_entry_bytes) for g in groups.values())
+    expected_index = sum(
+        int((g.hits + g.misses) * g.index_entry_bytes) for g in groups.values()
+    )
+    assert sim.h2d_bytes == expected_main + expected_index
+    assert sim.main_h2d_bytes == expected_main
+    assert sim.index_h2d_bytes == expected_index
+    assert sim.index_scan_bytes == expected_index
     assert sim.h2d_bytes_by_ratio == {
-        1: int(groups[1].misses * 1154.0),
-        2: int(groups[2].misses * 3462.0),
+        1: int(
+            groups[1].misses * groups[1].main_entry_bytes
+            + (groups[1].hits + groups[1].misses) * groups[1].index_entry_bytes
+        ),
+        2: int(
+            groups[2].misses * groups[2].main_entry_bytes
+            + (groups[2].hits + groups[2].misses) * groups[2].index_entry_bytes
+        ),
     }
     assert sim.staging_bytes == int(prompt * 2885.0)
 
     metrics = sim.metrics()
+    assert metrics["hisparse_runtime_target"] == "vllm_ascend"
+    assert metrics["hisparse_capacity_bytes_per_token"] == 4096.0
+    assert metrics["hisparse_io_channel_groups"] == [
+        [1, 1024.0, 130.0],
+        [2, 3072.0, 390.0],
+    ]
+    assert metrics["hisparse_main_kv_h2d_bytes"] == expected_main
+    assert metrics["hisparse_index_h2d_bytes"] == expected_index
     assert metrics["hisparse_kv_profile"] == "dsv41_vllm_bf16"
     assert metrics["hisparse_bytes_scope"] == "per_rank"
     assert metrics["hisparse_source_layer_bytes_per_token"] == [

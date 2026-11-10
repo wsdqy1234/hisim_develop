@@ -33,6 +33,8 @@
         "access_model": "sticky",
         "churn": 0.05,
         "recent_ratio": 0.5,
+        "selection_cadence": "every_step",
+        "index_read_on_hit": true,
         "shared_index_freq": 1,
         "backup_on_critical": false
     }

@@ -599,3 +599,369 @@ PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py bench --enable \
 - DCP>1、连续到达吞吐、真实 LRU 物理淘汰；
 - 生产级跨请求全局去重与 KV 生命周期；
 - PD 分离 / direct RDMA / HiCache 共存（sglang 中 HiSparse 与 HiCache 互斥）。
+
+---
+
+## 12. 2026-11-09 decode 稀疏实现复核（仅评审，未改代码）
+
+### 12.1 总结与结论边界
+
+本轮复核了 `_WorkingSet`、profile decode、hot buffer、IO/时延模型、sglang hook、
+现有单测，并对照了当前 sglang coordinator/allocator/indexer/swap kernel 和
+`.22` vLLM-Ascend 交接材料。结论是：**还有影响容量、命中率和时延结论的问题，
+不能只在现有模型上继续调 `churn` 来凑结果。**
+
+当前结果仍可用于比较抽象 access model 的相对敏感性，但在完成下述修复前：
+
+- `dsv41_vllm_bf16` 的 HBM 物理 token 数和由其派生的并发结论需要重算；
+- decode 命中率、H2D/D2H 和 load latency 只能视为合成模型输出，不能称为
+  DSV4.1/sglang HiSparse 实测预测；
+- `.22` vLLM-Ascend BF16 与官方 FP4/CSA2、以及当前 sglang C4/C128 路径必须继续
+  分开描述，不能互相当作语义验证。
+
+本节对动态 decode 和容量口径的复核结论优先于前文相关描述。尤其前文 7.3 的
+BF16 physical tokens 及派生指标应在修复后重跑，不再作为容量结论引用。
+
+问题分级：
+
+- **P0**：已确认的公式/实现错误，或会使验证对象发生根本错位；先修复再校准。
+- **P1**：已确认的重要语义缺口，绝对命中率、流量或时延可能明显偏差。
+- **P2**：小边界问题或尚需 trace/实测判定的假设，不能伪装成已验证事实。
+
+### 12.2 P0：先修正确定性错误
+
+#### P0-1 BF16 把 2885 payload 错用于 HBM 容量，4096 allocator 只做了展示
+
+证据：
+
+- 交接报告明确区分：有效长程 payload 为 `2885 B/original-token/rank`，物理
+  allocator 斜率为 `524288 / 128 = 4096 B/original-token/rank`，两者不能互换；
+  SWA、压缩状态和空块另计。
+- `hisparse_sim.py:995-1003` 的 `hbm_kv_bytes` 使用
+  `physical_pool_tokens * (offload + indexer)`；BF16 此时就是 2885，而没有使用
+  已定义的 `allocator_bytes_per_token=4096`。
+- `benchmark/hisparse/hisparse_bench.py:146-156` 的 BF16 sweep 同样用 2885 估算
+  physical tokens。`baseline_hbm_kv_bytes` 也有相同的容量口径风险。
+
+影响：在相同 80 GB、8 请求稳态 SWA/compressor 扣减的简化预算下，当前为
+27,714,007 physical tokens；改用 4096 后应为 **19,520,242**，当前约高估 42%。
+这只是公式纠错，不是新的实测容量。IO/staging 仍应使用 2885 payload，不能把
+所有字段一刀切改成 4096。
+
+修复方向：增加明确的 `capacity_bytes_per_token` 口径，BF16 HBM 池 sizing 和稳态
+HBM 容量使用 allocator 4096；IO 使用 payload 2885；index 是否另计由 profile 决定，
+避免重复计费。FP4 的未知 allocator/page 字节继续保持未知，不套用 BF16 数值。
+
+#### P0-2 profile 没有重定 e2e 物理池，scheduler 容量与 metrics 可能互相矛盾
+
+`sglang_hook.py:247-330` 先用 legacy 模型几何或 `max_total_tokens` 得到
+physical tokens，再把它交给 profile simulator，随后将 full/SWA/logical 池都设为
+`physical * host_to_device_ratio`。profile 的 2885/4096、SWA/compressor 布局并没有
+参与这次物理池重定。`max_num_reqs` 还来自通用启发式（最高 4096），不一定是
+`.22` 的 8 或实际 server 并发上限。
+
+因此解析 sweep 与端到端 replay 可能使用两套容量来源；统一把
+`full_max_total_num_tokens`、`swa_max_total_num_tokens` 都设为 logical tokens，
+也没有表达真实分离的 long-KV/SWA/C4/C128 池。
+
+修复方向：要么由 HBM 预算和 profile 重新求 physical pool，再派生各 scheduler
+池；要么要求显式传入 physical/logical/SWA 容量并在不一致时失败。并发和
+SWA/compressor 稳态字节必须使用同一个实际 deployment 并发来源。
+
+#### P0-3 对当前 sglang 路径，压缩候选长度用了 ceil 而真实 C4 使用 floor
+
+`hisparse_sim.py:1167-1179` 使用：
+
+```text
+comp_len = max(1, ceil(past_len / ratio))
+```
+
+当前 sglang 的 `metadata_kernel.py:40-49` 则是
+`c4_seq_lens_raw = seq_len // 4`，再仅为 kernel 下限 clamp 到 1；
+`deepseek_v4_backend.py` 和 indexer 使用该长度做 C4 top-k/swap-in。
+在非整除点，两者候选集合不同，仿真会把尚未完整产生的压缩条目提前纳入选择。
+
+同时要区分验证对象：当前 profile 的 `(2,2,2,1)` 来自官方/vLLM-Ascend 布局；
+当前 sglang `deepseek_v4.py:624-633` 只接受 `(0,4,128)`，DSV4 HiSparse allocator
+固定 `compress_ratio=4`，indexer 的 HiSparse swap-in 也走 C4。现有 2/1 replay
+可以保留为 vLLM 启发式模型，但不能称为当前 sglang DSV4.1 语义验证。
+
+**D2H 不在本轮武断判成同样的 off-by-one**：ceil 长度的增量条件恰好是
+`(L-1) % ratio == 0`，与 coordinator 的 backup 条件形式一致。因此已确认的是
+“用于 top-k 的候选长度错误”；首步跳过、末步未 backup、hook 的 `past_len` 与真实
+`seq_lens_cpu` 是否完全同相，仍须用同一请求逐步对拍后定论。
+
+#### P0-4 把“压缩长度不推进”误当成“top-k 不变化且全命中”
+
+`hisparse_sim.py:1173-1179` 在 `comp_len` 不推进时直接返回
+`min(top_k, comp_len)` hits、0 misses，不调用 `_WorkingSet.step()`。
+压缩条目产生 cadence 只限制候选集合，不保证下一步 query 的 indexer 分数和
+Top-K ID 不变。真实 query 每个 decode step 都在变化，即使候选长度不变，也可能
+选择不同的历史条目并产生 swap-in。
+
+该 shortcut会系统性高估命中率、低估 H2D；修正 floor 后更不能继续沿用这个假设。
+`test_cadence_does_not_churn_on_non_advance_steps` 当前是在固化待验证假设，
+不是与真实实现对齐的证明。
+
+修复方向：将 **query/top-k 选择 cadence**、**压缩条目产生 cadence**、
+**D2H backup cadence** 拆成三个概念。默认每个 decode step 都更新选择；
+`comp_len` 只限制候选范围，D2H 只由新完整条目触发。若需保留旧行为，应显式命名为
+`frozen_selection_between_boundaries` 的敏感性对照，而非默认真实语义。
+
+#### P0-5 churn 重采样没有排除 dropped，`churn=1` 并不等于完全换血
+
+`hisparse_sim.py:728-733` 先从 sticky 集合删除 `dropped`，随后 `_sample()` 只排除
+剩余 sticky，没有排除刚删除的位置，因此旧位置可以立即被重选。只读探针中，
+`top_k=64、recent_ratio=0.5、churn=1` 的短历史场景一步后仍保留旧 sticky 的
+30/32；这会使配置 churn 明显高于实际 churn，并高估命中率。
+
+修复方向：候选重采样排除 `dropped`，历史不足时明确截断有效 churn，而不是静默
+重选。新增集合级测试：历史充足时 `new_sticky.isdisjoint(dropped)`，并检查
+`churn=0/1`、短历史和长时间稳态，而不只检查聚合 miss 数。
+
+#### P0-6 初始 hot buffer seed 与所引用的 sglang 路径不一致
+
+`hisparse_sim.py:649-652` 假定 prefill 把**最新** `capacity` 个位置放入 hot buffer。
+当前 sglang `hisparse_coordinator.py:481-483` 的 staging 路径却把 regular device
+buffer 初始化为 `arange(device_buffer_size)`，即最早的压缩位置；direct 长序列路径
+在 `:410-415` 将槽位置为 `-1`，首次 top-k 全 miss，短序列则走 preload。
+
+这不是无关紧要的初值差异：它决定首个 decode 的 miss 身份、后续 LRU 顺序和
+staging/direct 的 H2D 峰值。修复时应分别建 staging-long、direct-long、direct-short
+初始化，不要用一个“最新 token 全热”的 seed 覆盖所有路径。
+
+### 12.3 P1：decode 稀疏和 IO/时延的重要语义缺口
+
+#### P1-1 当前不是实际 LRU，且把 newest page 当作普通 hot slot
+
+现有 `OrderedDict` 主要记录插入顺序；已有 hit 不执行 `move_to_end()`，所以它是
+“受当前 recent/sticky 集合保护的插入顺序缓存”，不是真实 LRU。实际 swap kernel
+会把 hits 移到 MRU、misses 插到 hits 前面（`hisparse.cuh:640-670`）。
+
+此外 simulator 把 `padded_buffer_size=device_buffer_size+page_size` 全部作为通用
+hot capacity；真实布局是 `[device_buffer_size 个 LRU slots] + [newest page]`，newest
+page 不参与 LRU（`hisparse.cuh:314-315`）。修复时应使用分离的 regular slot/newest
+slot 模型，并用小型手工 top-k 序列对拍每步淘汰顺序。
+
+#### P1-2 每个 ratio 只有一条独立随机流，未表达真实层间选择与 candidate 路径
+
+当前 ratio-2 的三个 source 被合成一个 working set，ratio-1 另用一个独立 RNG；
+但 profile 自己声明有 4 个持久 source、8 个 index compute layers，以及
+“source 20 的 2048×8 candidate -> filters”的路径。candidate/filter 目前只有元数据，
+并未限制候选或产生流量。
+
+这既不能证明各 source 应共享同一 Top-K，也不能证明它们应独立。后续应由真实
+layer trace 决定共享关系，至少记录 per-source/per-index-layer Top-K ID、miss ID 和
+复用关系。`shared_index_freq` 也不能替代这些结构信息。
+
+#### P1-3 `shared_index_freq` 简单把关键路径字节除以 N，不代表 anchor/follower 时序
+
+`_account_transfer()` 对聚合 H2D bytes 乘 `1/shared_index_freq`，总字节不变、
+launch overhead 只计一次。真实 shared-index 路径是 anchor 同步 swap-in 并记录 miss
+plan，skip layers 在侧流复用 plan；关键路径取决于 anchor 的字节、事件等待和计算
+重叠，不是任意两组不同大小 IO 的统一 `1/N`。
+
+修复方向：保留总流量与关键路径流量的区别，按 anchor/follower 建事件和传输，
+不要用一个频率参数同时隐含选择共享、预取字节和延迟缩放。
+
+#### P1-4 main KV 与 index IO 混算，命中时也没有 index 读取流量
+
+当前 miss entry 一次性计 `main KV + index` 的 H2D，新条目也按同一 entry bytes 计
+D2H。`.22` 交接报告则明确要求分别建：索引扫描、候选筛选、Top-K ID 返回、稀疏
+主 KV 取回；Top-512 之前仍可能读取索引，**命中 main KV 不等于没有 index IO**。
+
+因此当前模型既可能漏掉 index scan，又可能把 index 只在 miss 时随 main KV 搬运，
+无法回答 SSU/HBM/host 各自瓶颈。修复时至少拆分
+`index_scan_bytes`、`candidate/topk_bytes`、`main_kv_h2d_bytes`、
+`main_kv_d2h_bytes` 和 resident index 容量；325 已包含在 2885 内，拆账时不能双计。
+对 sglang C4 的 resident index 与 `.22` 远端 index 应使用不同 profile，而不是套同一
+传输公式。
+
+#### P1-5 prefix 复用和 host 生命周期没有建模
+
+hook 在 `sglang_hook.py:1838-1845` 以完整 input+output 长度启动 staging，没有减去
+已复用的 `prefix_indices`；`on_request_finish()` 又释放该请求全部 host tokens。
+对于交接材料中的重复请求，这会把已有 prefix 再完整 staging，并不表达请求结束后
+仍保留的共享 prefix。唯一 prefix 的 workload 受影响较小，重复/多轮 workload 的
+staging、host 峰值和 TTFT 会明显失真。
+
+修复方向：显式输入 prompt/prefix/new-token 长度，给 host prefix 建引用计数或明确
+逐请求私有语义，并用“首次请求/重复请求”两个案例验收。
+
+#### P1-6 传输与计算时间线仍过于理想化
+
+- prefill staging 只累计 bytes，不计传输完成事件或 admission 等待，TTFT 偏乐观；
+- backup 默认只累计 `backup_hidden_dur`，没有队列、event 或 backpressure，D2H 慢于
+  decode 时仍可无限隐藏；
+- 整个 batch 的所有请求/组只计一次 H2D fixed overhead，而真实 swap-in 按 layer/
+  anchor 调用，小传输场景会低估 launch/tail；
+- H2D 默认全部串行加到 forward，非 anchor 传输与 attention 的重叠没有按事件建模；
+- 通用 64 GB/s 和固定 `t0` 不是 `.22` host/SSU 实测参数。
+
+修复方向：先测单次 kernel/传输的 `t0`、有效带宽和并发流，再建 staging、anchor
+H2D、follower prefetch、D2H backup、forward 的事件图；关键路径由依赖和
+`max(compute, overlapped IO)` 决定，而不是固定全加或固定隐藏。
+
+### 12.4 P2 与测试解释
+
+- `recent_ratio=0` 仍由 `_recent_count()` 强制保留 1 个 recent entry；若 0 的语义应是
+  纯 sticky，需要补边界测试并修正文档/实现之一。
+- 模块注释称“page-granular LRU”，当前实际按抽象 entry 位置管理；page/entry 单位
+  必须在目标 profile 中明确，不能顺手把 ratio-2 capacity 减半或加倍。
+- `test_compressed_working_set_cadence`、`test_top_k_is_selected_on_compressed_positions`
+  当前断言 ceil；BF16 测试断言 `physical_tokens * 2885` 的 HBM；这些测试证明的是
+  现有公式自洽，不能作为真实语义 oracle。
+- 现有 46 个目标测试通过不覆盖上述问题。后续应把“公式单元测试”和“参考实现/trace
+  对拍测试”分开命名，避免再次把假设写成断言。
+
+### 12.5 分阶段修复计划
+
+#### 阶段 A：锁定目标与逐步 oracle（先于任何性能调参）
+
+1. 分开声明 `vllm_ascend_dsv41` 与 `sglang_dsv4_hisparse` 目标；前者保留 2/1 和
+   2885/4096 双口径，后者按 C4/C128 真实池与 indexer 路径建模。
+2. 定义逐步 trace：`rid, seq_len, comp_len, layer/source, top-k IDs, hot slots,
+   miss IDs, newest hit, H2D/D2H bytes, staging/backup events`。
+3. 用同一请求对齐 hook 的 `past_len`、真实 `seq_lens_cpu`、压缩产生步和 backup 步；
+   特别核对首步、整除边界、末步，不预先假定 D2H 总量错误。
+
+验收：短小序列可手工逐步解释；floor/ceil、首步和最后一个 token 均有明确预期。
+
+#### 阶段 B：修确定性错误和 hot-buffer 状态机
+
+1. BF16 容量改用 4096 allocator，IO 保持 2885 payload；统一 hook 与 sweep 的
+   physical/logical/SWA 池及 deployment 并发来源。
+2. 修正目标对应的 `comp_len`，拆开选择/压缩/backup cadence；删除非推进 step 的
+   默认全命中 shortcut。
+3. churn 重选排除 dropped；实现 staging/direct 初始化、hit-to-MRU、miss 插入和
+   独立 newest page。
+4. 保留 legacy 路径和 HiSparse 默认关闭行为，不改旧几何默认值。
+
+验收：集合级/LRU 顺序测试通过；churn=1 在历史充足时不重选；同一 trace 的逐步
+hits/misses、hot slots、H2D/D2H 与 oracle 一致；BF16 容量测试显式检查
+`tokens*4096 + SWA + compressor`，legacy 测试零回归。
+
+#### 阶段 C：重建分层 IO 和事件时序
+
+1. 按 source/index layer 建选择及共享关系，接入 candidate/filter，而非只按 ratio
+   聚合并独立随机。
+2. 拆 index scan、candidate/top-k、main KV H2D/D2H、resident bytes；明确每类流量的
+   HBM/host/SSU 来源与去向。
+3. 用实测 kernel/链路的 fixed overhead、带宽、anchor/follower 并发和 staging/backup
+   event 替换统一 `1/N`、单 launch、全串行/全隐藏近似。
+
+验收：总 bytes 守恒且无 index 双计；hit/miss 路径的 index IO 均按目标 profile
+计费（resident index 可以有明确的 0 远程字节）；batch/layer 数变化时 launch 次数
+正确；D2H 积压会产生可观察 backpressure；与实测分步时间线误差有报告。
+
+#### 阶段 D：补生命周期、重跑实验并恢复结论
+
+1. 加 prefix 复用、host 引用生命周期、连续到达和多请求并发。
+2. 用真实 Top-K/hot-buffer/IO trace 校准 `access_model/churn/recent_ratio`，不再用
+   这些参数掩盖结构性错误。
+3. 重跑单测、目标 replay 和三种 profile sweep；将旧 BF16 容量、命中率和绝对时延
+   结果标记为 superseded，保留仅用于解释修复前后差异。
+4. 最后才恢复“容量/吞吐/TTFT/TPOT 收益”结论；没有实测校准的 FP4 page、allocator、
+   SWA/compressor 和 SSU 参数继续留空或标假设。
+
+### 12.6 建议执行顺序
+
+最小安全顺序是：**A 语义对拍 -> B 容量/cadence/churn/LRU -> C 分层 IO/时序 ->
+D 生命周期与实测校准**。不建议先改带宽或调 churn，因为那只会让错误状态机得到
+看起来合理、但无法验证的曲线。
+
+12.1-12.6 是 2026-11-09 的评审结论，最初未修改代码；修复落地、重跑结果和
+仍缺的实测项见下一节。
+
+### 12.7 修复落地（2026-11-09）
+
+#### 12.7.1 已完成
+
+| 项 | 状态 | 实现 |
+| --- | --- | --- |
+| BF16 HBM 容量 | ✅ | 使用 `capacity_bytes_per_token=4096` allocator 斜率；IO/staging 继续用 2885 payload |
+| e2e 物理池 | ✅ | hook 用同一字节预算和 profile capacity 重算 physical tokens；BF16 默认并发 8 |
+| 压缩长度 | ✅ | ratio 组改用 `floor(past_len/ratio)` |
+| 选择 cadence | ✅ | 默认 `every_step`；`compression_boundary` 仅作显式敏感性模式 |
+| churn 重选 | ✅ | dropped 不再立即重选；历史不足时保持 Top-K 目标大小 |
+| hot buffer 初始化 | ✅ | profile 默认 earliest；支持 earliest/latest/empty |
+| hot buffer LRU | ✅ | hit-to-MRU、独立 newest slot、regular capacity 不含 extra page |
+| main/index IO 分账 | ✅ | BF16 逐 source split：main `(512,512,512,1024)`、index `(65,65,65,130)` |
+| index 命中读取 | ✅ | `index_read_on_hit=True` 时 hit/miss 都计 index payload 读取 |
+| prefix staging | ✅ | `on_request_start(..., prefix_len=)` 只 staging 新增部分；hook 传入 `prefix_indices` |
+| recent_ratio=0 | ✅ | 不再强制保留 1 个 recent entry |
+| 传输 launch | ⚠️ | index scan 与 main KV 分两阶段计 fixed overhead；尚未按真实 layer 调用次数展开 |
+| 其他指标 | ✅ | 新增 main/index H2D/D2H、critical H2D、staging latency、prefix tokens、runtime target |
+
+目标测试：
+
+```text
+PYTHONPATH=src python -m pytest test/test_hisparse_sim.py test/test_hisparse_dsv41.py -q
+53 passed
+```
+
+legacy 无 profile 路径仍保留原有 FIFO/hot 近似；HiSparse 默认关闭不变。
+`hisparse_sim.py`、`sglang_hook.py`、`hisparse_bench.py`、mock 配置和测试已更新。
+
+#### 12.7.2 重跑结果
+
+`sweep` 公共 workload 仍为 64 请求 × 32K prompt + 512 output、80 GB 预算、
+`top_k=512`、`device_buffer=1024`、host ratio 8、`recent_ratio=0.5`。
+旧 7.1-7.3 的动态数字已被本节取代。
+
+`dsv41`（890 B/token）：
+
+| churn | 命中率（条目/字节） | H2D | D2H | staging | mean load |
+| --- | --- | --- | --- | --- | --- |
+| 0.05 | 97.19% / 97.24% | 0.721 GB | 0.0290 GB | 1.866 GB | 7.07 µs |
+| 0.20 | 89.96% / 90.05% | 2.600 GB | 0.0290 GB | 1.866 GB | 8.13 µs |
+| 0.50 | 75.31% / 75.49% | 6.404 GB | 0.0290 GB | 1.866 GB | 10.26 µs |
+
+physical tokens = 89,887,640；host = 640 GB；`max_reqs_hot_pool=87,695`。
+
+`dsv41_fp4_csa2`（890 + 544 假设）：
+
+| churn | 命中率（条目/字节） | H2D | mean load |
+| --- | --- | --- | --- |
+| 0.05 | 97.19% / 97.24% | 0.721 GB | 7.07 µs |
+| 0.20 | 89.96% / 90.05% | 2.600 GB | 8.13 µs |
+| 0.50 | 75.31% / 75.49% | 6.404 GB | 10.26 µs |
+
+physical tokens = 55,788,005（capacity 1434 B/token）；host = 397.21 GB；
+`max_reqs_hot_pool=54,427`。FP4 page/allocator/SWA/compressor 仍未测。
+
+`dsv41_vllm_bf16`（4096 B/token/rank 容量）：
+
+| churn | 命中率（条目/字节） | main H2D | index H2D | D2H | staging | mean load |
+| --- | --- | --- | --- | --- | --- | --- |
+| 0.05 | 97.19% / 97.23% | 1.906 GB | 8.724 GB | 0.0942 GB | 6.050 GB | 19.30 µs |
+| 0.20 | 89.96% / 90.02% | 6.856 GB | 8.724 GB | 0.0942 GB | 6.050 GB | 22.08 µs |
+| 0.50 | 75.31% / 75.44% | 16.879 GB | 8.724 GB | 0.0942 GB | 6.050 GB | 27.70 µs |
+
+physical tokens = **19,520,242**（旧 27,714,007 高估 42%）；host = 450.53 GB；
+`max_reqs_hot_pool=19,044`；admission 1M 仍为 8533 blocks / 4.4737 GB。
+index H2D 在三个 churn 下相同，因为每步选中的 index entry 数不变；main H2D
+随 miss 增加。这里的 index 读取是“选中 entry 的 payload”，**不是全候选扫描**，
+因此是下界而非实测预测。
+
+#### 12.7.3 仍不能宣称已验证
+
+- 当前 profile 仍是 **vLLM-Ascend/official layout + sglang hook harness**；
+  sglang 当前 C4/C128 的独立池、`compress_ratio=4` 和真实 candidate 路径尚未
+  建 profile。`runtime_target=vllm_ascend` 已写入 metrics。
+- `churn`/`recent_ratio` 仍是合成 access model，未用真实 Top-K ID 校准；不能把
+  97% 或 75% 当目标模型的真实命中率。
+- 仍按 ratio 聚合 source 层，未建模 8 个 index compute 层的共享/anchor 关系和
+  source20 的 2048×8 candidate/filter 流量。
+- index 目前只读选中的 payload；全候选 index scan、Top-K ID 返回和 resident
+  index 的 HBM 带宽仍未建模。
+- `shared_index_freq` 仍只是关键路径字节/延迟缩放；已有 critical bytes 指标，
+  但没有 anchor event + follower 侧流事件图。
+- prefix 复用已从 staging 中扣除，但 host 侧共享 prefix 的引用生命周期仍未完整
+  建模；当前按逐请求新增 host token 计费。
+- staging latency 已单独记录，但还没有作为 admission event 接入 scheduler；
+  eager backup 仍只累计 hidden duration，没有队列/backpressure。
+- FP4 的 page、allocator、SWA、compressor、SSU 带宽/尾延迟仍为未知或假设。
+
+因此本轮修复解决了容量分母、cadence、churn、初始化/LRU 和 IO 分账等
+**确定性错误**；绝对吞吐/TPOT 结论仍需真实 indexer/hot-buffer/SSU trace 后才能恢复。

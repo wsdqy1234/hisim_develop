@@ -1,11 +1,13 @@
 """HiSparse (hierarchical sparse KV) simulation for hisim.
 
-This module models the *decode-side* behaviour of sglang's HiSparse path
-(``--enable-hisparse``) on top of the hisim replay loop.  sglang's real
-implementation cannot run under hisim on a CPU-only host: it needs the DSA
-indexer scores, CUDA streams/events and ``sgl_kernel.kvcacheio``.  What we can
-reproduce faithfully -- and what actually drives the performance trade-off --
-is the memory hierarchy and the data movement it causes:
+This module is an abstract decode-side model of hierarchical sparse KV on top
+of the hisim replay loop.  It can run with sglang's scheduler hooks, but the
+profiles here describe the vLLM-Ascend/official DSV4.1 byte layout, not a
+byte-for-byte model of sglang's current C4/C128 pools.  Real indexer Top-K IDs,
+CUDA events and ``sgl_kernel.kvcacheio`` traces are still required for
+calibration.
+
+The implemented hierarchy is:
 
 * The scheduler-visible KV pool is the *logical* pool.  Its capacity is
   ``physical_pool_tokens * host_to_device_ratio`` because the full sequence
@@ -14,24 +16,26 @@ is the memory hierarchy and the data movement it causes:
   ``padded_buffer_size = device_buffer_size + page_size`` slots, so the number
   of concurrently resident requests is bounded by
   ``physical_pool_tokens // padded_buffer_size``.
-* At every decode step the DSA-style indexer selects ``top_k`` token positions.
-  Positions that are not in the request's hot buffer are copied host->device on
-  the critical path (``kvcacheio`` swap-in).  A page-granular LRU keeps the
-  hottest positions resident.
-* Prefill KV is staged device->host once.  Each newly decoded token is eagerly
-  backed up device->host on a side stream (hidden from the critical path by
-  default, but the bytes are accounted).
+* At every decode step the indexer selects ``top_k`` compressed positions.
+  Selection cadence is independent of compression and backup cadence.  Misses
+  are copied host->device on the critical path; hits can still read index
+  payload.  The regular hot slots use hit-to-MRU LRU, and the newest token has
+  a separate reserved slot outside that LRU.
+* Prefill KV is staged device->host once.  Reused prefix tokens are not staged
+  again.  Each newly decoded compressed entry is eagerly backed up device->host
+  on a side stream (hidden from the critical path by default, but the bytes and
+  duration are accounted).
 
 The real indexer scores are not observable in a trace replay, so the top-k
 access stream is a configurable abstraction (see :class:`HiSparseSimConfig`).
-``sticky`` (the default) keeps a working set whose non-recent part churns by
-``churn`` per step: that is the knob to calibrate against counters from a real
-sglang HiSparse deployment (hot-buffer hits/misses, swap-in bytes).
+``sticky`` keeps a working set whose non-recent part churns by ``churn`` per
+step.  This remains a synthetic access model; calibration must use real
+hot-buffer hit/miss and swap-in counters.
 
-The per-layer working sets are modelled as i.i.d.: one canonical stream is
-sampled per request and the resulting bytes/hits are scaled by the number of KV
-layers.  When ``shared_index_freq > 1`` the IO of the non-anchor layers is
-prefetched and therefore removed from the critical path.
+Per-ratio working sets aggregate the source layers of that ratio.  The profile
+gains optional source-layer main/index splits for per-channel IO accounting.
+When ``shared_index_freq > 1`` the non-anchor IO is approximated as prefetched
+off the critical path; anchor/follower events still need real traces.
 """
 
 from __future__ import annotations
@@ -83,6 +87,14 @@ class KVProfile:
     """
 
     name: str = "generic"
+    # The profiles in this module describe the vLLM-Ascend/official layout.
+    # They are not a byte-for-byte model of sglang's current C4/C128 pools.
+    runtime_target: str = "vllm_ascend"
+    # Deployment concurrency used by the admission/steady-state formulas when
+    # the server does not provide an explicit max_running_requests.
+    deployment_max_num_reqs: int = 0
+    # Initial regular hot-buffer contents: earliest | latest | empty.
+    hot_buffer_init: str = "earliest"
     offload_bytes_per_token: float = 0.0
     # Ratios of the KV source layers, e.g. (2, 2, 2, 1) for DSV4.1.
     source_layer_ratios: Tuple[int, ...] = ()
@@ -105,6 +117,10 @@ class KVProfile:
     source_layer_ids: Tuple[int, ...] = ()
     # Per original token, per source layer, e.g. (577, 577, 577, 1154).
     source_layer_bytes_per_token: Tuple[float, ...] = ()
+    # Optional split of each source-layer payload into main KV and index bytes.
+    # BF16 .22: main (512,512,512,1024), index (65,65,65,130).
+    source_layer_main_kv_bytes_per_token: Tuple[float, ...] = ()
+    source_layer_index_bytes_per_token: Tuple[float, ...] = ()
     # ((source_layer, (consumer_layer, ...)), ...).
     source_consumers: Tuple[Tuple[int, Tuple[int, ...]], ...] = ()
     index_storage_layers: Tuple[int, ...] = ()
@@ -142,6 +158,19 @@ class KVProfile:
     @property
     def source_layer_bytes_sum(self) -> float:
         return float(sum(self.source_layer_bytes_per_token))
+
+    @property
+    def capacity_bytes_per_token(self) -> float:
+        """Bytes occupied per original token in the HBM long-KV pool.
+
+        The effective payload and the allocator footprint are different
+        quantities.  When an allocator slope is known it wins; otherwise fall
+        back to payload + separately resident index.  IO/staging still use
+        ``offload_bytes_per_token`` and must not use this property.
+        """
+        if self.allocator_bytes_per_token > 0:
+            return float(self.allocator_bytes_per_token)
+        return float(self.offload_bytes_per_token + self.indexer_bytes_per_token)
 
     def io_groups(self) -> List[Tuple[int, float]]:
         """Return ``[(ratio, bytes_per_compressed_entry), ...]``.
@@ -183,6 +212,30 @@ class KVProfile:
             layer_bytes = sum(per_layer for r in ratios if r == ratio)
             groups.append((ratio, float(layer_bytes * ratio)))
         return groups
+
+    def io_channel_groups(self) -> List[Tuple[int, float, float]]:
+        """Return ``[(ratio, main_kv_bytes, index_payload_bytes), ...]``.
+
+        The split is only emitted when the profile has explicit per-source
+        main/index bytes.  Otherwise the entire entry is treated as main KV and
+        index traffic remains an explicitly uncalibrated residual.
+        """
+        ratios = tuple(int(r) for r in self.source_layer_ratios if int(r) > 0)
+        main = tuple(float(x) for x in self.source_layer_main_kv_bytes_per_token)
+        index = tuple(float(x) for x in self.source_layer_index_bytes_per_token)
+        if ratios and len(main) == len(ratios) and len(index) == len(ratios):
+            grouped: Dict[int, Tuple[float, float]] = {}
+            for ratio, main_b, index_b in zip(ratios, main, index):
+                old_main, old_index = grouped.get(ratio, (0.0, 0.0))
+                grouped[ratio] = (
+                    old_main + main_b * ratio,
+                    old_index + index_b * ratio,
+                )
+            return [
+                (ratio, grouped[ratio][0], grouped[ratio][1])
+                for ratio in sorted(grouped)
+            ]
+        return [(ratio, total, 0.0) for ratio, total in self.io_groups()]
 
     def admission_blocks(self, tokens: int) -> int:
         """Return the installed vLLM-Ascend admission block count.
@@ -261,10 +314,13 @@ class KVProfile:
             for key in int_tuple_fields:
                 if key in raw:
                     raw[key] = tuple(int(x) for x in raw[key])
-            if "source_layer_bytes_per_token" in raw:
-                raw["source_layer_bytes_per_token"] = tuple(
-                    float(x) for x in raw["source_layer_bytes_per_token"]
-                )
+            for key in (
+                "source_layer_bytes_per_token",
+                "source_layer_main_kv_bytes_per_token",
+                "source_layer_index_bytes_per_token",
+            ):
+                if key in raw:
+                    raw[key] = tuple(float(x) for x in raw[key])
             if "layer_groups" in raw:
                 raw["layer_groups"] = tuple(
                     (int(a), int(b)) for a, b in raw["layer_groups"]
@@ -301,6 +357,7 @@ DSV41_SOURCE_CONSUMERS: Tuple[Tuple[int, Tuple[int, ...]], ...] = (
 # fields are shared with the FP4/CSA2 L2 profile below.
 DSV41_PROFILE = KVProfile(
     name="dsv41",
+    runtime_target="vllm_ascend",
     offload_bytes_per_token=890.0,
     source_layer_ratios=(2, 2, 2, 1),
     layer_groups=((2, 0), (18, 2), (20, 1)),
@@ -329,6 +386,7 @@ DSV41_PROFILE = KVProfile(
 # design notes, kept separate so it can be overridden by a custom dict.
 DSV41_FP4_PROFILE = KVProfile(
     name="dsv41_fp4_csa2",
+    runtime_target="vllm_ascend",
     offload_bytes_per_token=890.0,
     source_layer_ratios=(2, 2, 2, 1),
     layer_groups=((2, 0), (18, 2), (20, 1)),
@@ -356,6 +414,9 @@ DSV41_FP4_PROFILE = KVProfile(
 # KV head, so TP8 must not divide them again.
 DSV41_VLLM_BF16_PROFILE = KVProfile(
     name="dsv41_vllm_bf16",
+    runtime_target="vllm_ascend",
+    deployment_max_num_reqs=8,
+    hot_buffer_init="earliest",
     offload_bytes_per_token=2885.0,
     source_layer_ratios=(2, 2, 2, 1),
     layer_groups=((2, 0), (18, 2), (20, 1)),
@@ -366,6 +427,8 @@ DSV41_VLLM_BF16_PROFILE = KVProfile(
     bytes_scope="per_rank",
     source_layer_ids=(2, 8, 14, 20),
     source_layer_bytes_per_token=(577.0, 577.0, 577.0, 1154.0),
+    source_layer_main_kv_bytes_per_token=(512.0, 512.0, 512.0, 1024.0),
+    source_layer_index_bytes_per_token=(65.0, 65.0, 65.0, 130.0),
     source_consumers=DSV41_SOURCE_CONSUMERS,
     index_storage_layers=(2, 8, 14, 20),
     index_compute_layers=(2, 8, 14, 20, 24, 28, 32, 36),
@@ -389,6 +452,37 @@ DSV41_VLLM_BF16_PROFILE = KVProfile(
     admission_extra_groups=1,
     admission_bytes_per_block=524288,
 )
+
+
+def profile_tp_scale(profile: KVProfile, tp_size: int = 1) -> float:
+    """Scale a profile's byte fields to one rank."""
+    return 1.0 if profile.per_rank else 1.0 / max(1, int(tp_size))
+
+
+def physical_pool_tokens_for_budget(
+    profile: KVProfile,
+    budget_bytes: float,
+    max_num_reqs: int,
+    tp_size: int = 1,
+) -> int:
+    """Size the HBM hot pool from an available KV-byte budget.
+
+    Long KV uses the allocator/capacity slope, while SWA and compressor state
+    are subtracted separately.  This is intentionally the inverse of
+    ``HiSparseSimulator.hbm_kv_bytes`` so e2e replay and analytic sweeps cannot
+    silently use different denominators.
+    """
+    scale = profile_tp_scale(profile, tp_size)
+    reqs = max(1, int(max_num_reqs))
+    per_req_overhead = (
+        float(profile.swa_window_tokens) * float(profile.swa_bytes_per_token)
+        + float(profile.compressor_bytes_per_request)
+    ) * scale
+    capacity_per_token = profile.capacity_bytes_per_token * scale
+    if capacity_per_token <= 0:
+        return 1
+    remaining = float(budget_bytes) - reqs * per_req_overhead
+    return max(1, int(remaining // capacity_per_token))
 
 
 # ---------------------------------------------------------------------------
@@ -423,6 +517,17 @@ class HiSparseSimConfig:
     churn: float = 0.05
     # Fraction of top_k that is always the most recent positions.
     recent_ratio: float = 0.5
+    # Top-k selection cadence.  ``every_step`` models a changing query even
+    # when no new compressed entry is produced.  ``compression_boundary`` is
+    # the old sensitivity-only assumption that the selected set is frozen
+    # between compression boundaries.
+    selection_cadence: str = "every_step"
+    # Initial regular hot buffer: "" follows profile/legacy default;
+    # earliest | latest | empty override it.
+    hot_buffer_init: str = ""
+    # Read index payload for selected positions on hits as well as misses.
+    # Only profiles with an explicit main/index split have index bytes.
+    index_read_on_hit: bool = True
     # 1 = every layer does its own indexer/swap-in; N > 1 = one anchor layer
     # per group of N, the followers are prefetched (off the critical path).
     shared_index_freq: int = 1
@@ -455,6 +560,18 @@ class HiSparseSimConfig:
                 self.access_model,
             )
             self.access_model = "sticky"
+        if self.selection_cadence not in ("every_step", "compression_boundary"):
+            logger.warning(
+                "Unknown selection cadence %r, falling back to 'every_step'.",
+                self.selection_cadence,
+            )
+            self.selection_cadence = "every_step"
+        if self.hot_buffer_init not in ("", "earliest", "latest", "empty"):
+            logger.warning(
+                "Unknown hot buffer init %r, falling back to profile default.",
+                self.hot_buffer_init,
+            )
+            self.hot_buffer_init = ""
 
     @property
     def padded_buffer_size(self) -> int:
@@ -479,6 +596,9 @@ class HiSparseSimConfig:
             "access_model": "access_model",
             "churn": "churn",
             "recent_ratio": "recent_ratio",
+            "selection_cadence": "selection_cadence",
+            "hot_buffer_init": "hot_buffer_init",
+            "index_read_on_hit": "index_read_on_hit",
             "shared_index_freq": "shared_index_freq",
             "backup_on_critical": "backup_on_critical",
             "seed": "seed",
@@ -503,10 +623,11 @@ class HiSparseSimConfig:
             kwargs["enable"] = str(kwargs["enable"]).strip().lower() in (
                 "1", "true", "yes", "on",
             )
-        if "backup_on_critical" in kwargs and not isinstance(kwargs["backup_on_critical"], bool):
-            kwargs["backup_on_critical"] = str(kwargs["backup_on_critical"]).strip().lower() in (
-                "1", "true", "yes", "on",
-            )
+        for key in ("backup_on_critical", "index_read_on_hit"):
+            if key in kwargs and not isinstance(kwargs[key], bool):
+                kwargs[key] = str(kwargs[key]).strip().lower() in (
+                    "1", "true", "yes", "on",
+                )
         return cls(**kwargs)
 
 
@@ -533,6 +654,9 @@ def load_hisparse_config() -> HiSparseSimConfig:
         "access_model": os.getenv("HISIM_HISPARSE_ACCESS_MODEL"),
         "churn": os.getenv("HISIM_HISPARSE_CHURN"),
         "recent_ratio": os.getenv("HISIM_HISPARSE_RECENT_RATIO"),
+        "selection_cadence": os.getenv("HISIM_HISPARSE_SELECTION_CADENCE"),
+        "hot_buffer_init": os.getenv("HISIM_HISPARSE_HOT_BUFFER_INIT"),
+        "index_read_on_hit": os.getenv("HISIM_HISPARSE_INDEX_READ_ON_HIT"),
         "shared_index_freq": os.getenv("HISIM_HISPARSE_SHARED_INDEX_FREQ"),
         "backup_on_critical": os.getenv("HISIM_HISPARSE_BACKUP_ON_CRITICAL"),
         "seed": os.getenv("HISIM_HISPARSE_SEED"),
@@ -604,13 +728,22 @@ class _WorkingSet:
         churn: float,
         recent_ratio: float,
         rng: random.Random,
+        *,
+        hot_buffer_init: str = "latest",
+        lru_mode: bool = False,
+        newest_page: bool = False,
     ) -> None:
         self.top_k = top_k
+        # Regular LRU slots only.  The newest-token page is modelled
+        # separately and does not consume a general-purpose hot slot.
         self.capacity = capacity
         self.access_model = access_model
         self.churn = churn
         self.recent_ratio = recent_ratio
         self.rng = rng
+        self.hot_buffer_init = hot_buffer_init
+        self.lru_mode = lru_mode
+        self.newest_page = newest_page
         self.sticky: Optional[set] = None
         self.hot: "OrderedDict[int, None]" = OrderedDict()
         self.prev_seq_len = 0
@@ -618,7 +751,11 @@ class _WorkingSet:
         self.prev_n = 0
 
     def _recent_count(self, n: int) -> int:
-        return min(n, max(1, int(round(n * self.recent_ratio)))) if n else 0
+        if n <= 0 or self.recent_ratio <= 0:
+            return 0
+        if self.recent_ratio >= 1:
+            return n
+        return min(n, max(1, int(round(n * self.recent_ratio))))
 
     def _window(self, seq_len: int) -> Tuple[int, int, int]:
         n = min(self.top_k, seq_len)
@@ -647,11 +784,17 @@ class _WorkingSet:
         return chosen
 
     def _seed_hot_buffer(self, seq_len: int) -> None:
-        # Prefill fills the device buffer with the newest tokens.
-        start = max(0, seq_len - self.capacity)
-        self.hot = OrderedDict((pos, None) for pos in range(start, seq_len))
+        if self.hot_buffer_init == "empty":
+            self.hot = OrderedDict()
+            return
+        if self.hot_buffer_init == "latest":
+            start = max(0, seq_len - self.capacity)
+        else:  # earliest, matching sglang's alloc_device_buffer(arange())
+            start = 0
+        end = min(seq_len, start + self.capacity)
+        self.hot = OrderedDict((pos, None) for pos in range(start, end))
 
-    def first_step(self, seq_len: int) -> Tuple[int, int]:
+    def _legacy_first_step(self, seq_len: int) -> Tuple[int, int]:
         n, n_recent, recent_start = self._window(seq_len)
         if self.access_model == "uniform":
             selected = set(self.rng.sample(range(seq_len), n))
@@ -669,36 +812,64 @@ class _WorkingSet:
         self.prev_seq_len = seq_len
         self.prev_recent_start = recent_start
         self.prev_n = n
-        self._trim(recent_start)
+        self._legacy_trim(recent_start)
         return n - misses, misses
 
-    def _trim(self, recent_start: int) -> None:
-        # Evict LRU positions that are neither in the recent window nor in the
-        # sticky set.  ``capacity >= top_k`` guarantees there are enough.
+    def _lru_first_step(self, seq_len: int) -> Tuple[int, int]:
+        n, n_recent, recent_start = self._window(seq_len)
+        if self.access_model == "uniform":
+            selected = set(self.rng.sample(range(seq_len), n))
+        else:
+            target_sticky = max(0, n - n_recent)
+            if self.access_model == "recency":
+                self.sticky = set()
+            else:
+                self.sticky = self._sample(target_sticky, recent_start, set())
+            selected = set(self.sticky or ())
+            selected.update(range(recent_start, seq_len))
+        self.sticky = selected if self.access_model == "uniform" else self.sticky
+        self._seed_hot_buffer(seq_len)
+        hits, misses = self._access_selected(selected, seq_len)
+        self.prev_seq_len = seq_len
+        self.prev_recent_start = recent_start
+        self.prev_n = n
+        return hits, misses
+
+    def _legacy_trim(self, recent_start: int) -> None:
+        # Evict positions that are neither in the recent window nor in the
+        # sticky set.  Legacy behaviour is intentionally kept for the
+        # non-profile path.
         while len(self.hot) > self.capacity:
             pos, _ = self.hot.popitem(last=False)
             if pos >= recent_start or pos in (self.sticky or ()):
                 self.hot[pos] = None
                 continue
 
-    def step(self, seq_len: int) -> Tuple[int, int]:
-        if self.sticky is None:
-            return self.first_step(seq_len)
-        if seq_len < self.prev_seq_len:
-            seq_len = self.prev_seq_len
-        n, n_recent, recent_start = self._window(seq_len)
-
-        if self.access_model == "uniform":
-            selected = set(self.rng.sample(range(seq_len), n))
-            misses = len(selected - set(self.hot))
-            for pos in selected:
+    def _access_selected(self, selected: set, seq_len: int) -> Tuple[int, int]:
+        """Resolve one selected set against the regular LRU + newest page."""
+        hits = 0
+        misses = 0
+        newest = seq_len - 1
+        for pos in sorted(selected):
+            if self.newest_page and pos == newest:
+                # The newest token lives in the reserved page, outside the
+                # regular LRU.  If it was already resident, retain MRU order.
+                hits += 1
+                if pos in self.hot:
+                    self.hot.move_to_end(pos)
+                continue
+            if pos in self.hot:
+                hits += 1
+                self.hot.move_to_end(pos)
+            else:
+                misses += 1
                 self.hot[pos] = None
-            self.sticky = selected
-            self.prev_seq_len = seq_len
-            self.prev_recent_start = recent_start
-            self.prev_n = n
-            self._trim(recent_start)
-            return n - misses, misses
+        while len(self.hot) > self.capacity:
+            self.hot.popitem(last=False)
+        return hits, misses
+
+    def _advance_sticky(self, seq_len: int) -> Tuple[int, int, int]:
+        n, n_recent, recent_start = self._window(seq_len)
 
         # 1. Positions that entered the recent window roll out of the sticky
         #    set (at most ``seq_len - prev_seq_len`` of them in steady state).
@@ -722,32 +893,84 @@ class _WorkingSet:
             drop = len(self.sticky) - target_sticky
             self.sticky -= set(self.rng.sample(sorted(self.sticky), drop))
 
-        # 3. Churn a fraction of the sticky set: replace it with positions from
-        #    the history.  Dropped positions stay in the hot buffer until LRU
-        #    eviction, so a returning position can still hit.
+        # 3. Churn a fraction of the sticky set.  Dropped positions must not be
+        #    eligible for immediate re-selection, otherwise churn=1 silently
+        #    becomes a much smaller effective churn.
         if self.access_model == "sticky" and target_sticky > 0:
             k = min(len(self.sticky), int(round(self.churn * target_sticky)))
             if k > 0:
                 dropped = set(self.rng.sample(sorted(self.sticky), k))
                 self.sticky -= dropped
-                self.sticky |= self._sample(k, recent_start, self.sticky)
+                replacements = self._sample(
+                    k, recent_start, set(self.sticky) | dropped
+                )
+                self.sticky |= replacements
+                # When the working set covers the whole available history,
+                # there is no replacement candidate.  Keep the set at its
+                # target size rather than silently shrinking Top-K.
+                restore = k - len(replacements)
+                if restore > 0 and dropped:
+                    self.sticky |= set(
+                        self.rng.sample(sorted(dropped), restore)
+                    )
+        return n, n_recent, recent_start
 
-        # 4. Resolve the newly selected positions against the hot buffer.
-        new_items = [p for p in self.sticky if p not in self.hot]
-        misses = len(new_items)
-        for pos in new_items:
-            self.hot[pos] = None
-        # Newly decoded tokens enter the recent window and are already in HBM
-        # (the newest-token page), so they are hits.
-        if seq_len > self.prev_seq_len:
-            for pos in range(self.prev_seq_len, seq_len):
-                self.hot.setdefault(pos, None)
-
+    def _legacy_step(self, seq_len: int) -> Tuple[int, int]:
+        if self.sticky is None:
+            return self._legacy_first_step(seq_len)
+        if seq_len < self.prev_seq_len:
+            seq_len = self.prev_seq_len
+        if self.access_model == "uniform":
+            n, _, recent_start = self._window(seq_len)
+            selected = set(self.rng.sample(range(seq_len), n))
+            misses = len(selected - set(self.hot))
+            for pos in selected:
+                self.hot[pos] = None
+            self.sticky = selected
+        else:
+            n, _, recent_start = self._advance_sticky(seq_len)
+            new_items = [p for p in (self.sticky or ()) if p not in self.hot]
+            misses = len(new_items)
+            for pos in new_items:
+                self.hot[pos] = None
+            # Legacy approximation: every newly decoded token is resident.
+            if seq_len > self.prev_seq_len:
+                for pos in range(self.prev_seq_len, seq_len):
+                    self.hot.setdefault(pos, None)
         self.prev_seq_len = seq_len
         self.prev_recent_start = recent_start
         self.prev_n = n
-        self._trim(recent_start)
+        self._legacy_trim(recent_start)
         return n - misses, misses
+
+    def _lru_step(self, seq_len: int) -> Tuple[int, int]:
+        if self.sticky is None:
+            return self._lru_first_step(seq_len)
+        if seq_len < self.prev_seq_len:
+            seq_len = self.prev_seq_len
+        n, n_recent, recent_start = self._window(seq_len)
+        if self.access_model == "uniform":
+            selected = set(self.rng.sample(range(seq_len), n))
+            self.sticky = selected
+        else:
+            self._advance_sticky(seq_len)
+            selected = set(self.sticky or ())
+            selected.update(range(recent_start, seq_len))
+        hits, misses = self._access_selected(selected, seq_len)
+        self.prev_seq_len = seq_len
+        self.prev_recent_start = recent_start
+        self.prev_n = n
+        return hits, misses
+
+    def first_step(self, seq_len: int) -> Tuple[int, int]:
+        if self.lru_mode:
+            return self._lru_first_step(seq_len)
+        return self._legacy_first_step(seq_len)
+
+    def step(self, seq_len: int) -> Tuple[int, int]:
+        if self.lru_mode:
+            return self._lru_step(seq_len)
+        return self._legacy_step(seq_len)
 
 
 # ---------------------------------------------------------------------------
@@ -761,6 +984,12 @@ class StepCost:
     misses: int = 0
     h2d_bytes: int = 0
     d2h_bytes: int = 0
+    main_h2d_bytes: int = 0
+    index_h2d_bytes: int = 0
+    main_d2h_bytes: int = 0
+    index_d2h_bytes: int = 0
+    index_scan_bytes: int = 0
+    critical_h2d_bytes: int = 0
     load_dur: float = 0.0
     backup_dur: float = 0.0
 
@@ -772,11 +1001,17 @@ class _RequestGroupState:
     ratio: int
     entry_bytes: float
     working: _WorkingSet
+    main_entry_bytes: float = 0.0
+    index_entry_bytes: float = 0.0
     prev_comp_len: int = 0
     hits: int = 0
     misses: int = 0
     h2d_bytes: int = 0
     d2h_bytes: int = 0
+    main_h2d_bytes: int = 0
+    index_h2d_bytes: int = 0
+    main_d2h_bytes: int = 0
+    index_d2h_bytes: int = 0
     new_entries: int = 0
 
 
@@ -866,6 +1101,27 @@ class HiSparseSimulator:
             if self.profile_enabled
             else []
         )
+        self.io_channel_groups: List[Tuple[int, float, float]] = (
+            [
+                (
+                    int(ratio),
+                    float(main_bytes) * self._tp_scale,
+                    float(index_bytes) * self._tp_scale,
+                )
+                for ratio, main_bytes, index_bytes in self.kv_profile.io_channel_groups()
+            ]
+            if self.profile_enabled
+            else []
+        )
+        self.capacity_bytes_per_token = (
+            float(self.kv_profile.capacity_bytes_per_token) * self._tp_scale
+            if self.profile_enabled
+            else 0.0
+        )
+        self.hot_buffer_init = (
+            self.config.hot_buffer_init
+            or (self.kv_profile.hot_buffer_init if self.profile_enabled else "latest")
+        )
 
         self.logical_pool_tokens = int(
             self.physical_pool_tokens * config.host_to_device_ratio
@@ -927,7 +1183,15 @@ class HiSparseSimulator:
         self.d2h_bytes_by_ratio: Dict[int, int] = {}
         self.h2d_bytes = 0
         self.d2h_bytes = 0
+        self.main_h2d_bytes = 0
+        self.index_h2d_bytes = 0
+        self.main_d2h_bytes = 0
+        self.index_d2h_bytes = 0
+        self.index_scan_bytes = 0
+        self.critical_h2d_bytes = 0
         self.staging_bytes = 0
+        self.staging_dur = 0.0
+        self.prefix_reused_tokens = 0
         self.load_dur = 0.0
         self.backup_dur = 0.0
         # Eager-backup latency that is hidden behind the next forward when
@@ -996,8 +1260,7 @@ class HiSparseSimulator:
     def hbm_kv_bytes(self) -> float:
         if self.profile_enabled:
             return (
-                self.physical_pool_tokens
-                * (self.offload_bytes_per_token + self.indexer_bytes_per_token)
+                self.physical_pool_tokens * self.capacity_bytes_per_token
                 + self.hbm_swa_bytes
                 + self.hbm_compressor_bytes
             )
@@ -1021,8 +1284,7 @@ class HiSparseSimulator:
     def baseline_hbm_kv_bytes(self) -> float:
         if self.profile_enabled:
             return (
-                self.logical_pool_tokens
-                * (self.offload_bytes_per_token + self.indexer_bytes_per_token)
+                self.logical_pool_tokens * self.capacity_bytes_per_token
                 + self.hbm_swa_bytes
                 + self.hbm_compressor_bytes
             )
@@ -1032,33 +1294,47 @@ class HiSparseSimulator:
             * self.bytes_per_token_per_layer
         )
 
-    def on_request_start(self, rid: str, prompt_len: int) -> None:
+    def on_request_start(
+        self, rid: str, prompt_len: int, prefix_len: int = 0
+    ) -> None:
         prompt_len = max(0, int(prompt_len))
+        prefix_len = min(prompt_len, max(0, int(prefix_len)))
         if rid in self.requests:
             return
+        new_prompt = prompt_len - prefix_len
+        self.prefix_reused_tokens += prefix_len
         if self.profile_enabled:
             groups: List[_RequestGroupState] = []
             staged = 0.0
-            for ratio, entry_bytes in self.io_groups:
-                comp_prompt = (prompt_len + ratio - 1) // ratio
-                staged += comp_prompt * entry_bytes
+            for (ratio, entry_bytes), (_, main_bytes, index_bytes) in zip(
+                self.io_groups, self.io_channel_groups
+            ):
+                full_comp = (prompt_len + ratio - 1) // ratio
+                prefix_comp = prefix_len // ratio
+                stage_comp = max(0, full_comp - prefix_comp)
+                staged += stage_comp * entry_bytes
                 groups.append(
                     _RequestGroupState(
                         ratio=ratio,
                         entry_bytes=entry_bytes,
+                        main_entry_bytes=main_bytes,
+                        index_entry_bytes=index_bytes,
                         working=_WorkingSet(
                             top_k=self.config.top_k,
-                            capacity=self.padded_buffer_size,
+                            capacity=self.config.device_buffer_size,
                             access_model=self.config.access_model,
                             churn=self.config.churn,
                             recent_ratio=self.config.recent_ratio,
                             rng=random.Random(self._rng.random()),
+                            hot_buffer_init=self.hot_buffer_init,
+                            lru_mode=True,
+                            newest_page=True,
                         ),
                     )
                 )
             state = _RequestState(
                 rid=rid,
-                host_tokens=prompt_len,
+                host_tokens=new_prompt,
                 working=None,
                 staged_bytes=int(staged),
                 groups=groups,
@@ -1071,17 +1347,22 @@ class HiSparseSimulator:
                 churn=self.config.churn,
                 recent_ratio=self.config.recent_ratio,
                 rng=random.Random(self._rng.random()),
+                hot_buffer_init="latest",
             )
-            staged = prompt_len * self.num_layers * self.bytes_per_token_per_layer
+            staged = new_prompt * self.num_layers * self.bytes_per_token_per_layer
             state = _RequestState(
                 rid=rid,
-                host_tokens=prompt_len,
+                host_tokens=new_prompt,
                 working=working,
                 staged_bytes=int(staged),
             )
         self.requests[rid] = state
         self.staging_bytes += int(staged)
-        self.cur_host_tokens += prompt_len
+        if staged > 0:
+            self.staging_dur += transfer_duration(
+                "D2H", staged, self.read_bandwidth, self.write_bandwidth
+            )
+        self.cur_host_tokens += new_prompt
         if self.cur_host_tokens > self.host_pool_tokens:
             self.host_overcommit_tokens = max(
                 self.host_overcommit_tokens, self.cur_host_tokens - self.host_pool_tokens
@@ -1138,6 +1419,8 @@ class HiSparseSimulator:
         self.misses_bytes += miss_bytes
         self.h2d_bytes += h2d
         self.d2h_bytes += d2h
+        self.main_h2d_bytes += h2d
+        self.main_d2h_bytes += d2h
         self.peak_host_tokens = max(self.peak_host_tokens, self.cur_host_tokens)
         if self.cur_host_tokens > self.host_pool_tokens:
             self.host_overcommit_tokens = max(
@@ -1149,38 +1432,54 @@ class HiSparseSimulator:
             misses=misses * n_layers,
             h2d_bytes=h2d,
             d2h_bytes=d2h,
+            main_h2d_bytes=h2d,
+            main_d2h_bytes=d2h,
         )
 
     def _decode_one_profile(self, state: _RequestState, past_len: int) -> StepCost:
-        """L1 decode step: one compressed working set per KV ratio group.
+        """Decode step: compressed selection + main/index IO per ratio group.
 
-        A ratio-``r`` source layer emits one compressed entry every ``r``
-        tokens.  The indexer selects ``top_k`` compressed positions, so on a
-        step that does not cross a compression boundary the selected set is
-        unchanged and every selected entry is still hot (no IO).
+        Compression cadence, indexer selection cadence and eager-backup cadence
+        are intentionally separate.  A new query can select a different Top-K
+        even when no new compressed entry was produced.
         """
         past_len = max(1, int(past_len))
         hits = misses = h2d = d2h = 0
+        main_h2d = index_h2d = 0
+        main_d2h = index_d2h = 0
         hit_bytes = miss_bytes = 0
         new_entries = 0
         for group in state.groups:
             ratio = group.ratio
-            comp_len = max(1, (past_len + ratio - 1) // ratio)
+            comp_len = max(1, past_len // ratio)
             ws = group.working
             if ws.sticky is None:
                 gh, gm = ws.first_step(comp_len)
                 new = 0  # prompt entries were already staged
-            elif comp_len > group.prev_comp_len:
-                gh, gm = ws.step(comp_len)
-                new = comp_len - group.prev_comp_len
             else:
-                # No new compressed entry: the top-k set does not change.
-                gh, gm = min(ws.top_k, comp_len), 0
-                new = 0
+                new = max(0, comp_len - group.prev_comp_len)
+                if (
+                    self.config.selection_cadence == "every_step"
+                    or new > 0
+                ):
+                    gh, gm = ws.step(comp_len)
+                else:
+                    # Explicit sensitivity mode: hold the selected set between
+                    # compression boundaries.  Not the default semantics.
+                    gh, gm = min(ws.top_k, comp_len), 0
             group.prev_comp_len = comp_len
 
-            group_h2d = int(gm * group.entry_bytes)
-            group_d2h = int(new * group.entry_bytes) if state.steps > 0 else 0
+            group_main_h2d = int(gm * group.main_entry_bytes)
+            index_reads = gh + gm if self.config.index_read_on_hit else gm
+            group_index_h2d = int(index_reads * group.index_entry_bytes)
+            group_h2d = group_main_h2d + group_index_h2d
+            group_main_d2h = (
+                int(new * group.main_entry_bytes) if state.steps > 0 else 0
+            )
+            group_index_d2h = (
+                int(new * group.index_entry_bytes) if state.steps > 0 else 0
+            )
+            group_d2h = group_main_d2h + group_index_d2h
             group_hit_bytes = gh * group.entry_bytes
             group_miss_bytes = gm * group.entry_bytes
 
@@ -1188,12 +1487,20 @@ class HiSparseSimulator:
             group.misses += gm
             group.h2d_bytes += group_h2d
             group.d2h_bytes += group_d2h
+            group.main_h2d_bytes += group_main_h2d
+            group.index_h2d_bytes += group_index_h2d
+            group.main_d2h_bytes += group_main_d2h
+            group.index_d2h_bytes += group_index_d2h
             group.new_entries += new if state.steps > 0 else 0
 
             hits += gh
             misses += gm
             h2d += group_h2d
             d2h += group_d2h
+            main_h2d += group_main_h2d
+            index_h2d += group_index_h2d
+            main_d2h += group_main_d2h
+            index_d2h += group_index_d2h
             hit_bytes += group_hit_bytes
             miss_bytes += group_miss_bytes
             new_entries += new if state.steps > 0 else 0
@@ -1220,6 +1527,11 @@ class HiSparseSimulator:
         self.new_compressed_entries += new_entries
         self.h2d_bytes += h2d
         self.d2h_bytes += d2h
+        self.main_h2d_bytes += main_h2d
+        self.index_h2d_bytes += index_h2d
+        self.main_d2h_bytes += main_d2h
+        self.index_d2h_bytes += index_d2h
+        self.index_scan_bytes += index_h2d
         self.peak_host_tokens = max(self.peak_host_tokens, self.cur_host_tokens)
         if self.cur_host_tokens > self.host_pool_tokens:
             self.host_overcommit_tokens = max(
@@ -1231,14 +1543,32 @@ class HiSparseSimulator:
             misses=misses,
             h2d_bytes=h2d,
             d2h_bytes=d2h,
+            main_h2d_bytes=main_h2d,
+            index_h2d_bytes=index_h2d,
+            main_d2h_bytes=main_d2h,
+            index_d2h_bytes=index_d2h,
+            index_scan_bytes=index_h2d,
         )
 
     def _account_transfer(self, cost: StepCost) -> None:
-        cost.load_dur = transfer_duration(
+        # Index selection and main-KV swap-in are separate phases.  Charge a
+        # launch only for a phase that actually moves/reads bytes.
+        fraction = self.config.critical_fraction
+        index_dur = transfer_duration(
             "H2D",
-            cost.h2d_bytes * self.config.critical_fraction,
+            cost.index_h2d_bytes * fraction,
             self.read_bandwidth,
             self.write_bandwidth,
+        )
+        main_dur = transfer_duration(
+            "H2D",
+            cost.main_h2d_bytes * fraction,
+            self.read_bandwidth,
+            self.write_bandwidth,
+        )
+        cost.load_dur = index_dur + main_dur
+        cost.critical_h2d_bytes = int(
+            (cost.main_h2d_bytes + cost.index_h2d_bytes) * fraction
         )
         cost.backup_dur = transfer_duration(
             "D2H", cost.d2h_bytes, self.read_bandwidth, self.write_bandwidth
@@ -1246,6 +1576,7 @@ class HiSparseSimulator:
         self.decode_batches += 1
         self.load_dur += cost.load_dur
         self.backup_dur += cost.backup_dur
+        self.critical_h2d_bytes += cost.critical_h2d_bytes
 
     def on_decode_step(self, rid: str, past_len: int) -> StepCost:
         """Single-request decode step (batch of one)."""
@@ -1261,6 +1592,12 @@ class HiSparseSimulator:
             total.misses += cost.misses
             total.h2d_bytes += cost.h2d_bytes
             total.d2h_bytes += cost.d2h_bytes
+            total.main_h2d_bytes += cost.main_h2d_bytes
+            total.index_h2d_bytes += cost.index_h2d_bytes
+            total.main_d2h_bytes += cost.main_d2h_bytes
+            total.index_d2h_bytes += cost.index_d2h_bytes
+            total.index_scan_bytes += cost.index_scan_bytes
+            total.critical_h2d_bytes += cost.critical_h2d_bytes
         self._account_transfer(total)
         return total
 
@@ -1292,7 +1629,11 @@ class HiSparseSimulator:
             ),
             "hisparse_tp_size": self.tp_size,
             "hisparse_bytes_scope": self.bytes_scope,
+            "hisparse_runtime_target": (
+                p.runtime_target if p else "legacy"
+            ),
             "hisparse_offload_bytes_per_token": self.offload_bytes_per_token,
+            "hisparse_capacity_bytes_per_token": self.capacity_bytes_per_token,
             "hisparse_source_layer_ratios": (
                 list(p.source_layer_ratios) if p else []
             ),
@@ -1397,6 +1738,14 @@ class HiSparseSimulator:
                 if self.profile_enabled
                 else []
             ),
+            "hisparse_io_channel_groups": (
+                [
+                    [ratio, main_bytes, index_bytes]
+                    for ratio, main_bytes, index_bytes in self.io_channel_groups
+                ]
+                if self.profile_enabled
+                else []
+            ),
             "hisparse_top_k": self.config.top_k,
             "hisparse_device_buffer_size": self.config.device_buffer_size,
             "hisparse_padded_buffer_size": self.padded_buffer_size,
@@ -1404,6 +1753,9 @@ class HiSparseSimulator:
             "hisparse_access_model": self.config.access_model,
             "hisparse_churn": self.config.churn,
             "hisparse_recent_ratio": self.config.recent_ratio,
+            "hisparse_selection_cadence": self.config.selection_cadence,
+            "hisparse_hot_buffer_init": self.hot_buffer_init,
+            "hisparse_index_read_on_hit": int(self.config.index_read_on_hit),
             "hisparse_shared_index_freq": self.config.shared_index_freq,
             "hisparse_backup_on_critical": int(self.config.backup_on_critical),
             "hisparse_physical_pool_tokens": self.physical_pool_tokens,
@@ -1437,8 +1789,16 @@ class HiSparseSimulator:
             },
             "hisparse_h2d_bytes": int(self.h2d_bytes),
             "hisparse_d2h_bytes": int(self.d2h_bytes),
+            "hisparse_main_kv_h2d_bytes": int(self.main_h2d_bytes),
+            "hisparse_index_h2d_bytes": int(self.index_h2d_bytes),
+            "hisparse_main_kv_d2h_bytes": int(self.main_d2h_bytes),
+            "hisparse_index_d2h_bytes": int(self.index_d2h_bytes),
+            "hisparse_index_scan_bytes": int(self.index_scan_bytes),
+            "hisparse_critical_h2d_bytes": int(self.critical_h2d_bytes),
             "hisparse_staging_bytes": int(self.staging_bytes),
+            "hisparse_prefix_reused_tokens": self.prefix_reused_tokens,
             "hisparse_total_io_bytes": int(self.h2d_bytes + self.d2h_bytes + self.staging_bytes),
+            "hisparse_staging_latency_s": self.staging_dur,
             "hisparse_load_latency_s": self.load_dur,
             "hisparse_backup_latency_s": self.backup_dur,
             "hisparse_backup_hidden_latency_s": self.backup_hidden_dur,

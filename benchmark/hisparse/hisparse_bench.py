@@ -127,11 +127,13 @@ def _run_sweep(args) -> dict:
 
     profile = getattr(args, "kv_profile", "legacy")
     max_num_reqs = None
+    capacity_bytes_per_token = None
     if profile == "dsv41":
         num_layers = 40
         bytes_per_token_per_layer = 0.0
         # 80 GB HBM budget / 890 B/token ~= 89.9M hot tokens.
-        physical_tokens = int(80e9 / 890.0)
+        capacity_bytes_per_token = 890.0
+        physical_tokens = int(80e9 / capacity_bytes_per_token)
         top_k = 512
         device_buffer_size = 1024
         host_ratio = 8
@@ -146,20 +148,20 @@ def _run_sweep(args) -> dict:
         if profile == "dsv41_vllm_bf16":
             p = DSV41_VLLM_BF16_PROFILE
             kv_profile = p.name
+            capacity_bytes_per_token = p.capacity_bytes_per_token
             # Per-rank bytes; subtract steady SWA/compressor from the 80 GB
             # budget before sizing the long-KV hot pool.
             swa_bytes = max_num_reqs * p.swa_window_tokens * p.swa_bytes_per_token
             compressor_bytes = max_num_reqs * p.compressor_bytes_per_request
             physical_tokens = int(
                 (80e9 - swa_bytes - compressor_bytes)
-                / (p.offload_bytes_per_token + p.indexer_bytes_per_token)
+                / capacity_bytes_per_token
             )
         else:
             p = DSV41_FP4_PROFILE
             kv_profile = p.name
-            physical_tokens = int(
-                80e9 / (p.offload_bytes_per_token + p.indexer_bytes_per_token)
-            )
+            capacity_bytes_per_token = p.capacity_bytes_per_token
+            physical_tokens = int(80e9 / capacity_bytes_per_token)
     else:
         num_layers = 61
         # DeepSeek-V3.2 MLA, FP8 KV: (512 + 64) bytes per token per layer.
@@ -217,6 +219,8 @@ def _run_sweep(args) -> dict:
                 ),
                 "new_compressed_entries": m["hisparse_new_compressed_entries"],
                 "h2d_bytes_by_ratio": m["hisparse_h2d_bytes_by_ratio"],
+                "main_kv_h2d_gb": m["hisparse_main_kv_h2d_bytes"] / 1e9,
+                "index_h2d_gb": m["hisparse_index_h2d_bytes"] / 1e9,
             }
         )
     payload = {
@@ -225,6 +229,7 @@ def _run_sweep(args) -> dict:
             "num_layers": num_layers,
             "bytes_per_token_per_layer": bytes_per_token_per_layer,
             "physical_tokens": physical_tokens,
+            "capacity_bytes_per_token": capacity_bytes_per_token,
             "max_num_reqs": max_num_reqs,
             "top_k": top_k,
             "device_buffer_size": device_buffer_size,

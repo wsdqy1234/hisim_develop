@@ -238,6 +238,7 @@ def test_shared_index_prefetch_scales_critical_latency():
     s = shared.on_decode_batch([("r1", 4096)])
     # Same traffic, one quarter of it on the critical path.
     assert s.h2d_bytes == b.h2d_bytes
+    assert s.critical_h2d_bytes == int(s.h2d_bytes / 4)
     assert s.load_dur < b.load_dur
 
 

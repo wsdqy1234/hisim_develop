@@ -47,9 +47,10 @@ DSV4.1 使用 `test/assets/mock/config_hisparse_dsv41.json`（`top_k=512`、
 - `dsv41`：890 B/token，四层均分，L0/L1 兼容；
 - `dsv41_fp4_csa2`：890 B/token + 544 B/token indexer 假设 + L2 拓扑；
   绝对 page/allocator/SWA/compressor/admission 字节未知；
-- `dsv41_vllm_bf16`：`.22` vLLM-Ascend BF16 的 **2885 B/token/rank** 实测布局，
-  逐 source layer `(577,577,577,1154)`、allocator 4096、SWA/compressor 和
-  admission 公式已落地；TP8 不再除 8。
+- `dsv41_vllm_bf16`：`.22` vLLM-Ascend BF16 布局，payload
+  **2885 B/token/rank**、allocator/capacity **4096 B/token/rank**。逐 source
+  layer main/index split、SWA/compressor 和 admission 公式已落地；HBM 池 sizing
+  用 4096，IO/staging 用 2885，TP8 不再除 8。
 
 ```bash
 # 三个 profile 的解析 sweep
@@ -76,6 +77,14 @@ PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py bench --enable \
 `run_validation.sh` 自带的 sweep 仍是 legacy 几何；DSV4.1 sweep 请用上面的
 `--kv-profile` 单跑。注意 `.22` 的 2885 B/token/rank 与官方 FP4/CSA2 的
 890 B/token 是两个场景，不能混用；FP4 的 544 只是 indexer 设计假设。
+
+profile 的动态 access model 默认每个 decode step 都重新选 Top-K
+（`selection_cadence=every_step`），即使压缩长度不变；`compression_boundary`
+只保留为敏感性对照。可用 `HISIM_HISPARSE_SELECTION_CADENCE`、
+`HISIM_HISPARSE_HOT_BUFFER_INIT`、`HISIM_HISPARSE_INDEX_READ_ON_HIT` 覆盖。
+这些 profile 的字节布局属于 vLLM-Ascend/official 口径，不等于当前 sglang
+C4/C128 的逐字节实现；真实 Top-K/hot-buffer/SSU 校准前不要把命中率或绝对
+TPOT 当成实测预测。
 长上下文 L1 验证命令见 DSV4.1 文档 §9 的复现命令。
 
 ## 复现注意事项
