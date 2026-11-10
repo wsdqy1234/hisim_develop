@@ -1,0 +1,36 @@
+{
+    "platform": {
+        "accelerator": {
+            "name": "H20"
+        },
+        "disk_read_bandwidth_gb": 8,
+        "disk_write_bandwidth_gb": 8,
+        "memory_read_bandwidth_gb": 16,
+        "memory_write_bandwidth_gb": 16,
+        "num_device_per_node": 8,
+        "enable_l3_direct_to_l1": false,
+        "l3_to_l1_bandwidth_gb": 64,
+        "storage_tiers": [
+            {
+                "name": "local_nvme",
+                "ssd_config": "3rdparty/simpyssd/simpyssd/configs/es3500p_pcie5.cfg",
+                "read_bandwidth_gb": 14.6,
+                "write_bandwidth_gb": 8,
+                "kvcm_storage_type": "pace",
+                "kvcm_bandwidth_mbps": 14600,
+                "kvcm_capacity_gb": 100,
+                "kvcm_priority": 0
+            }
+        ]
+    },
+    "predictor": {
+        "name": "aiconfigurator",
+        "device_name": "h100_sxm"
+    },
+    "scheduler": {
+        "tp_size": 1,
+        "ep_size": 1,
+        "dp_size": 1,
+        "backend_version": "0.5.6.post2"
+    }
+}

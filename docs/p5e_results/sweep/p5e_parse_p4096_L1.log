@@ -1,0 +1,18 @@
+{
+ "label": "p4096_L1",
+ "n_reqs": 6,
+ "reuse_input_tokens": 20480,
+ "reuse_hit_tokens": 0,
+ "reuse_recomputed": 20480,
+ "coverage_pct": 0.0,
+ "host_loads": [],
+ "hbf_backup_tokens": [],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  12.6,
+  12.6,
+  12.6,
+  12.6,
+  53.4
+ ]
+}

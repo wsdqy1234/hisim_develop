@@ -1,0 +1,3 @@
+
+[ag_str] mode=agent: 16 requests
+[ag_str] wall=0.7s

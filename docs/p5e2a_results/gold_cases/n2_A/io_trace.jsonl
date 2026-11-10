@@ -1,0 +1,13 @@
+{"t": 0, "op": "backup", "pool": "dram", "path": "real", "tokens": 0, "bytes": 688128, "dur_s": 5.5e-05, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 0.011365, "op": "backup", "pool": "dram", "path": "real", "tokens": 0, "bytes": 802816, "dur_s": 6.3e-05, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 0, "op": "backup", "pool": "dram", "path": "real", "tokens": 0, "bytes": 38993920, "dur_s": 0.014299, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.011428, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 1.0, "op": "backup", "pool": "dram", "path": "real", "tokens": 0, "bytes": 38993920, "dur_s": 0.002871, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 1.02985, "op": "backup", "pool": "dram", "path": "real", "tokens": 0, "bytes": 1720320, "dur_s": 0.00013, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 1.031617, "op": "backup", "pool": "dram", "path": "real", "tokens": 0, "bytes": 1720320, "dur_s": 0.00013, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 2.0, "op": "backup", "pool": "dram", "path": "real", "tokens": 0, "bytes": 38993920, "dur_s": 0.002871, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 3.0, "op": "backup", "pool": "dram", "path": "real", "tokens": 0, "bytes": 38993920, "dur_s": 0.002871, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 3.02985, "op": "backup", "pool": "dram", "path": "real", "tokens": 0, "bytes": 1720320, "dur_s": 0.00013, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 3.031617, "op": "backup", "pool": "dram", "path": "real", "tokens": 0, "bytes": 1720320, "dur_s": 0.00013, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 5.0, "op": "load", "pool": "dram", "path": "real", "tokens": 678, "bytes": 75936, "dur_s": 1.2e-05, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 5.0, "op": "load", "pool": "dram", "path": "real", "tokens": 339, "bytes": 38879232, "dur_s": 0.002878, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": "e6c5e7d8168f491f9df1f27a5c47345b", "nodes": 0, "node_ids": []}
+{"t": 5.0, "op": "load", "pool": "dram", "path": "real", "tokens": 339, "bytes": 38879232, "dur_s": 0.005743, "media_s": 0.0, "ic_s": 0.0, "qw_s": 1.2e-05, "rid": "6f290eff43ff47ad88d7411461c45636", "nodes": 0, "node_ids": []}

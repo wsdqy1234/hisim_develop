@@ -1,0 +1,40 @@
+{
+ "label": "p256_B70",
+ "n_reqs": 6,
+ "reuse_input_tokens": 1280,
+ "reuse_hit_tokens": 510,
+ "reuse_recomputed": 770,
+ "coverage_pct": 39.8,
+ "host_loads": [
+  {
+   "hit": 255,
+   "hbf": 255,
+   "dram": 0,
+   "hb": 29245440,
+   "db": 0
+  },
+  {
+   "hit": 255,
+   "hbf": 0,
+   "dram": 255,
+   "hb": 0,
+   "db": 29245440
+  }
+ ],
+ "hbf_backup_tokens": [
+  6,
+  256,
+  15,
+  15,
+  256,
+  15
+ ],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  2.8,
+  4.5,
+  2.7,
+  3.7,
+  31.7
+ ]
+}

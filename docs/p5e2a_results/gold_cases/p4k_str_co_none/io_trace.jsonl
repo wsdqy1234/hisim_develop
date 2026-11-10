@@ -1,0 +1,12 @@
+{"t": 0, "op": "backup", "pool": "hbf", "path": "real", "tokens": 6, "bytes": 688128, "dur_s": 6.9e-05, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 1, "node_ids": [10]}
+{"t": 0.011379, "op": "backup", "pool": "dram", "path": "real", "tokens": 7, "bytes": 802816, "dur_s": 6.3e-05, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 0, "op": "backup", "pool": "hbf", "path": "real", "tokens": 4096, "bytes": 469762048, "dur_s": 0.005941, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 1, "node_ids": [12]}
+{"t": 1.0, "op": "backup", "pool": "dram", "path": "real", "tokens": 4096, "bytes": 469762048, "dur_s": 0.034545, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 1.140164, "op": "backup", "pool": "hbf", "path": "real", "tokens": 15, "bytes": 1720320, "dur_s": 0.000172, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 1, "node_ids": [14]}
+{"t": 1.142231, "op": "backup", "pool": "hbf", "path": "real", "tokens": 15, "bytes": 1720320, "dur_s": 0.000172, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 1, "node_ids": [15]}
+{"t": 2.0, "op": "backup", "pool": "hbf", "path": "real", "tokens": 4096, "bytes": 469762048, "dur_s": 0.005872, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 1, "node_ids": [16]}
+{"t": 7.001, "op": "load", "pool": "hbf", "path": "mock_lbk", "tokens": 4095, "bytes": 458640, "dur_s": 5e-06, "media_s": 5e-06, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 7.001, "op": "load", "pool": "hbf", "path": "real", "tokens": 4095, "bytes": 469647360, "dur_s": 0.000299, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": "8dbd5b0e70e047379d5fe38e005ed23e", "nodes": 0, "node_ids": []}
+{"t": 7.084337, "op": "backup", "pool": "hbf", "path": "real", "tokens": 15, "bytes": 1720320, "dur_s": 0.000172, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 1, "node_ids": [19]}
+{"t": 7.088163, "op": "load", "pool": "dram", "path": "mock_lbk", "tokens": 4095, "bytes": 458640, "dur_s": 4e-05, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": null, "nodes": 0, "node_ids": []}
+{"t": 7.088163, "op": "load", "pool": "dram", "path": "real", "tokens": 4095, "bytes": 469647360, "dur_s": 0.03458, "media_s": 0.0, "ic_s": 0.0, "qw_s": 0.0, "rid": "f7ae6576f40a48549a5109299be6104d", "nodes": 0, "node_ids": []}

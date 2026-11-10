@@ -1,0 +1,15 @@
+{
+ "case_id": "p16k_hbfo_none",
+ "config_hash": "33306be36eab37d4",
+ "wl": "p16k",
+ "scen": "HBFO",
+ "iface_hypothesis": "none",
+ "access_mode": "seq",
+ "media_read_gb": 200,
+ "media_write_gb": 10,
+ "max_total": 33100,
+ "hicache_ratio": 0.05,
+ "shared_dram": true,
+ "hbf_layer": "A-envelope",
+ "notes": "iface values are HYPOTHESES (UB unconfirmed); media 160/80 = assumed 0.8 efficiency"
+}

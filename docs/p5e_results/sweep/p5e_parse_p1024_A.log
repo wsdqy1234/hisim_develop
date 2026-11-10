@@ -1,0 +1,33 @@
+{
+ "label": "p1024_A",
+ "n_reqs": 6,
+ "reuse_input_tokens": 5120,
+ "reuse_hit_tokens": 2046,
+ "reuse_recomputed": 3074,
+ "coverage_pct": 40.0,
+ "host_loads": [
+  {
+   "hit": 1023,
+   "hbf": 0,
+   "dram": 1023,
+   "hb": 0,
+   "db": 117325824
+  },
+  {
+   "hit": 1023,
+   "hbf": 0,
+   "dram": 1023,
+   "hb": 0,
+   "db": 117325824
+  }
+ ],
+ "hbf_backup_tokens": [],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  12.5,
+  14.7,
+  12.5,
+  14.7,
+  50.5
+ ]
+}

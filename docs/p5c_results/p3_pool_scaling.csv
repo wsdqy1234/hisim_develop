@@ -1,0 +1,12 @@
+active_eff,active_wins,balance,fixed_eff,placement,qw_max_us,rand_gbps,read_gbps,seq_gbps,write_gbps
+1.0,1,0.0,0.125,balanced,12247.0,,200.0,,
+1.0,2,0.0,0.25,balanced,6026.3,,400.0,,
+1.0,4,0.0,0.5,balanced,2915.9,,800.0,,
+1.0,8,1.0,1.0,balanced,1360.8,,1600.0,,
+1.0,1,0.0,0.125,hotspot,12247.0,,200.0,,
+1.0,2,0.0,0.125,hotspot,12247.0,,200.0,,
+1.0,4,0.0,0.125,hotspot,12247.0,,200.0,,
+1.0,8,0.0,0.125,hotspot,12247.0,,200.0,,
+,8,,1.0,balanced,,,,1600.0,
+,8,,1.0,balanced,,800.0,,,
+,8,,1.0,balanced,,,,,80.0

@@ -1,0 +1,7 @@
+
+[n4_str_fix] 6 build + 4 reuse = 10 reqs (input=340, unique)...
+  [n4_str_fix] reuse 1: cached=339 e2e=247.2ms
+  [n4_str_fix] reuse 0: cached=339 e2e=246.9ms
+  [n4_str_fix] reuse 2: cached=339 e2e=246.2ms
+  [n4_str_fix] reuse 3: cached=339 e2e=294.3ms
+[n4_str_fix] Wall time: 0.311s

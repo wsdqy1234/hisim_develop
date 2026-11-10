@@ -1,0 +1,40 @@
+{
+ "label": "p16384_B70",
+ "n_reqs": 6,
+ "reuse_input_tokens": 81920,
+ "reuse_hit_tokens": 32766,
+ "reuse_recomputed": 49154,
+ "coverage_pct": 40.0,
+ "host_loads": [
+  {
+   "hit": 16383,
+   "hbf": 16383,
+   "dram": 0,
+   "hb": 1878933504,
+   "db": 0
+  },
+  {
+   "hit": 16383,
+   "hbf": 0,
+   "dram": 16383,
+   "hb": 0,
+   "db": 1878933504
+  }
+ ],
+ "hbf_backup_tokens": [
+  6,
+  16384,
+  15,
+  15,
+  16384,
+  15
+ ],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  106.8,
+  234.9,
+  106.7,
+  234.9,
+  419.6
+ ]
+}

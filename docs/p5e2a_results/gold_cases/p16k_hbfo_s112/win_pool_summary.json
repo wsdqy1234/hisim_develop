@@ -1,0 +1,156 @@
+{
+ "n_wins": 8,
+ "layer": "envelope",
+ "placement": "striped",
+ "total_ios": 46,
+ "batch_span_s": 7.296772,
+ "total_read_gb": 3.762,
+ "total_write_gb": 5.643,
+ "read_throughput_gbps": 0.52,
+ "write_throughput_gbps": 0.77,
+ "aggregate_cap_read_gbps": 1600.0,
+ "aggregate_cap_write_gbps": 80.0,
+ "shared_interface_bw_gbps": 112.0,
+ "per_win": [
+  {
+   "win": 0,
+   "used_gb": 0.705,
+   "io_count": 6,
+   "bytes_read_seq_gb": 0.47,
+   "bytes_read_rand_gb": 0.0,
+   "bytes_written_gb": 0.705,
+   "media_busy_s": 7.281154,
+   "media_service_sum_s": 0.072882,
+   "queue_wait_max_us": 68.8,
+   "n_interface_constrained": 2
+  },
+  {
+   "win": 1,
+   "used_gb": 0.706,
+   "io_count": 6,
+   "bytes_read_seq_gb": 0.47,
+   "bytes_read_rand_gb": 0.0,
+   "bytes_written_gb": 0.706,
+   "media_busy_s": 7.281153,
+   "media_service_sum_s": 0.072984,
+   "queue_wait_max_us": 0.0,
+   "n_interface_constrained": 2
+  },
+  {
+   "win": 2,
+   "used_gb": 0.706,
+   "io_count": 6,
+   "bytes_read_seq_gb": 0.47,
+   "bytes_read_rand_gb": 0.0,
+   "bytes_written_gb": 0.706,
+   "media_busy_s": 7.281154,
+   "media_service_sum_s": 0.072985,
+   "queue_wait_max_us": 0.0,
+   "n_interface_constrained": 2
+  },
+  {
+   "win": 3,
+   "used_gb": 0.705,
+   "io_count": 6,
+   "bytes_read_seq_gb": 0.472,
+   "bytes_read_rand_gb": 0.0,
+   "bytes_written_gb": 0.705,
+   "media_busy_s": 7.281154,
+   "media_service_sum_s": 0.072822,
+   "queue_wait_max_us": 9.2,
+   "n_interface_constrained": 3
+  },
+  {
+   "win": 4,
+   "used_gb": 0.706,
+   "io_count": 6,
+   "bytes_read_seq_gb": 0.47,
+   "bytes_read_rand_gb": 0.0,
+   "bytes_written_gb": 0.706,
+   "media_busy_s": 7.281154,
+   "media_service_sum_s": 0.072985,
+   "queue_wait_max_us": 0.0,
+   "n_interface_constrained": 2
+  },
+  {
+   "win": 5,
+   "used_gb": 0.705,
+   "io_count": 6,
+   "bytes_read_seq_gb": 0.472,
+   "bytes_read_rand_gb": 0.0,
+   "bytes_written_gb": 0.705,
+   "media_busy_s": 7.281163,
+   "media_service_sum_s": 0.072822,
+   "queue_wait_max_us": 9.2,
+   "n_interface_constrained": 3
+  },
+  {
+   "win": 6,
+   "used_gb": 0.705,
+   "io_count": 5,
+   "bytes_read_seq_gb": 0.47,
+   "bytes_read_rand_gb": 0.0,
+   "bytes_written_gb": 0.705,
+   "media_busy_s": 7.281154,
+   "media_service_sum_s": 0.072813,
+   "queue_wait_max_us": 0.0,
+   "n_interface_constrained": 2
+  },
+  {
+   "win": 7,
+   "used_gb": 0.705,
+   "io_count": 5,
+   "bytes_read_seq_gb": 0.47,
+   "bytes_read_rand_gb": 0.0,
+   "bytes_written_gb": 0.705,
+   "media_busy_s": 7.281154,
+   "media_service_sum_s": 0.072813,
+   "queue_wait_max_us": 0.0,
+   "n_interface_constrained": 2
+  }
+ ],
+ "objects": {
+  "n_objects": 7,
+  "n_evictions": 0,
+  "n_migrations": 0,
+  "n_stale_blocked_restores": 0,
+  "win_bytes": [
+   710492160,
+   704643072,
+   704643072,
+   704643072,
+   704643072,
+   704643072,
+   704643072,
+   704643072
+  ],
+  "fragmented_objects": 3,
+  "reads_total": 2
+ },
+ "conservation": {
+  "n_objects": 7,
+  "total_slots": 49203,
+  "slot_index_entries": 49203,
+  "win_bytes": [
+   710492160,
+   704643072,
+   704643072,
+   704643072,
+   704643072,
+   704643072,
+   704643072,
+   704643072
+  ],
+  "total_bytes": 5642993664,
+  "accounted_bytes": 5642993664,
+  "bytes_consistent": true,
+  "slots_consistent": true,
+  "states": {
+   "ALLOCATED": 0,
+   "BACKING_UP": 0,
+   "READY": 7,
+   "RESTORING": 0,
+   "EVICTED": 0
+  }
+ }
+}

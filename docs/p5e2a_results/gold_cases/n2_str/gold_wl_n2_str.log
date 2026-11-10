@@ -1,0 +1,5 @@
+
+[n2_str] 4 build + 2 reuse = 6 reqs (input=340, unique)...
+  [n2_str] reuse 1: cached=339 e2e=274.9ms
+  [n2_str] reuse 0: cached=339 e2e=273.8ms
+[n2_str] Wall time: 0.289s

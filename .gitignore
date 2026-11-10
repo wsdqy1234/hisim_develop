@@ -13,6 +13,12 @@ __pycache__/
 *_config.json
 *.so
 
+# Phase deliverable archives: full evidence (CSV/log/config) must be kept
+!docs/p5c_results/**
+!docs/p5d_results/**
+!docs/p5e_results/**
+!docs/p5e2a_results/**
+
 build/
 tmp/
 logs/

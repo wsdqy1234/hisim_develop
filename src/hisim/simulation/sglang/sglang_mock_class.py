@@ -1230,6 +1230,22 @@ class MockHiCacheStorage:
     _DEBUG_BATCH_SET_COUNT = 0
     _DEBUG_BATCH_EXISTS_COUNT = 0
     _DEBUG_BATCH_EXISTS_HITS = 0
+    _DEBUG_BATCH_GET_COUNT = 0
+    _DEBUG_BATCH_GET_HITS = 0
+    # Phase 2d-Final: hash key tracing for L3 write/query consistency
+    _WRITTEN_KEYS: set = set()
+    _QUERY_TRACES: list = []  # list of (first_key, exists, n_keys)
+
+    @classmethod
+    def reset_traces(cls):
+        """Reset all debug counters and traces (call at test start)."""
+        cls._DEBUG_BATCH_SET_COUNT = 0
+        cls._DEBUG_BATCH_EXISTS_COUNT = 0
+        cls._DEBUG_BATCH_EXISTS_HITS = 0
+        cls._DEBUG_BATCH_GET_COUNT = 0
+        cls._DEBUG_BATCH_GET_HITS = 0
+        cls._WRITTEN_KEYS = set()
+        cls._QUERY_TRACES = []
 
     def __init__(self, *args, **kwargs):
         self._last_per_tier_hits = None
@@ -1340,11 +1356,14 @@ class MockHiCacheStorage:
     ) -> bool:
         if self.exists(key):
             return True
-        self.storage.add(key)
-        if self.persist_storage:
-            os.makedirs(os.path.dirname(self.storage_file_path), exist_ok=True)
-            with open(self.storage_file_path, "a+") as f:
-                f.write(key + "\n")
+        if hasattr(self, "storage"):
+            self.storage.add(key)
+            if self.persist_storage:
+                os.makedirs(os.path.dirname(self.storage_file_path), exist_ok=True)
+                with open(self.storage_file_path, "a+") as f:
+                    f.write(key + "\n")
+        else:
+            MockHiCacheStorage._WRITTEN_KEYS.add(key)
         return True
 
     def batch_set(
@@ -1355,6 +1374,18 @@ class MockHiCacheStorage:
         target_locations: Optional[Any] = None,
         target_sizes: Optional[Any] = None,
     ) -> bool:
+        # Phase 2d-Final: trace written keys for L3 hash consistency check
+        if extra_info and extra_info.prefix_keys is not None:
+            _complete = extra_info.prefix_keys + keys
+        else:
+            _complete = keys
+        for _k in _complete:
+            MockHiCacheStorage._WRITTEN_KEYS.add(_k)
+        logger.info(
+            f"[L3-TRACE] WRITE n_keys={len(keys)} "
+            f"prefix_keys={len(extra_info.prefix_keys) if extra_info and extra_info.prefix_keys else 0} "
+            f"first_key={_complete[0][:16] if _complete else 'N/A'}..."
+        )
         if hasattr(self, "storage_manager"):
             if extra_info and extra_info.prefix_keys is not None:
                 complete_prefix_hashs = extra_info.prefix_keys + keys
@@ -1390,7 +1421,11 @@ class MockHiCacheStorage:
             return True
 
     def exists(self, key: str) -> bool:
-        return key in self.storage
+        if hasattr(self, "storage"):
+            return key in self.storage
+        # kvcm path: Metadata-only Restore Mock uses _WRITTEN_KEYS
+        # (populated by batch_set tracing) for existence checks.
+        return key in MockHiCacheStorage._WRITTEN_KEYS
 
     def batch_exists(self, keys: List[str], extra_info) -> int:
         """
@@ -1398,6 +1433,19 @@ class MockHiCacheStorage:
         return the number of consecutive existing keys from the start.
         Can be overridden by subclasses for more efficient implementation.
         """
+        # Phase 2d-Final: trace queried keys for L3 hash consistency check
+        _first_exists = keys[0] in MockHiCacheStorage._WRITTEN_KEYS if keys else False
+        _any_match = sum(1 for k in keys if k in MockHiCacheStorage._WRITTEN_KEYS)
+        logger.info(
+            f"[L3-TRACE] QUERY n_keys={len(keys)} "
+            f"first_key={keys[0][:16] if keys else 'N/A'}... "
+            f"first_in_written={_first_exists} "
+            f"any_match={_any_match}/{len(keys)} "
+            f"total_written={len(MockHiCacheStorage._WRITTEN_KEYS)}"
+        )
+        MockHiCacheStorage._QUERY_TRACES.append(
+            (keys[0][:16] if keys else "", _first_exists, len(keys))
+        )
         if hasattr(self, "storage_manager"):
             int_hash_keys = [_pass_str_to_block_ids(key) for key in keys]
             # Call the kvcm interface to match L3 prefix
@@ -1448,11 +1496,36 @@ class MockHiCacheStorage:
     ):
         """sglang >= 0.5.10 page-get interface.
 
-        The mock backend only tracks keys (no real KV data), so every load is
-        reported as a miss (``None`` -> 0 pages loaded by the controller)."""
-        return None
+        Metadata-only Restore Mock: returns the dummy pages passed in by the
+        caller (_generic_page_get) for keys that exist in the storage set,
+        signaling a successful logical read. ``set_from_flat_data_page`` is a
+        no-op on the mock host pool, so no real KV tensor is materialised —
+        only the radix-tree bookkeeping (host_indices insertion) and the L2
+        load-back timing (mock_start_loading) proceed as if data were restored.
+
+        Applicability boundary: CPU Mock mode only. Does NOT validate real KV
+        tensor integrity; it validates cache management logic, placement
+        policy, and the timing model (L3 read → L2 load-back → TTFT).
+        """
+        if target_locations is None:
+            # Fallback when caller doesn't pass dummy pages: synthesise
+            # non-None sentinels so _generic_page_get counts them as loaded.
+            target_locations = [True] * len(keys)
+        result = []
+        for i, key in enumerate(keys):
+            if self.exists(key):
+                result.append(target_locations[i])
+            else:
+                result.append(None)
+        MockHiCacheStorage._DEBUG_BATCH_GET_COUNT += 1
+        MockHiCacheStorage._DEBUG_BATCH_GET_HITS += sum(
+            1 for r in result if r is not None
+        )
+        return result
 
     def get(self, key: str, target_location=None, target_sizes=None):
+        if self.exists(key):
+            return target_location if target_location is not None else True
         return None
 
     # --- sglang >= 0.5.10 storage backend interfaces (HybridCacheController) --- #
@@ -1463,13 +1536,23 @@ class MockHiCacheStorage:
         self.registered_pools[host_pool_name] = host_pool
 
     def batch_get_v1(self, keys, host_indices, extra_info=None):
-        return [False] * len(keys)
+        # Metadata-only Restore Mock: return True for existing keys.
+        return [self.exists(k) for k in keys]
 
     def batch_set_v1(self, keys, host_indices, extra_info=None):
         return self.batch_set(keys, [None] * len(keys), extra_info)
 
     def batch_get_v2(self, transfers, extra_info=None):
-        return {}
+        # Metadata-only Restore Mock: return per-transfer hit lists for
+        # existing keys. count_pool_hits counts consecutive True values.
+        results = {}
+        for transfer in transfers or []:
+            name = transfer.name
+            keys = transfer.keys or []
+            if not keys and transfer.host_indices is not None:
+                keys = [""] * int(transfer.host_indices.numel())
+            results[str(name)] = [self.exists(k) for k in keys]
+        return results
 
     def batch_set_v2(self, transfers, extra_info=None):
         return {}

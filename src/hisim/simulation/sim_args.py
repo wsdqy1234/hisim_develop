@@ -3,7 +3,24 @@ import dataclasses
 import json
 from typing import Optional
 
-from hisim.simulation.types import StorageTierConfig
+from hisim.simulation.types import StorageTierConfig, HBFConfig
+
+
+def _parse_hbf_config(hbf_dict):
+    """Parse HBF config dict into HBFConfig dataclass."""
+    if not hbf_dict:
+        return None
+    return HBFConfig(
+        capacity_gb=hbf_dict.get("capacity_gb", 1024.0),
+        read_bandwidth_gb=hbf_dict.get("read_bandwidth_gb", 512.0),
+        write_bandwidth_gb=hbf_dict.get("write_bandwidth_gb"),
+        read_latency_us=hbf_dict.get("read_latency_us", 10.0),
+        write_latency_us=hbf_dict.get("write_latency_us", 100.0),
+        channels=hbf_dict.get("channels", 32),
+        queue_depth=hbf_dict.get("queue_depth", 128),
+        hbm_cache_gb=hbf_dict.get("hbm_cache_gb", 8.0),
+        placement_ratio=hbf_dict.get("placement_ratio", 0.7),
+    )
 
 
 @dataclasses.dataclass
@@ -22,6 +39,8 @@ class PlatformConfig:
     memory_write_bandwidth_gb: float = 64.0
     storage_tiers: list = dataclasses.field(default_factory=list)
     tier_read_mode: str = "parallel"
+    enable_hbf: bool = False
+    hbf: Optional[HBFConfig] = None
 
 
 @dataclasses.dataclass
@@ -180,6 +199,8 @@ class SimulationArgs:
                 ),
                 storage_tiers=storage_tiers,
                 tier_read_mode=platform.get("tier_read_mode", "parallel"),
+                enable_hbf=platform.get("enable_hbf", False),
+                hbf=_parse_hbf_config(platform.get("hbf")) if platform.get("enable_hbf") else None,
             ),
             predictor=PredictorConfig(
                 name=predictor.get("name", "aiconfigurator"),

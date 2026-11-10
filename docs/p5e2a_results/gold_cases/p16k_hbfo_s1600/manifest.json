@@ -1,0 +1,15 @@
+{
+ "case_id": "p16k_hbfo_s1600",
+ "config_hash": "a8d6701ae8a8187b",
+ "wl": "p16k",
+ "scen": "HBFO",
+ "iface_hypothesis": "s1600",
+ "access_mode": "seq",
+ "media_read_gb": 200,
+ "media_write_gb": 10,
+ "max_total": 33100,
+ "hicache_ratio": 0.05,
+ "shared_dram": true,
+ "hbf_layer": "A-envelope",
+ "notes": "iface values are HYPOTHESES (UB unconfirmed); media 160/80 = assumed 0.8 efficiency"
+}

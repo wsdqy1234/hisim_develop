@@ -1,7 +1,8 @@
 import json
 
 from hisim.spec import ModelInfo, AcceleratorInfo, DataType
-from hisim.simulation.types import PlatformConfig, SchedulerConfig, StorageTierConfig
+from hisim.simulation.types import PlatformConfig, SchedulerConfig, StorageTierConfig, HBFConfig
+from hisim.simulation.sim_args import _parse_hbf_config
 from hisim.simulation.manager import Envs
 from hisim.simulation.utils import (
     calc_kv_cache_cell_elems,
@@ -96,6 +97,8 @@ class ConfigManager:
                     "enable_l3_direct_to_l1", False
                 ),
                 l3_to_l1_bandwidth_gb=platform_config.get("l3_to_l1_bandwidth_gb"),
+                enable_hbf=platform_config.get("enable_hbf", False),
+                hbf=_parse_hbf_config(platform_config.get("hbf")) if platform_config.get("enable_hbf") else None,
             )
 
             logger.info(

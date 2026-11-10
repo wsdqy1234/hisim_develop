@@ -1,0 +1,40 @@
+{
+ "label": "p4096_B70",
+ "n_reqs": 6,
+ "reuse_input_tokens": 20480,
+ "reuse_hit_tokens": 8190,
+ "reuse_recomputed": 12290,
+ "coverage_pct": 40.0,
+ "host_loads": [
+  {
+   "hit": 4095,
+   "hbf": 4095,
+   "dram": 0,
+   "hb": 469647360,
+   "db": 0
+  },
+  {
+   "hit": 4095,
+   "hbf": 0,
+   "dram": 4095,
+   "hb": 0,
+   "db": 469647360
+  }
+ ],
+ "hbf_backup_tokens": [
+  6,
+  4096,
+  15,
+  15,
+  4096,
+  15
+ ],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  18.5,
+  58.7,
+  18.4,
+  58.7,
+  123.5
+ ]
+}

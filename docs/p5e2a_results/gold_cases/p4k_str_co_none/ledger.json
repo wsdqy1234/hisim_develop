@@ -1,0 +1,476 @@
+{
+ "case_id": "p4k_str_co_none",
+ "n_batches": 60,
+ "prefill_batches": [
+  {
+   "i": 0,
+   "type": "PREFILL",
+   "bs": 1,
+   "load_us": 0.0,
+   "infer_ms": 1.925,
+   "backup_us": 68.8,
+   "l3_ovf_us": 0.0,
+   "clock_ms": 1.994
+  },
+  {
+   "i": 8,
+   "type": "PREFILL",
+   "bs": 1,
+   "load_us": 0.0,
+   "infer_ms": 12.558,
+   "backup_us": 5940.8,
+   "l3_ovf_us": 0.0,
+   "clock_ms": 18.499
+  },
+  {
+   "i": 10,
+   "type": "PREFILL",
+   "bs": 1,
+   "load_us": 0.0,
+   "infer_ms": 12.558,
+   "backup_us": 34545.3,
+   "l3_ovf_us": 11616.5,
+   "clock_ms": 1058.72
+  },
+  {
+   "i": 26,
+   "type": "PREFILL",
+   "bs": 1,
+   "load_us": 0.0,
+   "infer_ms": 12.558,
+   "backup_us": 5872.0,
+   "l3_ovf_us": 0.0,
+   "clock_ms": 2018.43
+  },
+  {
+   "i": 28,
+   "type": "PREFILL",
+   "bs": 1,
+   "load_us": 298.6,
+   "infer_ms": 1.759,
+   "backup_us": 0.0,
+   "l3_ovf_us": 56662.2,
+   "clock_ms": 7059.72
+  },
+  {
+   "i": 44,
+   "type": "PREFILL",
+   "bs": 1,
+   "load_us": 34580.0,
+   "infer_ms": 1.759,
+   "backup_us": 0.0,
+   "l3_ovf_us": 0.0,
+   "clock_ms": 7124.503
+  }
+ ],
+ "n_io_ops": 12,
+ "io_ops": [
+  {
+   "t": 0,
+   "op": "backup",
+   "pool": "hbf",
+   "path": "real",
+   "tokens": 6,
+   "bytes": 688128,
+   "dur_s": 6.9e-05,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": null,
+   "nodes": 1,
+   "node_ids": [
+    10
+   ]
+  },
+  {
+   "t": 0.011379,
+   "op": "backup",
+   "pool": "dram",
+   "path": "real",
+   "tokens": 7,
+   "bytes": 802816,
+   "dur_s": 6.3e-05,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": null,
+   "nodes": 0,
+   "node_ids": []
+  },
+  {
+   "t": 0,
+   "op": "backup",
+   "pool": "hbf",
+   "path": "real",
+   "tokens": 4096,
+   "bytes": 469762048,
+   "dur_s": 0.005941,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": null,
+   "nodes": 1,
+   "node_ids": [
+    12
+   ]
+  },
+  {
+   "t": 1.0,
+   "op": "backup",
+   "pool": "dram",
+   "path": "real",
+   "tokens": 4096,
+   "bytes": 469762048,
+   "dur_s": 0.034545,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": null,
+   "nodes": 0,
+   "node_ids": []
+  },
+  {
+   "t": 1.140164,
+   "op": "backup",
+   "pool": "hbf",
+   "path": "real",
+   "tokens": 15,
+   "bytes": 1720320,
+   "dur_s": 0.000172,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": null,
+   "nodes": 1,
+   "node_ids": [
+    14
+   ]
+  },
+  {
+   "t": 1.142231,
+   "op": "backup",
+   "pool": "hbf",
+   "path": "real",
+   "tokens": 15,
+   "bytes": 1720320,
+   "dur_s": 0.000172,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": null,
+   "nodes": 1,
+   "node_ids": [
+    15
+   ]
+  },
+  {
+   "t": 2.0,
+   "op": "backup",
+   "pool": "hbf",
+   "path": "real",
+   "tokens": 4096,
+   "bytes": 469762048,
+   "dur_s": 0.005872,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": null,
+   "nodes": 1,
+   "node_ids": [
+    16
+   ]
+  },
+  {
+   "t": 7.001,
+   "op": "load",
+   "pool": "hbf",
+   "path": "mock_lbk",
+   "tokens": 4095,
+   "bytes": 458640,
+   "dur_s": 5e-06,
+   "media_s": 5e-06,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": null,
+   "nodes": 0,
+   "node_ids": []
+  },
+  {
+   "t": 7.001,
+   "op": "load",
+   "pool": "hbf",
+   "path": "real",
+   "tokens": 4095,
+   "bytes": 469647360,
+   "dur_s": 0.000299,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": "8dbd5b0e70e047379d5fe38e005ed23e",
+   "nodes": 0,
+   "node_ids": []
+  },
+  {
+   "t": 7.084337,
+   "op": "backup",
+   "pool": "hbf",
+   "path": "real",
+   "tokens": 15,
+   "bytes": 1720320,
+   "dur_s": 0.000172,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": null,
+   "nodes": 1,
+   "node_ids": [
+    19
+   ]
+  },
+  {
+   "t": 7.088163,
+   "op": "load",
+   "pool": "dram",
+   "path": "mock_lbk",
+   "tokens": 4095,
+   "bytes": 458640,
+   "dur_s": 4e-05,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": null,
+   "nodes": 0,
+   "node_ids": []
+  },
+  {
+   "t": 7.088163,
+   "op": "load",
+   "pool": "dram",
+   "path": "real",
+   "tokens": 4095,
+   "bytes": 469647360,
+   "dur_s": 0.03458,
+   "media_s": 0.0,
+   "ic_s": 0.0,
+   "qw_s": 0.0,
+   "rid": "f7ae6576f40a48549a5109299be6104d",
+   "nodes": 0,
+   "node_ids": []
+  }
+ ],
+ "events": [
+  {
+   "kind": "host_load",
+   "rid": "8dbd5b0e70e047379d5fe38e005ed23e",
+   "host_hit": 4095,
+   "hbf_tk": 4095,
+   "dram_tk": 0,
+   "hbf_bytes": 469647360,
+   "dram_bytes": 0
+  },
+  {
+   "kind": "host_load",
+   "rid": "f7ae6576f40a48549a5109299be6104d",
+   "host_hit": 4095,
+   "hbf_tk": 0,
+   "dram_tk": 4095,
+   "hbf_bytes": 0,
+   "dram_bytes": 469647360
+  },
+  {
+   "kind": "hbf_backup",
+   "tokens": 6,
+   "bytes_mb": 0.69,
+   "dur_us": 68.8
+  },
+  {
+   "kind": "hbf_backup",
+   "tokens": 4096,
+   "bytes_mb": 469.76,
+   "dur_us": 5940.8
+  },
+  {
+   "kind": "hbf_backup",
+   "tokens": 15,
+   "bytes_mb": 1.72,
+   "dur_us": 172.0
+  },
+  {
+   "kind": "hbf_backup",
+   "tokens": 15,
+   "bytes_mb": 1.72,
+   "dur_us": 172.0
+  },
+  {
+   "kind": "hbf_backup",
+   "tokens": 4096,
+   "bytes_mb": 469.76,
+   "dur_us": 5872.0
+  },
+  {
+   "kind": "hbf_backup",
+   "tokens": 15,
+   "bytes_mb": 1.72,
+   "dur_us": 172.0
+  }
+ ],
+ "requests": [
+  {
+   "rid": "",
+   "input": 1,
+   "actual": 6,
+   "l1": 0,
+   "hbf": 0,
+   "dram": 0,
+   "l3": 0,
+   "rc": 6,
+   "cons_ok": true,
+   "ttft_ms": -998.0,
+   "io_ops": [],
+   "load_media_us": 0,
+   "load_ic_us": 0,
+   "load_dur_us": 0,
+   "backup_dur_us": 0
+  },
+  {
+   "rid": "789baa188733432bb6150e7bff11b701",
+   "input": 4096,
+   "actual": 4096,
+   "l1": 0,
+   "hbf": 0,
+   "dram": 0,
+   "l3": 0,
+   "rc": 4096,
+   "cons_ok": true,
+   "ttft_ms": 18.5,
+   "io_ops": [],
+   "load_media_us": 0,
+   "load_ic_us": 0,
+   "load_dur_us": 0,
+   "backup_dur_us": 0
+  },
+  {
+   "rid": "1ad95c3a4c3d443db2ec5472ca6b78da",
+   "input": 4096,
+   "actual": 4096,
+   "l1": 0,
+   "hbf": 0,
+   "dram": 0,
+   "l3": 0,
+   "rc": 4096,
+   "cons_ok": true,
+   "ttft_ms": 58.7,
+   "io_ops": [],
+   "load_media_us": 0,
+   "load_ic_us": 0,
+   "load_dur_us": 0,
+   "backup_dur_us": 0
+  },
+  {
+   "rid": "ef44e11663eb4033bbf398f850bdf58c",
+   "input": 4096,
+   "actual": 4096,
+   "l1": 0,
+   "hbf": 0,
+   "dram": 0,
+   "l3": 0,
+   "rc": 4096,
+   "cons_ok": true,
+   "ttft_ms": 18.4,
+   "io_ops": [],
+   "load_media_us": 0,
+   "load_ic_us": 0,
+   "load_dur_us": 0,
+   "backup_dur_us": 0
+  },
+  {
+   "rid": "8dbd5b0e70e047379d5fe38e005ed23e",
+   "input": 4096,
+   "actual": 4096,
+   "l1": 0,
+   "hbf": 4095,
+   "dram": 0,
+   "l3": 0,
+   "rc": 1,
+   "cons_ok": true,
+   "ttft_ms": 59.7,
+   "io_ops": [
+    {
+     "op": "load",
+     "pool": "hbf",
+     "tokens": 4095,
+     "bytes": 469647360,
+     "dur_us": 299.0,
+     "media_us": 0.0,
+     "ic_us": 0.0,
+     "qw_us": 0.0,
+     "arrival_s": 7.001
+    }
+   ],
+   "load_media_us": 0.0,
+   "load_ic_us": 0.0,
+   "load_dur_us": 299.0,
+   "backup_dur_us": 0
+  },
+  {
+   "rid": "f7ae6576f40a48549a5109299be6104d",
+   "input": 4096,
+   "actual": 4096,
+   "l1": 0,
+   "hbf": 0,
+   "dram": 4095,
+   "l3": 0,
+   "rc": 1,
+   "cons_ok": true,
+   "ttft_ms": 123.5,
+   "io_ops": [
+    {
+     "op": "load",
+     "pool": "dram",
+     "tokens": 4095,
+     "bytes": 469647360,
+     "dur_us": 34580.0,
+     "media_us": 0.0,
+     "ic_us": 0.0,
+     "qw_us": 0.0,
+     "arrival_s": 7.088163
+    }
+   ],
+   "load_media_us": 0.0,
+   "load_ic_us": 0.0,
+   "load_dur_us": 34580.0,
+   "backup_dur_us": 0
+  }
+ ],
+ "reuse_ledgers": [
+  {
+   "rid": "8dbd5b0e70e0",
+   "hbf_tk": 4095,
+   "dram_tk": 0,
+   "ttft_ms": 59.7,
+   "ledger": {
+    "own_hbf_load_us": 299.0,
+    "own_dram_load_us": 0,
+    "hbf_media_us": 0.0,
+    "hbf_ic_us": 0.0,
+    "load_media_max_us": 299.0,
+    "note": "phases serial (load->infer); cross-media loads parallel (max); same-medium concurrent loads serialize via shared resource cursor"
+   }
+  },
+  {
+   "rid": "f7ae6576f40a",
+   "hbf_tk": 0,
+   "dram_tk": 4095,
+   "ttft_ms": 123.5,
+   "ledger": {
+    "own_hbf_load_us": 0,
+    "own_dram_load_us": 34580.0,
+    "hbf_media_us": 0,
+    "hbf_ic_us": 0,
+    "load_media_max_us": 34580.0,
+    "note": "phases serial (load->infer); cross-media loads parallel (max); same-medium concurrent loads serialize via shared resource cursor"
+   }
+  }
+ ],
+ "conservation_all": true
+}

@@ -1,0 +1,3 @@
+{"placement": "striped", "stripe_block_tokens": 2048,
+ "layer": "envelope", "default_access_mode": "sequential",
+ "package_shared_interface_bw": 112000000000.0}

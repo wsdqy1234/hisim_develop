@@ -1,0 +1,33 @@
+{
+ "label": "p16384_A",
+ "n_reqs": 6,
+ "reuse_input_tokens": 81920,
+ "reuse_hit_tokens": 32766,
+ "reuse_recomputed": 49154,
+ "coverage_pct": 40.0,
+ "host_loads": [
+  {
+   "hit": 16383,
+   "hbf": 0,
+   "dram": 16383,
+   "hb": 0,
+   "db": 1878933504
+  },
+  {
+   "hit": 16383,
+   "hbf": 0,
+   "dram": 16383,
+   "hb": 0,
+   "db": 1878933504
+  }
+ ],
+ "hbf_backup_tokens": [],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  221.4,
+  234.9,
+  221.4,
+  234.9,
+  419.5
+ ]
+}

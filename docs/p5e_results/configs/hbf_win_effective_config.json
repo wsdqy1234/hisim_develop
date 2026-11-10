@@ -1,0 +1,39 @@
+{
+  "n_wins": 8,
+  "win": {
+    "capacity_bytes": 100000000000.0,
+    "seq_read_bw": 200000000000.0,
+    "rand_read_bw": 100000000000.0,
+    "write_bw": 10000000000.0,
+    "read_latency_s": 7.5e-06,
+    "write_latency_s": 0.0001,
+    "source": "expert-2026-11"
+  },
+  "layer": "envelope",
+  "default_access_mode": "sequential",
+  "placement": "striped",
+  "hotspot_win": 0,
+  "stripe_block_tokens": 43,
+  "per_win_interface_bw": null,
+  "package_shared_interface_bw": null,
+  "interface_full_duplex": false,
+  "queue_depth": 128,
+  "pagesim_assumptions": {
+    "channels": 32,
+    "planes_per_channel": 32,
+    "page_bytes": 16384,
+    "read_latency_s": 1e-05,
+    "write_latency_s": 0.0001,
+    "channel_rate": 1600000000.0,
+    "note": "ASSUMPTION: WIN geometry unknown; HBFSim nominal placeholder; NOT expert-calibrated; do not tune to match 200 GB/s"
+  },
+  "spec_source": "expert-2026-11",
+  "assumptions": {
+    "win.write_latency_s": "NOT expert-given (NAND ballpark)",
+    "win.read_latency_s": "expert range 5-10\u03bcs, midpoint chosen",
+    "pagesim_assumptions.*": "ASSUMPTION: WIN geometry unknown; HBFSim nominal placeholder; NOT expert-calibrated; do not tune to match 200 GB/s",
+    "per_win_interface_bw / package_shared_interface_bw": "UB\u00d74@224G unresolved: G unit, lane count, per-WIN vs package-shared, duplex, encoding overhead all unknown; default None = unconstrained",
+    "interface_full_duplex": "half-duplex modeled by default",
+    "aggregate_caps": "1600/800/80 GB/s emerge from per-WIN limits; not separately enforced"
+  }
+}

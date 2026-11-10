@@ -1,0 +1,33 @@
+{
+ "label": "p512_B70",
+ "n_reqs": 6,
+ "reuse_input_tokens": 2560,
+ "reuse_hit_tokens": 1022,
+ "reuse_recomputed": 1538,
+ "coverage_pct": 39.9,
+ "host_loads": [
+  {
+   "hit": 511,
+   "hbf": 511,
+   "dram": 0,
+   "hb": 58605568,
+   "db": 0
+  }
+ ],
+ "hbf_backup_tokens": [
+  6,
+  512,
+  15,
+  15,
+  512,
+  15
+ ],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  3.6,
+  7.3,
+  3.5,
+  7.3,
+  34.6
+ ]
+}

@@ -1,0 +1,25 @@
+{
+ "label": "p128_B70",
+ "n_reqs": 6,
+ "reuse_input_tokens": 640,
+ "reuse_hit_tokens": 254,
+ "reuse_recomputed": 386,
+ "coverage_pct": 39.7,
+ "host_loads": [],
+ "hbf_backup_tokens": [
+  6,
+  128,
+  15,
+  15,
+  128,
+  15
+ ],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  2.3,
+  3.1,
+  2.2,
+  1.8,
+  1.8
+ ]
+}

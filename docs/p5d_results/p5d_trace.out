@@ -1,0 +1,22 @@
+====================================================================================================
+Phase 5D P4-B: 800GB-scale capacity trace (virtual objects, 340tk sessions, agent-style reuse ×2)
+Equal-capacity A/B keep total Host bytes IDENTICAL; expansion C reported separately
+====================================================================================================
+[S2000] ws=    78GB α=0.5 mode=A host=    39GB (HBF     0 + DRAM    39) hit= 33.3% (L1 2000/HBF 0/DRAM 0/RC 4000) TTFT p50/p95=4.76/4.76ms backupP95=2.87ms
+[S2000] ws=    78GB α=0.5 mode=B host=    39GB (HBF    27 + DRAM    12) hit= 33.3% (L1 2000/HBF 0/DRAM 0/RC 4000) TTFT p50/p95=4.76/4.76ms backupP95=2.87ms
+[S2000] ws=    78GB α=1.0 mode=A host=    78GB (HBF     0 + DRAM    78) hit= 66.7% (L1 2000/HBF 0/DRAM 2000/RC 2000) TTFT p50/p95=2.87/4.76ms backupP95=2.87ms
+[S2000] ws=    78GB α=1.0 mode=B host=    78GB (HBF    55 + DRAM    23) hit= 63.3% (L1 2000/HBF 1200/DRAM 600/RC 2200) TTFT p50/p95=0.02/4.76ms backupP95=2.87ms
+[S2000] ws=    78GB α=2.0 mode=A host=   156GB (HBF     0 + DRAM   156) hit= 66.7% (L1 2000/HBF 0/DRAM 2000/RC 2000) TTFT p50/p95=2.87/4.76ms backupP95=2.87ms
+[S2000] ws=    78GB α=2.0 mode=B host=   156GB (HBF   109 + DRAM    47) hit= 66.7% (L1 2000/HBF 1400/DRAM 600/RC 2000) TTFT p50/p95=0.02/4.76ms backupP95=2.87ms
+[S8000] ws=   312GB α=0.5 mode=A host=   156GB (HBF     0 + DRAM   156) hit= 33.3% (L1 8000/HBF 0/DRAM 0/RC 16000) TTFT p50/p95=4.76/4.76ms backupP95=2.87ms
+[S8000] ws=   312GB α=0.5 mode=B host=   156GB (HBF   109 + DRAM    47) hit= 33.3% (L1 8000/HBF 0/DRAM 0/RC 16000) TTFT p50/p95=4.76/4.76ms backupP95=2.87ms
+[S8000] ws=   312GB α=1.0 mode=A host=   312GB (HBF     0 + DRAM   312) hit= 66.7% (L1 8000/HBF 0/DRAM 8000/RC 8000) TTFT p50/p95=2.87/4.76ms backupP95=2.87ms
+[S8000] ws=   312GB α=1.0 mode=B host=   312GB (HBF   218 + DRAM    94) hit= 63.3% (L1 8000/HBF 4800/DRAM 2400/RC 8800) TTFT p50/p95=0.02/4.76ms backupP95=2.87ms
+[S8000] ws=   312GB α=2.0 mode=A host=   624GB (HBF     0 + DRAM   624) hit= 66.7% (L1 8000/HBF 0/DRAM 8000/RC 8000) TTFT p50/p95=2.87/4.76ms backupP95=2.87ms
+[S8000] ws=   312GB α=2.0 mode=B host=   624GB (HBF   437 + DRAM   187) hit= 66.7% (L1 8000/HBF 5600/DRAM 2400/RC 8000) TTFT p50/p95=0.02/4.76ms backupP95=2.87ms
+[S20517-800GB] ws=   800GB α=1.0 mode=A host=   800GB (HBF     0 + DRAM   800) hit= 66.7% (L1 20517/HBF 0/DRAM 20517/RC 20517) TTFT p50/p95=2.87/4.76ms backupP95=2.87ms
+[S20517-800GB] ws=   800GB α=1.0 mode=B host=   800GB (HBF   560 + DRAM   240) hit= 63.3% (L1 20517/HBF 14363/DRAM 4102/RC 22569) TTFT p50/p95=0.02/4.76ms backupP95=2.87ms
+[expansion-baseline] ws=1170GB mode=A DRAM=800GB hit=33.3% TTFT p50/p95=4.76/4.76ms
+[expansion] ws=1170GB mode=C DRAM=800GB+HBF-extra=800GB (1.6TB host) hit=43.3% TTFT p50/p95=4.76/4.76ms backupP95=2.87ms
+
+→ /tmp/p5d_results/p4b_capacity_trace.csv

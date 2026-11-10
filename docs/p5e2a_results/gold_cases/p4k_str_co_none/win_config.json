@@ -1,0 +1,6 @@
+{
+  "placement": "striped", "stripe_block_tokens": 512, "layer": "envelope",
+  "default_access_mode": "sequential",
+  "package_shared_interface_bw": null,
+  "win": {"seq_read_bw": 200000000000, "rand_read_bw": 100000000000, "write_bw": 10000000000, "read_latency_s": 5e-06, "write_latency_s": 5e-06, "capacity_bytes": 100000000000}
+}

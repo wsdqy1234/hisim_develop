@@ -1,0 +1,229 @@
+Phase 5C scan — Layer A = expert envelope; Layer B = ASSUMED geometry (NOT calibrated, NOT tuned)
+
+================================================================================================
+P2: SINGLE-WIN I/O efficiency (n_wins=1; fixed = active denominator)
+================================================================================================
+
+--- Layer A (envelope, expert spec) ---
+
+[seq]  eff vs size × QD (lat=7.5μs):
+   size QD1      QD4      QD8      QD16     QD32     QD64    
+    4KB 0.003    0.003    0.003    0.003    0.003    0.003   
+   16KB 0.011    0.011    0.011    0.011    0.011    0.011   
+   64KB 0.044    0.044    0.044    0.044    0.044    0.044   
+  256KB 0.175    0.175    0.175    0.175    0.175    0.175   
+    1MB 0.699    0.699    0.699    0.699    0.699    0.699   
+    4MB 1.000    1.000    1.000    1.000    1.000    1.000   
+   16MB 1.000    1.000    1.000    1.000    1.000    1.000   
+ 38.9MB 1.000    1.000    1.000    1.000    1.000    1.000   
+   64MB 1.000    1.000    1.000    1.000    1.000    1.000   
+
+[rand]  eff vs size × QD (lat=7.5μs):
+   size QD1      QD4      QD8      QD16     QD32     QD64    
+    4KB 0.005    0.005    0.005    0.005    0.005    0.005   
+   16KB 0.022    0.022    0.022    0.022    0.022    0.022   
+   64KB 0.087    0.087    0.087    0.087    0.087    0.087   
+  256KB 0.349    0.349    0.349    0.349    0.349    0.349   
+    1MB 1.000    1.000    1.000    1.000    1.000    1.000   
+    4MB 1.000    1.000    1.000    1.000    1.000    1.000   
+   16MB 1.000    1.000    1.000    1.000    1.000    1.000   
+ 38.9MB 1.000    1.000    1.000    1.000    1.000    1.000   
+   64MB 1.000    1.000    1.000    1.000    1.000    1.000   
+
+[write]  eff vs size × QD (lat=7.5μs):
+   size QD1      QD4      QD8      QD16     QD32     QD64    
+    4KB 0.004    0.004    0.004    0.004    0.004    0.004   
+   16KB 0.016    0.016    0.016    0.016    0.016    0.016   
+   64KB 0.066    0.066    0.066    0.066    0.066    0.066   
+  256KB 0.262    0.262    0.262    0.262    0.262    0.262   
+    1MB 1.000    1.000    1.000    1.000    1.000    1.000   
+    4MB 1.000    1.000    1.000    1.000    1.000    1.000   
+   16MB 1.000    1.000    1.000    1.000    1.000    1.000   
+ 38.9MB 1.000    1.000    1.000    1.000    1.000    1.000   
+   64MB 1.000    1.000    1.000    1.000    1.000    1.000   
+
+--- Layer B (ASSUMED geometry — HBFSim nominal placeholder) ---
+
+[seq]  eff vs size × QD (lat=7.5μs):
+   size QD1      QD4      QD8      QD16     QD32     QD64    
+    4KB 0.001    0.004    0.008    0.016    0.032    0.051   
+   16KB 0.004    0.016    0.032    0.065    0.130    0.206   
+   64KB 0.016    0.065    0.130    0.228    0.228    0.241   
+  256KB 0.065    0.248    0.248    0.248    0.248    0.252   
+    1MB 0.172    0.254    0.254    0.254    0.254    0.255   
+    4MB 0.228    0.256    0.256    0.256    0.256    0.256   
+   16MB 0.248    0.256    0.256    0.256    0.256    0.256   
+ 38.9MB 0.250    0.256    0.256    0.256    0.256    0.256   
+   64MB 0.254    0.256    0.256    0.256    0.256    0.256   
+
+[rand]  eff vs size × QD (lat=7.5μs):
+   size QD1      QD4      QD8      QD16     QD32     QD64    
+    4KB 0.002    0.008    0.016    0.032    0.065    0.103   
+   16KB 0.008    0.032    0.065    0.130    0.259    0.411   
+   64KB 0.032    0.130    0.259    0.456    0.456    0.482   
+  256KB 0.130    0.497    0.497    0.497    0.497    0.504   
+    1MB 0.344    0.508    0.508    0.508    0.508    0.510   
+    4MB 0.456    0.511    0.511    0.511    0.511    0.511   
+   16MB 0.497    0.512    0.512    0.512    0.512    0.512   
+ 38.9MB 0.500    0.512    0.512    0.512    0.512    0.512   
+   64MB 0.508    0.512    0.512    0.512    0.512    0.512   
+
+[write]  eff vs size × QD (lat=7.5μs):
+   size QD1      QD4      QD8      QD16     QD32     QD64    
+    4KB 0.004    0.015    0.030    0.059    0.119    0.227   
+   16KB 0.015    0.059    0.119    0.238    0.476    0.909   
+   64KB 0.059    0.238    0.476    0.930    1.670    2.871   
+  256KB 0.238    0.946    1.838    3.273    3.923    4.442   
+    1MB 0.870    3.374    4.757    4.757    4.757    4.932   
+    4MB 2.306    5.024    5.024    5.024    5.024    5.072   
+   16MB 3.923    5.096    5.096    5.096    5.096    5.108   
+ 38.9MB 4.479    5.109    5.109    5.109    5.109    5.115   
+   64MB 4.757    5.114    5.114    5.114    5.114    5.117   
+
+[latency sweep] seq-read single WIN, QD=1 (Layer A):
+   size   lat5μs  lat7.5μs   lat10μs
+    4KB     0.004     0.003     0.002
+   16KB     0.016     0.011     0.008
+   64KB     0.066     0.044     0.033
+  256KB     0.262     0.175     0.131
+    1MB     1.000     0.699     0.524
+    4MB     1.000     1.000     1.000
+   16MB     1.000     1.000     1.000
+ 38.9MB     1.000     1.000     1.000
+   64MB     1.000     1.000     1.000
+
+80% single-WIN working points (Layer A, QD=1):
+  lat=5.0μs: I/O ≥ 0.80MB (200GB/s×5.0μs×0.8)
+  lat=7.5μs: I/O ≥ 1.20MB (200GB/s×7.5μs×0.8)
+  lat=10.0μs: I/O ≥ 1.60MB (200GB/s×10.0μs×0.8)
+  → /tmp/p5c_results/p2_single_win.csv
+
+================================================================================================
+P3: 8-WIN pool scaling (pool FIXED at 8 WINs; active routing varies)
+================================================================================================
+
+--- seq read 38.88MB, closed-loop QD=64 ---
+ placement  active  readGB/s  fixedEff  activeEff  balance  utilMax
+  balanced       1     200.0     0.125      1.000    0.000    1.000
+  balanced       2     400.0     0.250      1.000    0.000    1.000
+  balanced       4     800.0     0.500      1.000    0.000    1.000
+  balanced       8    1600.0     1.000      1.000    1.000    1.000
+   hotspot       1     200.0     0.125      1.000    0.000    1.000
+   hotspot       2     200.0     0.125      1.000    0.000    1.000
+   hotspot       4     200.0     0.125      1.000    0.000    1.000
+   hotspot       8     200.0     0.125      1.000    0.000    1.000
+
+--- 80% aggregate targets (balanced, 8 active, QD=64) ---
+     seq:  1600.0 GB/s (cap 1600, 80% target 1280) ✅ fixedEff=1.000
+    rand:   800.0 GB/s (cap 800, 80% target 640) ✅ fixedEff=1.000
+   write:    80.0 GB/s (cap 80, 80% target 64) ✅ fixedEff=1.000
+
+--- Page-striping upper bound (analytic, one logical I/O across 8 WINs) ---
+   38.9MB striped:     24.3μs →  1600.0 GB/s (100.0% fixed-pool eff)
+     16MB striped:     10.5μs →  1600.0 GB/s (100.0% fixed-pool eff)
+      4MB striped:      7.5μs →   559.2 GB/s (35.0% fixed-pool eff)
+  (single-WIN I/O of same size: 200 GB/s — striping is the analytic upper bound; NOT simulated as a placement policy)
+  → /tmp/p5c_results/p3_pool_scaling.csv
+
+================================================================================================
+P4: UB interface assumptions (ALL are sensitivity assumptions — real HW unresolved)
+================================================================================================
+
+--- R100 (8 WINs, balanced, QD=32) ---
+ interface  boundGB/s  readGB/s writeGB/s  ICdeliv  ICutil  constr%   qwMaxμs
+      none       1600    1600.0       0.0      0.0   0.000      0.0     583.2
+ shared112        112     112.0       0.0    112.0   1.000    100.0     583.2
+ perwin112        896     896.0       0.0    896.0   1.000    100.0     583.2
+ shared896        896     896.0       0.0    896.0   1.000     93.8     583.2
+
+--- W100 (8 WINs, balanced, QD=32) ---
+ interface  boundGB/s  readGB/s writeGB/s  ICdeliv  ICutil  constr%   qwMaxμs
+      none         80       0.0      80.0      0.0   0.000      0.0   11698.2
+ shared112         80       0.0      80.0    112.0   0.714      0.0   11698.2
+ perwin112         80       0.0      80.0    156.5   0.511      0.0   11698.2
+ shared896         80       0.0      80.0    156.5   0.511      0.0   11698.2
+
+--- R50W50 (8 WINs, balanced, QD=32) ---
+ interface  boundGB/s  readGB/s writeGB/s  ICdeliv  ICutil  constr%   qwMaxμs
+      none         80      39.9      40.0      0.0   0.000      0.0   25935.0
+ shared112         80      39.9      40.0    112.0   0.713     50.0   15597.6
+ perwin112         80      39.9      40.0    652.4   0.122     50.0   24865.8
+ shared896         80      39.9      40.0    856.6   0.093     43.8   25079.6
+
+--- Write burst + concurrent restore (6W + 2R at t=0, 8 WINs) ---
+        none: span=   3.90ms  restore latency=   0.19ms (no-write baseline 0.19ms)  ICconstr=0%  qw=0μs
+   shared112: span=   3.90ms  restore latency=   2.44ms (no-write baseline 0.19ms)  ICconstr=25%  qw=0μs
+   perwin112: span=   3.90ms  restore latency=   0.35ms (no-write baseline 0.19ms)  ICconstr=25%  qw=0μs
+   shared896: span=   3.90ms  restore latency=   0.30ms (no-write baseline 0.19ms)  ICconstr=12%  qw=0μs
+
+Contention levels distinguished:
+  WIN-internal: R/W on same WIN → media serial (write 3.9ms blocks)
+  Package interface: shared cursor across WINs (half-duplex)
+  Downstream: OUT OF SCOPE here (DRAM-side, Phase 3E topology)
+  → /tmp/p5c_results/p4_interface.csv
+
+================================================================================================
+P5: loss attribution — same trace, base chain + mechanism branches
+================================================================================================
+
+--- KV trace (48 I/Os = 32R+16W, 38.9MB) ---
+                                           level   span_ms  readGB/s writeGB/s  fixedEffR  fixedEffW
+             C0 analytic ideal (work-conserving)     8.576         —         —          —          —
+          C1 burst @t=0, balanced (packing loss)     8.576     145.1      72.8      0.091      0.909
+             C2 closed-loop QD=8 (slot coupling)    15.792      78.8      39.5      0.049      0.494
+             C2a + hotspot@win0 (placement loss)    68.611      18.1       9.1      0.011      0.114
+     C2b + shared interface 112 (interface loss)    17.797      69.9      35.1      0.044      0.438
+
+--- Small trace (128×64KB R) ---
+                                           level   span_ms  readGB/s writeGB/s  fixedEffR  fixedEffW
+             C0 analytic ideal (work-conserving)     0.120         —         —          —          —
+          C1 burst @t=0, balanced (packing loss)     0.120      69.9       0.0      0.044      0.000
+             C2 closed-loop QD=8 (slot coupling)     0.120      69.9       0.0      0.044      0.000
+             C2a + hotspot@win0 (placement loss)     0.960       8.7       0.0      0.005      0.000
+     C2b + shared interface 112 (interface loss)     0.120      69.9       0.0      0.044      0.000
+
+--- R/W contention pairwise (1 write + 2 reads, 8 WINs, t=0) ---
+             reads pinned to FREE WINs: restore latency =   0.19ms
+       reads pinned to the WRITE's WIN: restore latency =   4.29ms
+
+--- Layer B mechanism toggles (32×38.88MB reads, ASSUMED geometry) ---
+                           variant   span_ms  Δ vs full
+       full pagesim (assumed geom)     3.051     +0.000  (407.7GB/s)
+                  page latency OFF     3.041     -0.010  (409.1GB/s)
+              plane contention OFF     3.051     +0.000  (407.7GB/s)
+             channel transfer OFF*     0.100     -2.951  (12441.4GB/s)
+  *channel transfer OFF removes the data-path bound entirely —
+   NOT a valid efficiency point; shown to identify the channel
+   data path as the binding resource at this (assumed) geometry.
+
+UNMODELED (Unknown — no numeric loss assigned): FTL, ECC, GC,
+read disturb, write amplification, P/E endurance effects.
+  → /tmp/p5c_results/p5_waterfall.csv
+
+================================================================================================
+P6: Qwen3 KV I/O feature replay (standalone microbench — NOT end-to-end benefit)
+================================================================================================
+
+                prefix    IOMB   mode   QD     GB/s  fixedEff   lat(ms)
+  340tk (agent prefix)    39.0    seq    1    200.0     0.125      0.19
+  340tk (agent prefix)    39.0    seq    8   1600.0     1.000      0.19
+  340tk (agent prefix)    39.0   rand    1    100.0     0.125      0.39
+  340tk (agent prefix)    39.0   rand    8    800.0     1.000      0.39
+  340tk (agent prefix)    39.0  write    1     10.0     0.125      3.90
+  340tk (agent prefix)    39.0  write    8     80.0     1.000      3.90
+    4Ktk (long prompt)   469.8    seq    1    200.0     0.125      2.35
+    4Ktk (long prompt)   469.8    seq    8   1600.0     1.000      2.35
+    4Ktk (long prompt)   469.8   rand    1    100.0     0.125      4.70
+    4Ktk (long prompt)   469.8   rand    8    800.0     1.000      4.70
+    4Ktk (long prompt)   469.8  write    1     10.0     0.125     46.98
+    4Ktk (long prompt)   469.8  write    8     80.0     1.000     46.98
+  16Ktk (long context)  1879.0    seq    1    200.0     0.125      9.40
+  16Ktk (long context)  1879.0    seq    8   1600.0     1.000      9.40
+  16Ktk (long context)  1879.0   rand    1    100.0     0.125     18.79
+  16Ktk (long context)  1879.0   rand    8    800.0     1.000     18.79
+  16Ktk (long context)  1879.0  write    1     10.0     0.125    187.90
+  16Ktk (long context)  1879.0  write    8     80.0     1.000    187.90
+  → /tmp/p5c_results/p6_qwen3.csv
+
+================================================================================================
+All CSVs → /tmp/p5c_results/

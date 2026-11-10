@@ -1,0 +1,33 @@
+{
+ "label": "p512_A",
+ "n_reqs": 6,
+ "reuse_input_tokens": 2560,
+ "reuse_hit_tokens": 1022,
+ "reuse_recomputed": 1538,
+ "coverage_pct": 39.9,
+ "host_loads": [
+  {
+   "hit": 511,
+   "hbf": 0,
+   "dram": 511,
+   "hb": 0,
+   "db": 58605568
+  },
+  {
+   "hit": 511,
+   "hbf": 0,
+   "dram": 511,
+   "hb": 0,
+   "db": 58605568
+  }
+ ],
+ "hbf_backup_tokens": [],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  7.1,
+  7.3,
+  7.1,
+  7.3,
+  38.8
+ ]
+}

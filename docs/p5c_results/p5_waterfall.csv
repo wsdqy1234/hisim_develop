@@ -1,0 +1,17 @@
+fixed_eff_read,fixed_eff_write,level,read_gbps,restore_latency_ms,span_ms,trace,write_gbps
+,,C0 analytic ideal (work-conserving),,,8.576,"KV trace (48 I/Os = 32R+16W, 38.9MB)",
+0.0907,0.9093,"C1 burst @t=0, balanced (packing loss)",145.07,,8.576,"KV trace (48 I/Os = 32R+16W, 38.9MB)",72.75
+0.0492,0.4938,C2 closed-loop QD=8 (slot coupling),78.78,,15.792,"KV trace (48 I/Os = 32R+16W, 38.9MB)",39.51
+0.0113,0.1137,C2a + hotspot@win0 (placement loss),18.13,,68.611,"KV trace (48 I/Os = 32R+16W, 38.9MB)",9.09
+0.0437,0.4382,C2b + shared interface 112 (interface loss),69.91,,17.797,"KV trace (48 I/Os = 32R+16W, 38.9MB)",35.06
+,,C0 analytic ideal (work-conserving),,,0.12,Small trace (128×64KB R),
+0.0437,0.0,"C1 burst @t=0, balanced (packing loss)",69.91,,0.12,Small trace (128×64KB R),0.0
+0.0437,0.0,C2 closed-loop QD=8 (slot coupling),69.91,,0.12,Small trace (128×64KB R),0.0
+0.0055,0.0,C2a + hotspot@win0 (placement loss),8.74,,0.96,Small trace (128×64KB R),0.0
+0.0437,0.0,C2b + shared interface 112 (interface loss),69.91,,0.12,Small trace (128×64KB R),0.0
+,,reads pinned to FREE WINs,,0.194,,R/W contention pairwise,
+,,reads pinned to the WRITE's WIN,,4.288,,R/W contention pairwise,
+,,full pagesim (assumed geom),407.74,,3.051,KV-read layerB,
+,,page latency OFF,409.08,,3.041,KV-read layerB,
+,,plane contention OFF,407.74,,3.051,KV-read layerB,
+,,channel transfer OFF*,12441.35,,0.1,KV-read layerB,

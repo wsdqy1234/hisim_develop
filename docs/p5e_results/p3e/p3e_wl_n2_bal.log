@@ -1,0 +1,5 @@
+
+[n2_bal] 4 build + 2 reuse = 6 reqs (input=340, unique)...
+  [n2_bal] reuse 0: cached=339 e2e=231.3ms
+  [n2_bal] reuse 1: cached=339 e2e=229.2ms
+[n2_bal] Wall time: 0.243s

@@ -1,0 +1,15 @@
+{
+ "case_id": "p4k_str_co_s112",
+ "config_hash": "59c81e83d55ccf37",
+ "wl": "p4k",
+ "scen": "B70",
+ "iface_hypothesis": "s112",
+ "access_mode": "seq",
+ "media_read_gb": 200,
+ "media_write_gb": 10,
+ "max_total": 8300,
+ "hicache_ratio": 0.6,
+ "shared_dram": true,
+ "hbf_layer": "A-envelope",
+ "notes": "iface values are HYPOTHESES (UB unconfirmed); media 160/80 = assumed 0.8 efficiency"
+}

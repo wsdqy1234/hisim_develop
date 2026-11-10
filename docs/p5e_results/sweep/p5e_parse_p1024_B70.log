@@ -1,0 +1,40 @@
+{
+ "label": "p1024_B70",
+ "n_reqs": 6,
+ "reuse_input_tokens": 5120,
+ "reuse_hit_tokens": 2046,
+ "reuse_recomputed": 3074,
+ "coverage_pct": 40.0,
+ "host_loads": [
+  {
+   "hit": 1023,
+   "hbf": 1023,
+   "dram": 0,
+   "hb": 117325824,
+   "db": 0
+  },
+  {
+   "hit": 1023,
+   "hbf": 0,
+   "dram": 1023,
+   "hb": 0,
+   "db": 117325824
+  }
+ ],
+ "hbf_backup_tokens": [
+  6,
+  1024,
+  15,
+  15,
+  1024,
+  15
+ ],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  5.4,
+  14.7,
+  5.3,
+  14.7,
+  50.5
+ ]
+}

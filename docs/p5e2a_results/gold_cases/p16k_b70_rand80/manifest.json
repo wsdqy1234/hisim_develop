@@ -1,0 +1,15 @@
+{
+ "case_id": "p16k_b70_rand80",
+ "config_hash": "0af62a156dc2fbfe",
+ "wl": "p16k",
+ "scen": "B70",
+ "iface_hypothesis": "none",
+ "access_mode": "rand",
+ "media_read_gb": 80,
+ "media_write_gb": 10,
+ "max_total": 33100,
+ "hicache_ratio": 0.6,
+ "shared_dram": true,
+ "hbf_layer": "A-envelope",
+ "notes": "iface values are HYPOTHESES (UB unconfirmed); media 160/80 = assumed 0.8 efficiency"
+}

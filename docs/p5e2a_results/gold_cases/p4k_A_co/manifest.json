@@ -1,0 +1,15 @@
+{
+ "case_id": "p4k_A_co",
+ "config_hash": "0b8926145d0027d6",
+ "wl": "p4k",
+ "scen": "A",
+ "iface_hypothesis": "none",
+ "access_mode": "seq",
+ "media_read_gb": 200,
+ "media_write_gb": 10,
+ "max_total": 8300,
+ "hicache_ratio": 2.0,
+ "shared_dram": true,
+ "hbf_layer": "A-envelope",
+ "notes": "iface values are HYPOTHESES (UB unconfirmed); media 160/80 = assumed 0.8 efficiency"
+}

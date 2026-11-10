@@ -1,0 +1,19 @@
+bw_gbps,fixed_eff,io_latency_ms,io_mb,mode,prefix,qd
+200.0,0.125,0.195,39.0,seq,340tk (agent prefix),1
+1600.0,1.0,0.195,39.0,seq,340tk (agent prefix),8
+100.0,0.125,0.39,39.0,rand,340tk (agent prefix),1
+800.0,1.0,0.39,39.0,rand,340tk (agent prefix),8
+10.0,0.125,3.899,39.0,write,340tk (agent prefix),1
+80.0,1.0,3.899,39.0,write,340tk (agent prefix),8
+200.0,0.125,2.349,469.8,seq,4Ktk (long prompt),1
+1600.0,1.0,2.349,469.8,seq,4Ktk (long prompt),8
+100.0,0.125,4.698,469.8,rand,4Ktk (long prompt),1
+800.0,1.0,4.698,469.8,rand,4Ktk (long prompt),8
+10.0,0.125,46.976,469.8,write,4Ktk (long prompt),1
+80.0,1.0,46.976,469.8,write,4Ktk (long prompt),8
+200.0,0.125,9.395,1879.0,seq,16Ktk (long context),1
+1600.0,1.0,9.395,1879.0,seq,16Ktk (long context),8
+100.0,0.125,18.79,1879.0,rand,16Ktk (long context),1
+800.0,1.0,18.79,1879.0,rand,16Ktk (long context),8
+10.0,0.125,187.905,1879.0,write,16Ktk (long context),1
+80.0,1.0,187.905,1879.0,write,16Ktk (long context),8

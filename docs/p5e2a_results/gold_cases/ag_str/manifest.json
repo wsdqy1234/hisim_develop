@@ -1,0 +1,15 @@
+{
+ "case_id": "ag_str",
+ "config_hash": "de0e9abe375d4ae7",
+ "wl": "agent",
+ "scen": "B70",
+ "iface_hypothesis": "none",
+ "access_mode": "seq",
+ "media_read_gb": 200,
+ "media_write_gb": 10,
+ "max_total": 1024,
+ "hicache_ratio": 0.6,
+ "shared_dram": true,
+ "hbf_layer": "A-envelope",
+ "notes": "iface values are HYPOTHESES (UB unconfirmed); media 160/80 = assumed 0.8 efficiency"
+}

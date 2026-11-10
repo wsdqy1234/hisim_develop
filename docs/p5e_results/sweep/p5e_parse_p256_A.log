@@ -1,0 +1,33 @@
+{
+ "label": "p256_A",
+ "n_reqs": 6,
+ "reuse_input_tokens": 1280,
+ "reuse_hit_tokens": 510,
+ "reuse_recomputed": 770,
+ "coverage_pct": 39.8,
+ "host_loads": [
+  {
+   "hit": 255,
+   "hbf": 0,
+   "dram": 255,
+   "hb": 0,
+   "db": 29245440
+  },
+  {
+   "hit": 255,
+   "hbf": 0,
+   "dram": 255,
+   "hb": 0,
+   "db": 29245440
+  }
+ ],
+ "hbf_backup_tokens": [],
+ "conservation_all": true,
+ "reuse_ttfts": [
+  4.5,
+  4.5,
+  4.5,
+  3.8,
+  31.7
+ ]
+}
