@@ -458,4 +458,151 @@ indexer / 预取 / 重叠三项，再谈 SSD 与 IndexShare。
   （arXiv:2603.28458）。
 - 本仓库：`src/hisim/simulation/sglang/hisparse_sim.py`、
   `src/hisim/simulation/sglang/sglang_hook.py`、
-  `src/hisim/benchmark/hisparse/hisparse_bench.py`。
+  `benchmark/hisparse/hisparse_bench.py`。
+
+---
+
+## 7. 评审建议更新（2026-11-10）
+
+> 本节是评审补充，不改变前文作为原对比材料的记录；若与前文冲突，以本节为准。
+> 评审基于分支 `develop_lfz_sparse_kv` 的实际 HEAD
+> `a35283721c5b6d0cf67d6bf6455363743d90307e`。原文中的 TierKV 外部实测数字
+> 仍属于转述，尚未在本仓库环境独立复现。
+
+### 7.1 总体结论
+
+对比方向和“先采 trace、再补时延模型”的落地顺序是合理的，但当前文档还不能直接
+作为实现规格。主要问题是：Indexer 复杂度混用了 prefill/decode 口径；预取模型只
+包含真阳性且默认传输必然及时完成；SFA 事件图漏掉 `KVSelect`/跨流依赖；把
+DSV4.1 的 KV 复用拓扑误当成 GLM IndexShare 分组；以及把静态容量解析能力扩大为
+一般容量、并发或 TPS 结论。
+
+建议先修正以下语义和公式，再用真实 Top-K/hot-buffer/SSU trace 校准。否则新增的
+`prefetch_accuracy`、indexer 系数和 overlap 收益只是第二组合成旋钮。
+
+### 7.2 Indexer 复杂度必须区分 prefill 与 decode
+
+前文 `O(L²) → O(L/B + mB)`（`:70`）及 `t_index_full = a + bL²`（`:192-193`）
+混淆了两个口径：
+
+- decode 通常只有一个 query，full indexer 是 `O(L)`，两阶段是
+  `O(L/B + mB)`；
+- prefill 有约 `Q=L` 个 query，full indexer 才是 `O(L²)`，两阶段应保留 `Q`。
+
+建议至少改为：
+
+```text
+t_full = a + b × Q × L
+t_hi   = a + b × Q × (L/B + mB) + t_mean_update
+```
+
+其中 `Q=1` 表示常规 decode；prefill 按实际 query 数展开，并另计 batch、Top-K、
+均值缓存维护和 launch。标定系数时也要按 prefill/decode 分开，不能用一个 `b`
+同时拟合两种阶段。
+
+### 7.3 预取模型必须包含假阳性、完成事件和缓存副作用
+
+`:232-245` 的方案从“下一层真实访问集”采样预测集，意味着预测集只包含真阳性：
+没有 false positive，也没有预测错误造成的额外流量和缓存污染。下一步若命中预测集
+就直接算 hit，又等价于假定所有异步预取都在使用前完成，使 `prefetch_lead_steps`
+和带宽竞争失去意义。
+
+建议用集合显式表达：
+
+```text
+P_t = 预测访问集
+A_t = 下一层真实访问集
+TP_t = P_t ∩ A_t
+FP_t = P_t - A_t
+FN_t = A_t - P_t
+C_t  = 到本次访问前已经完成且仍驻留 HBM 的预取集
+同步 miss = A_t - C_t
+```
+
+预取集必须进入热池容量和淘汰逻辑，并记录开始/完成时刻、排队、带宽占用和
+false-positive 污染。若没有逐层 trace，应使用 recall/precision 两个参数做敏感性
+分析，而不是只给一个“准确率”。
+
+建议把 `:245` 的“能复现 −79%”改为：“该结构用于检验需要多高的预测
+recall/precision 和提前量才能接近文章收益；最终复现程度由同 workload trace
+校准后判定。”
+
+### 7.4 SFA 事件图需要选定一种 merge 语义并补依赖
+
+`:264-292` 同时描述了两套不同结构：
+
+1. hit/miss 两支分别产生 partial state，最后独立 merge；
+2. SFA-tail 接收 hit 的 prior state，并在 tail kernel 内完成 merge。
+
+两者不能共用同一个公式。若采用独立 partial state：
+
+```text
+t_indexer
++ max(t_hit_sfa, t_kvselect + t_gather + t_miss_sfa)
++ t_merge
+```
+
+若采用 tail 接收 prior state，则 tail 必须同时等待 hit SFA 与 gather，且 merge
+已包含在 tail 内，不能再无条件单列一次 `t_merge`。同时，`KVSelect` 是
+`KVGather` 的前置依赖，不能只把它列在三条并发流中而不进入关键路径。
+
+多流调度应按事件依赖实现，而不是简单给三条流各排一条串行链。现有
+`hisparse_mean_load_us` 是 H2D-only 指标；补完 indexer/SFA 后应新增
+`hisparse_step_dur_us` 或 `hisparse_critical_path_us`，不要改变原指标的含义。
+
+### 7.5 IndexShare 不能从 DSV4.1 现有拓扑直接推导
+
+`:313-319,413` 用 `KVProfile.source_consumers` / `index_compute_layers` 建立
+GLM 式四层共享组，这是两种不同概念：
+
+- `source_consumers` 是 KV Tensor 的 source→consumer 复用拓扑；
+- `index_compute_layers` 是索引计算层集合；
+- GLM IndexShare 共享的是同一组历史位置/Top-K，不是 KV Tensor。
+
+因此不能据此推出“连续四层共享同一 Top-K”，也不能把 anchor 关键路径直接除以
+组大小。建议新增显式的 `index_share_groups` 配置，只对已确认使用 IndexShare 的
+模型启用；DSV4.1 在获得真实 trace 前保持 `group_size=1`。
+
+### 7.6 结论强度需要收窄到静态解析边界
+
+`:32,443,446-448` 将“给定布局和预算下的静态 hot-pool 解析上限”扩大为一般
+容量/并发结论，并把它与 TierKV 的实测 TPS 并列，容易形成能力等价的误读。
+
+当前仿真可以支持：
+
+- 给定 profile、预算和部署并发下的物理/逻辑 token 上限；
+- SWA、compressor、admission 上界的静态分账；
+- 不同 churn/recent_ratio 假设下的相对敏感性。
+
+当前不能直接支持：
+
+- 真实最大并发、端到端 TPS 或 TPOT 预测；
+- 未建模的 candidate/filter、shared prefix 生命周期和实际调度；
+- 合成 Top-K 命中率与真实 kernel 命中率的等价性。
+
+建议将 `:443` 的“✅ 已建模（hot-pool clamp）”改为“已建模静态 hot-pool 上界”，
+并删除与实测 TPS 的等价暗示。
+
+### 7.7 可复现信息与事实修正
+
+- `:4` 的 HEAD `cd22c02` 不是有效 git 对象，实际为 `a352837`。
+- `:165` 的“一个 batch 只计一次 launch overhead”不准确：当前按 batch 聚合后，
+  非空 index/main 阶段分别计 fixed overhead；真正的问题是未按 layer/request/group
+  展开，而不是只计一次。
+- `:461` 的源码路径应为 `benchmark/hisparse/hisparse_bench.py`。
+- 建议为原文补充可访问 URL、版本/快照日期。公开检索中存在同名但不同的 TierKV
+  工作，仅有 `postId` 不足以稳定区分引用对象。
+
+### 7.8 建议验收顺序
+
+1. **语义 oracle**：用手工 Top-K 序列分别覆盖 direct-short、长序列 newest、
+   多 hit/miss 顺序和不可行预算；逐步核对 hit/miss、H2D/D2H 与 hot slots。
+2. **trace 采集**：逐层 Top-K ID/分数、hot-buffer 计数器、预取完成事件、
+   host/SSU 带宽与尾延迟。
+3. **模型接入**：先实现 indexer 时间项，再加入带完成事件的预取，最后实现带依赖
+   的 SFA/多流事件图。
+4. **校准与报告**：固定同一 workload 比较 full vs two_stage、LRU vs 预测预取、
+   串行 vs 分段 overlap；在 trace 校准前，所有绝对命中率和时延都只标为敏感性结果。
+
+在这四步完成前，本文的优先级建议可以保留，但不应把任何合成结果写成对 TierKV
+实测收益的复现或验证。
