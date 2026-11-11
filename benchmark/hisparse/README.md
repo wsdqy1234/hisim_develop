@@ -81,7 +81,8 @@ PYTHONPATH=src python benchmark/hisparse/hisparse_bench.py bench --enable \
 profile 的动态 access model 默认每个 decode step 都重新选 Top-K
 （`selection_cadence=every_step`），即使压缩长度不变；`compression_boundary`
 只保留为敏感性对照。hook 在 prefill 的 radix matching 完成后才启动 staging，
-因此 `prefix_indices` 已可读；轮转的 newest page 老化不产生主 KV H2D；
+因此 `prefix_indices` 已可读；direct-short 的 newest page 老化不产生主 KV H2D，
+长序列 previous-newest 仍按 swap-in 计费；
 hot-pool 容量和请求 overhead 使用同一个 per-worker 并发口径。可用
 `HISIM_HISPARSE_SELECTION_CADENCE`、`HISIM_HISPARSE_HOT_BUFFER_INIT`、
 `HISIM_HISPARSE_INDEX_READ_ON_HIT` 覆盖。

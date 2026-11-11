@@ -177,6 +177,24 @@ def test_hot_pool_geometry_resolves_request_clamp_and_overhead():
     assert sim.hbm_kv_bytes == pytest.approx(budget)
 
 
+def test_infeasible_hot_pool_budget_is_rejected():
+    p = DSV41_VLLM_BF16_PROFILE
+    assert (
+        physical_pool_tokens_for_budget(p, 1, max_num_reqs=1, tp_size=8)
+        == 0
+    )
+    with pytest.raises(ValueError, match="cannot fit one request"):
+        hot_pool_geometry_for_budget(
+            p, 1, requested_reqs=8, padded_buffer_size=1025, tp_size=8
+        )
+
+
+def test_simulator_rejects_pool_below_one_padded_buffer():
+    cfg = _dsv41_config()
+    with pytest.raises(ValueError, match="one request reserves"):
+        _make_sim(cfg, physical_tokens=cfg.padded_buffer_size - 1)
+
+
 def test_requested_reqs_are_per_dp_worker():
     from hisim.simulation.sglang.sglang_hook import _requested_reqs_for_profile
 
@@ -514,6 +532,29 @@ def test_direct_short_has_no_swap_in_and_ages_newest_for_free():
     for seq_len in (2, 3, 4):
         assert ws.step(seq_len) == (2, 0)
     assert ws.prev_newest == 3
+
+
+def test_long_sequence_previous_newest_is_swapped_in():
+    ws = _WorkingSet(
+        top_k=2,
+        capacity=4,
+        access_model="recency",
+        churn=0.0,
+        recent_ratio=1.0,
+        rng=random.Random(0),
+        hot_buffer_init="earliest",
+        lru_mode=True,
+        newest_page=True,
+    )
+    # Step 5 starts the long-sequence path but the previous newest is not yet
+    # relevant.  From step 6 on, the previous newest is outside the regular LRU
+    # and must be copied back when selected again.
+    assert ws.step(5) == (2, 0)
+    for seq_len in (6, 7):
+        previous = ws.prev_newest
+        assert previous not in ws.hot
+        assert ws.step(seq_len) == (1, 1)
+        assert previous in ws.hot
 
 
 def test_lru_hit_moves_to_mru():

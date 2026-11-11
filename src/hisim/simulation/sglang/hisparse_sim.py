@@ -20,8 +20,11 @@ The implemented hierarchy is:
   Selection cadence is independent of compression and backup cadence.  Misses
   are copied host->device on the critical path; hits can still read index
   payload.  The regular hot slots use hit-to-MRU LRU, and the newest token has
-  a separate reserved slot outside that LRU.  When that page ages, it enters the
-  regular LRU without an H2D transfer, so direct-short replay has no main-KV IO.
+  a separate reserved slot outside that LRU.  On the direct-short path, where
+  the whole compressed sequence fits the device buffer, the previous newest
+  entry enters the regular LRU without an H2D transfer.  On the long-sequence
+  swap path it stays outside the regular LRU and must be copied back if the
+  next Top-K selects it again.
 * Prefill KV is staged device->host once.  Reused prefix tokens are not staged
   again.  Each newly decoded compressed entry is eagerly backed up device->host
   on a side stream (hidden from the critical path by default, but the bytes and
@@ -471,7 +474,8 @@ def physical_pool_tokens_for_budget(
     Long KV uses the allocator/capacity slope, while SWA and compressor state
     are subtracted separately.  This is intentionally the inverse of
     ``HiSparseSimulator.hbm_kv_bytes`` so e2e replay and analytic sweeps cannot
-    silently use different denominators.
+    silently use different denominators.  Return 0 when the budget cannot fit
+    even one token for the requested request count.
     """
     scale = profile_tp_scale(profile, tp_size)
     reqs = max(1, int(max_num_reqs))
@@ -481,9 +485,15 @@ def physical_pool_tokens_for_budget(
     ) * scale
     capacity_per_token = profile.capacity_bytes_per_token * scale
     if capacity_per_token <= 0:
-        return 1
+        raise ValueError(
+            f"HiSparse profile {profile.name!r} has no positive capacity slope"
+        )
     remaining = float(budget_bytes) - reqs * per_req_overhead
-    return max(1, int(remaining // capacity_per_token))
+    if remaining < capacity_per_token:
+        # Do not silently round an infeasible pool up to one token.  The caller
+        # needs to distinguish "no request fits" from a valid one-token pool.
+        return 0
+    return int(remaining // capacity_per_token)
 
 
 def hot_pool_geometry_for_budget(
@@ -499,7 +509,8 @@ def hot_pool_geometry_for_budget(
     depend on each other: the hot-pool concurrency cap limits how many requests
     can actually run, while each running request consumes SWA/compressor bytes.
     Resolve that fixed point so the final ``max_reqs`` is the one used by the
-    simulator and by ``HiSparseSimulator.hbm_kv_bytes``.
+    simulator and by ``HiSparseSimulator.hbm_kv_bytes``.  Raise ``ValueError``
+    when the budget cannot hold one request's overhead plus a padded buffer.
     """
     requested = max(1, int(requested_reqs))
     padded = max(1, int(padded_buffer_size))
@@ -508,7 +519,23 @@ def hot_pool_geometry_for_budget(
         tokens = physical_pool_tokens_for_budget(
             profile, budget_bytes, reqs, tp_size=tp_size
         )
-        return reqs <= max(1, tokens // padded)
+        return tokens >= padded and reqs <= tokens // padded
+
+    if not fits(1):
+        scale = profile_tp_scale(profile, tp_size)
+        per_req_overhead = (
+            float(profile.swa_window_tokens) * float(profile.swa_bytes_per_token)
+            + float(profile.compressor_bytes_per_request)
+        ) * scale
+        minimum = (
+            per_req_overhead
+            + profile.capacity_bytes_per_token * scale * padded
+        )
+        raise ValueError(
+            f"HiSparse profile {profile.name!r} cannot fit one request with "
+            f"{float(budget_bytes):.0f} B: need at least {minimum:.0f} B "
+            f"for SWA/compressor plus {padded} hot-pool tokens"
+        )
 
     # Lower concurrency frees request overhead and can only increase the number
     # of hot-pool buffers, so feasibility is monotone.  Find the largest
@@ -794,10 +821,9 @@ class _WorkingSet:
         self.prev_seq_len = 0
         self.prev_recent_start = 0
         self.prev_n = 0
-        # The previous step's newest page.  Its data is already in HBM, so when
-        # it ages out of the reserved page it must enter the regular LRU without
-        # an H2D transfer.  This also gives the direct-short path a zero-IO
-        # history as long as the whole sequence fits the device buffer.
+        # The previous step's newest page.  Only the direct-short path keeps
+        # its data resident outside the reserved page; on the long-sequence
+        # swap path it is not automatically moved into the regular LRU.
         self.prev_newest: Optional[int] = None
 
     def _recent_count(self, n: int) -> int:
@@ -901,14 +927,18 @@ class _WorkingSet:
         """Resolve one selected set against the regular LRU + newest page.
 
         The swap kernel moves the current hits to MRU and inserts misses before
-        the hit block.  The previous newest page is already resident in HBM; when
-        it ages, insert it into the regular LRU without charging an H2D miss.
+        the hit block.  On the direct-short path the whole compressed sequence
+        fits the device buffer, so the previous newest page ages into the
+        regular LRU without an H2D miss.  The long-sequence path does not migrate
+        it; if selected again, it is a normal swap-in unless already resident.
         """
         hits = 0
         misses = 0
         newest = seq_len - 1
+        direct_short = seq_len <= self.capacity
         if (
-            self.newest_page
+            direct_short
+            and self.newest_page
             and self.prev_newest is not None
             and self.prev_newest >= 0
             and self.prev_newest != newest
@@ -1140,9 +1170,18 @@ class HiSparseSimulator:
         self.config = config
         self.num_layers = max(1, int(num_layers))
         self.bytes_per_token_per_layer = float(bytes_per_token_per_layer)
-        self.physical_pool_tokens = max(1, int(physical_pool_tokens))
+        physical_tokens = int(physical_pool_tokens)
+        if physical_tokens < 1:
+            raise ValueError("HiSparse physical pool must contain at least one token")
+        self.physical_pool_tokens = physical_tokens
         self.page_size = max(1, int(page_size))
         self.padded_buffer_size = config.padded_buffer_size
+        if self.physical_pool_tokens < self.padded_buffer_size:
+            raise ValueError(
+                f"HiSparse physical pool has {self.physical_pool_tokens} tokens, "
+                f"but one request reserves {self.padded_buffer_size}; increase "
+                "the hot-pool budget or reduce device_buffer_size"
+            )
         self.read_bandwidth = read_bandwidth
         self.write_bandwidth = write_bandwidth
         self.tp_size = max(1, int(tp_size))
@@ -1211,8 +1250,8 @@ class HiSparseSimulator:
         )
         # Host pool is sized from the device pool exactly like sglang.
         self.host_pool_tokens = self.logical_pool_tokens
-        self.max_reqs_by_hot_pool = max(
-            1, self.physical_pool_tokens // self.padded_buffer_size
+        self.max_reqs_by_hot_pool = (
+            self.physical_pool_tokens // self.padded_buffer_size
         )
         self.max_num_reqs = (
             min(max_num_reqs, self.max_reqs_by_hot_pool)
