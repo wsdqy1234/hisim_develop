@@ -606,3 +606,129 @@ GLM 式四层共享组，这是两种不同概念：
 
 在这四步完成前，本文的优先级建议可以保留，但不应把任何合成结果写成对 TierKV
 实测收益的复现或验证。
+
+---
+
+## 8. 对 §7 评审的复核（2026-11-11）
+
+> 复核对象：`origin/develop_lfz_sparse_kv` 上的 `ef5832b`（§7 文档）与
+> `6db93b5`（newest aging / 不可行预算修复）。
+> 复核方法：逐条对照原文（稼先社区 postId `77ec4f82...`）与当前代码实现。
+> 结论：**§7 的 6 条技术意见有 5 条成立、1 条部分成立；但 §7.7 自身有 1 处
+> 事实错误，§7.2 的表述需要补一句限定。**
+
+### 8.1 总体判断
+
+§7 把本文从“方向性对比”推进到了“可实现的规格边界”，方向正确，尤其是
+以下三点价值最高：
+
+1. **§7.2 prefill/decode 复杂度分开**：这是原文没有区分、而实现必须区分的口径；
+2. **§7.3 预取必须含假阳性与完成事件**：直接否定了“`1/N` 字节打折”和
+   “命中预测集即 hit”两个隐含假设；
+3. **§7.5 IndexShare 不能从 `source_consumers` 推导**：这是本文最实质的语义错误，
+   原文明确写了“共享的是位置/索引，不是 KV Tensor”。
+
+但 §7 不能原样作为最终结论，原因见 8.3。
+
+### 8.2 逐条核对
+
+| §7 条目 | 判断 | 依据 |
+| --- | --- | --- |
+| 7.2 Indexer 需区分 prefill/decode | ✅ **成立** | 原文的 `O(L²)→O(L/B+mB)` 是“Q 个 query”的一般式；decode 只有 1 个 query，full 是 `O(L)`。本文 §1.3(1) 与 §3.1 直接照抄了该式，用于 decode 会高估原始 indexer 成本、低估两阶段相对收益。 |
+| 7.3 预取需含 FP/FN 与完成事件 | ✅ **成立** | 原文的预测预取有“预测开销”和“动态预测 θ=0.6 省 1/3 计算量”，说明预测本身不完美；本文 §3.2 的“从下一层真实访问集采样”只产生真阳性，且“命中即 hit”等价于默认预取 100% 按时完成，`prefetch_lead_steps` 因此失效。 |
+| 7.4 SFA 事件图需选定一种 merge 语义 | ✅ **成立** | 原文方案一（独立 `DaAttentionMerge`）与方案二（tail 内 prior merge）是两套结构；本文 §3.3 同时写了“独立 merge 公式”和“方案二”，确实自相矛盾。原文依赖表也明确 `miss_sfa_i + merge_i` 同时依赖 `hit_sfa_i` 与 `kvgather_i`，且 `kvgather0` 依赖 `mock_kv_select0_done`。 |
+| 7.5 IndexShare 不能由 DSV4.1 拓扑推导 | ✅ **成立（最重要）** | 原文原话：“共享的是历史 token 的位置或稀疏索引结果，而不是不同层之间的 KV Tensor。由于各层具有独立的 K/V 投影参数，同一 token 在不同层对应的 KV 数据并不相同。” `source_consumers` 是 KV Tensor 的 source→consumer 复用，`index_compute_layers` 是索引计算层集合，二者都不是 GLM 式四层共享组。 |
+| 7.6 结论强度需收窄 | ✅ **成立** | 本文 §0/§5 把“静态 hot-pool 解析上限”与 TierKV 实测 TPS 并列，容易读成能力等价。当前仿真确实不能给真实最大并发/端到端 TPS。 |
+| 7.7 事实修正 | ⚠️ **部分成立，且有错误** | 见 8.3。 |
+| 7.8 验收顺序 | ✅ **合理** | 与 §4 的阶段 0/1 一致，且把“语义 oracle”放在 trace 之前，顺序正确。 |
+
+### 8.3 §7 自身需要修正的地方
+
+#### (1) §7.7 的 HEAD 说法是错的
+
+§7 开头与 §7.7 都称“HEAD `cd22c02` 不是有效 git 对象，实际为 `a352837`”。
+复核结果相反：
+
+```text
+$ git cat-file -t cd22c02
+commit
+$ git cat-file -t a352837
+fatal: Not a valid object name a352837
+$ git log --all --oneline | grep a352837
+（无结果）
+```
+
+即：`cd22c02` 是真实提交（`Fix HiSparse request lifecycle and hot-pool edges`），
+`a352837` 在本仓库任何分支上都不存在。本文开头的 `HEAD cd22c02` 是**正确的**，
+不需要修改；§7 的这条“修正”应删除，否则会误导后续读者去追一个不存在的对象。
+
+#### (2) §7.7 的路径“修正”是同一次提交自己改的
+
+§7 说“`:461` 的源码路径应为 `benchmark/hisparse/hisparse_bench.py`”。
+`ef5832b` 本身已经把该行从 `src/hisim/benchmark/...` 改成了 `benchmark/...`，
+当前文件第 461 行已经是正确路径。这条只应作为“已修复”记录，不应作为待办。
+
+#### (3) §7.2 需要补一句“原文口径”的限定
+
+§7.2 说本文“混淆了两个口径”，这成立；但原文本身也是用
+`O(L²) → O(L/B + mB)` 描述的，并未区分 Q。建议表述为
+“原文给出的是 Q-query 的一般式，本文在 decode 场景直接套用导致高估”，
+而不是暗示原文有误。
+
+#### (4) §7.7 的“一个 batch 只计一次 launch overhead”判断正确，但原因可再精确
+
+当前 `_account_transfer` 对 index 与 main 两个非空阶段**各计一次** `t0`，
+所以严格说是“最多两次”，不是“一次”。真正的问题如 §7 所说，是
+**未按 layer / request / group 展开**，而不是“只计一次”。这条保留，但建议
+把本文 §2.2 第 4 条的措辞从“只计一次 launch overhead”改为
+“按阶段各计一次，未按 layer/request 展开”。
+
+#### (5) 行号已整体偏移
+
+`6db93b5` 给 `hisparse_sim.py` 增加了约 73 行，本文 §2.1 引用的行号已过期：
+
+| 引用 | 本文旧行号 | 当前行号 |
+| --- | --- | --- |
+| `transfer_duration` | `:718` | `:745` |
+| `_WorkingSet` | `:756` | `:783` |
+| `_access_selected` | `:900` | `:926` |
+| `_decode_one_profile` | `:1528` | `:1567` |
+| `_account_transfer` | 未标 | `:1676` |
+| `metrics()` | `:1702` | `:1741` |
+
+建议后续统一改为“函数名 + 文件”引用，不再写死行号。
+
+### 8.4 对原文的最终修订建议（按 §7 + 本节）
+
+| 位置 | 原表述 | 建议改为 |
+| --- | --- | --- |
+| §0 表“容量与并发” | `✅ 已实现（hot-pool clamp 固定点）` | `已建模静态 hot-pool 上界（给定 profile/预算/并发）`，并删除同行的 TPS 数字或标注“原文实测，非本仿真” |
+| §1.3(1) 复杂度 | `O(L²) → O(L/B + mB)` | `O(Q·L) → O(Q·(L/B + mB))`，注明 decode `Q=1`、prefill `Q≈L` |
+| §3.1 公式 | `t_index_full = a + b·L²` | `t_full = a + b·Q·L`；`t_hi = a + b·Q·(L/B + mB) + t_mean_update` |
+| §3.2 预取 | “从下一层真实访问集采样” | 显式给出 `TP/FP/FN/C_t`，用 recall/precision 两个参数；预取集进入热池容量与淘汰 |
+| §3.2 预期收益 | “能复现 −79%” | “用于检验需要多高 recall/precision/提前量才能接近 −79%；复现程度由同 workload trace 判定” |
+| §3.3 事件图 | 单一 `step_dur` 公式 | 按 merge 语义二选一；`KVSelect` 作为 `KVGather` 前置依赖进入关键路径；新增 `hisparse_step_dur_us`，不改 `hisparse_mean_load_us` 语义 |
+| §3.4 IndexShare | 用 `source_consumers` 建组 | 新增显式 `index_share_groups`；DSV4.1 在拿到 trace 前保持 `group_size=1` |
+| §2.2 第 4 条 | “只计一次 launch overhead” | “按 index/main 阶段各计一次，未按 layer/request 展开” |
+| §7 开头 / §7.7 | `a352837` 为实际 HEAD | 删除；HEAD 就是 `cd22c02`（或更新为 `6db93b5`） |
+
+### 8.5 对照原文后，§7 仍未覆盖的两点
+
+1. **两阶段 indexer 的精度回退代价**：原文明确“少数层 IoU 较低的可以回退使用原始
+   indexer，实践中回退 0、1 两层”；LongBench V2 上 `top-m=64` 掉 2% 精度。
+   §7 只讨论了复杂度，没有讨论“回退层”对时延收益的折损。仿真若要建模
+   `indexer_mode=two_stage`，应增加 `fallback_layers` 参数，并把这部分层按
+   full indexer 计费。
+2. **80% 跨步 KV 复用是分段 SFA 的经验前提**：原文说“当前 step 选中的 KV 中
+   大约 80% 与上一次 decode step 重复”。这是 `max(t_hit_sfa, t_gather)` 能产生
+   正收益的根本原因。§7 没有指出仿真必须能输出这个**跨步复用率**，否则
+   overlap 收益无法解释。建议在 `StepCost` 增加 `reused_from_prev_step` 计数，
+   并在指标里输出 `hisparse_step_reuse_rate`。
+
+### 8.6 复核结论
+
+- §7 的技术批评成立，采纳；本文 §0/§1.3/§2.2/§3.1-§3.4/§5 应按下表修订。
+- §7 的 HEAD 事实错误必须删除，否则文档自相矛盾。
+- 修订后仍应保留 §4 的落地顺序：**语义 oracle → trace → indexer → 预取 → SFA/多流**。
+- 在 trace 到位前，本文所有绝对命中率/时延都应标为“合成模型敏感性”，
+  不得写成 TierKV 实测收益的复现。
